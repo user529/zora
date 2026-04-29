@@ -131,7 +131,12 @@ fn run(allocator: std.mem.Allocator) !void {
 
     // ── Hot-reload watcher (detached; no graceful shutdown in prototype) ───────
     {
-        const watcher_t = try std.Thread.spawn(.{}, reload.watcherThread, .{cfg.rules_file});
+        const watcher_t = try std.Thread.spawn(.{}, reload.watcherThread, .{
+            reload.WatcherArgs{
+                .rules_path = cfg.rules_file,
+                .allocator  = allocator,
+            },
+        });
         watcher_t.detach();
     }
 
@@ -503,7 +508,10 @@ test "AC-11.5: rules.lua updated → next request uses new rules within 2 s" {
     // Spawn the hot-reload watcher for this stack's rules file.
     // Detached — runs until the test binary exits.
     const watcher_t = try std.Thread.spawn(.{}, reload.watcherThread, .{
-        @as([]const u8, stack.rules_path),
+        reload.WatcherArgs{
+            .rules_path = stack.rules_path,
+            .allocator  = std.heap.page_allocator,
+        },
     });
     watcher_t.detach();
 

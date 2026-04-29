@@ -4,7 +4,7 @@
 ///   - a LuaEngine (Lua state + on_message function)
 ///   - a StateStore connection (WAL allows concurrent readers)
 ///
-/// Main loop (pseudo-code):
+/// Main loop (pseudo-code from CLAUDE.md):
 ///   loop:
 ///     update = queue.tryPop()  -- check stop flag between polls
 ///     if global_reload_version > local_reload_version:
@@ -17,6 +17,7 @@
 /// Routing helper:
 ///   hashUserId(user_id, worker_count) → worker index
 ///   Deterministic, uniform distribution via 64-bit multiplicative hash.
+
 const std = @import("std");
 const types = @import("types.zig");
 const queue_mod = @import("queue.zig");
@@ -62,7 +63,7 @@ pub const WorkerArgs = struct {
 pub fn workerThread(args: WorkerArgs) void {
     // Build the ApiCtx that bot.* Lua functions use.
     var api_ctx = lua_api.ApiCtx{
-        .db = args.db,
+        .db        = args.db,
         .allocator = args.allocator,
     };
 
@@ -73,10 +74,19 @@ pub fn workerThread(args: WorkerArgs) void {
     };
     defer engine.deinit();
 
-    // Load the initial rules file.  A load failure is non-fatal: the worker
-    // continues and will retry on the next reload signal.
+    // Load the initial rules file, falling back to the backup if the primary
+    // fails.  A load failure is non-fatal: the worker continues with no rules
+    // and will retry on the next reload signal.
     engine.loadFile(args.rules_path) catch {
-        log.warn("worker {d}: initial loadFile failed", .{args.id});
+        log.warn("worker {d}: initial load failed, trying backup", .{args.id});
+        var bk_buf: [std.fs.max_path_bytes + 5]u8 = undefined;
+        if (std.fmt.bufPrintZ(&bk_buf, "{s}.bak", .{args.rules_path})) |bk| {
+            engine.loadFile(bk) catch {
+                log.warn("worker {d}: backup also failed, no rules loaded", .{args.id});
+            };
+        } else |_| {
+            log.warn("worker {d}: backup path too long, no rules loaded", .{args.id});
+        }
     };
 
     // Track which reload generation this worker has applied.
@@ -142,11 +152,8 @@ pub fn hashUserId(user_id: i64, worker_count: u32) u32 {
 /// Does NOT free the Action value itself (it is stack/queue allocated).
 fn freeActionPayload(action: types.Action, allocator: std.mem.Allocator) void {
     switch (action) {
-        .send_message => |a| allocator.free(a.text),
-        .send_message_ex => |a| {
-            allocator.free(a.text);
-            allocator.free(a.opts);
-        },
+        .send_message    => |a| allocator.free(a.text),
+        .send_message_ex => |a| { allocator.free(a.text); allocator.free(a.opts); },
         .answer_callback => |a| {
             allocator.free(a.callback_query_id);
             if (a.text) |t| allocator.free(t);
@@ -216,27 +223,27 @@ const TestCtx = struct {
         self.db = try state_store.StateStore.open(allocator, ":memory:");
         errdefer self.db.close();
 
-        self.input_q = try Queue(types.Update).init(allocator, 64);
+        self.input_q  = try Queue(types.Update).init(allocator, 64);
         errdefer self.input_q.deinit(allocator);
 
         self.output_q = try Queue(types.Action).init(allocator, 256);
         errdefer self.output_q.deinit(allocator);
 
-        self.stop = std.atomic.Value(bool).init(false);
+        self.stop       = std.atomic.Value(bool).init(false);
         self.reload_ver = std.atomic.Value(u64).init(0);
         return self;
     }
 
     fn spawnWorker(self: *TestCtx) !std.Thread {
         const args = WorkerArgs{
-            .id = 0,
-            .rules_path = self.rules_path,
-            .allocator = self.allocator,
-            .queue = &self.input_q,
+            .id               = 0,
+            .rules_path       = self.rules_path,
+            .allocator        = self.allocator,
+            .queue            = &self.input_q,
             .dispatcher_queue = &self.output_q,
-            .db = &self.db,
-            .stop = &self.stop,
-            .reload_ver = &self.reload_ver,
+            .db               = &self.db,
+            .stop             = &self.stop,
+            .reload_ver       = &self.reload_ver,
         };
         return std.Thread.spawn(.{}, workerThread, .{args});
     }
@@ -393,6 +400,37 @@ test "AC-8.5: worker thread alive (not exited) after 200ms with empty queue" {
         std.Thread.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expectEqual(@as(usize, 0), ctx.input_q.len());
+}
+
+test "fallback: broken primary rules.lua → worker loads from rules.lua.bak" {
+    // Write an invalid primary rules file.
+    var ctx = try TestCtx.init(testing.allocator, "function ( -- INVALID SYNTAX");
+
+    // Write a valid backup BEFORE spawning the worker so it is available on
+    // the initial load attempt.
+    {
+        var f = try ctx.tmp.dir.createFile("rules.lua.bak", .{});
+        defer f.close();
+        try f.writeAll(
+            \\function on_message(u)
+            \\  return { {action="send_message", chat_id=99, text="from-backup"} }
+            \\end
+        );
+    }
+
+    const t = try ctx.spawnWorker();
+    defer ctx.deinit(t);
+
+    // Give worker time to start and load rules via backup.
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    try ctx.input_q.push(types.Update{ .update_id = 20 });
+
+    try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
+
+    const action = popAction(&ctx.output_q);
+    defer freeAction(action, testing.allocator);
+    try testing.expectEqualStrings("from-backup", action.send_message.text);
 }
 
 test "AC-8.6: hashUserId is deterministic — 10k ids × 8 workers always same index" {
