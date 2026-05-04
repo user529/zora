@@ -53,15 +53,24 @@ pub const WatcherArgs = struct {
 /// Run the file watcher for the path in `args.rules_path`.  Never returns
 /// under normal operation.  Intended to be run as a dedicated `std.Thread`.
 pub fn watcherThread(args: WatcherArgs) void {
+    // Own a copy of rules_path so the caller's string can be freed any time
+    // after spawning this thread. handleChange() accesses rules_path on every
+    // file-change event, so the slice must remain valid for the thread lifetime.
+    const rules_path = args.allocator.dupe(u8, args.rules_path) catch {
+        log.err("OOM duplicating rules_path — hot-reload disabled", .{});
+        return;
+    };
+    defer args.allocator.free(rules_path);
+
     var bk_buf: [std.fs.max_path_bytes + 5]u8 = undefined;
-    const bk = std.fmt.bufPrint(&bk_buf, "{s}.bak", .{args.rules_path}) catch {
+    const bk = std.fmt.bufPrint(&bk_buf, "{s}.bak", .{rules_path}) catch {
         log.err("rules_path too long to compute backup path — hot-reload disabled", .{});
         return;
     };
     switch (builtin.os.tag) {
-        .linux   => watcherInotify(args.rules_path, bk, args.allocator, &reload_version),
-        .freebsd => watcherKqueue(args.rules_path, bk, args.allocator, &reload_version),
-        else     => watcherPoll(args.rules_path, bk, args.allocator, &reload_version, 500, null),
+        .linux   => watcherInotify(rules_path, bk, args.allocator, &reload_version),
+        .freebsd => watcherKqueue(rules_path, bk, args.allocator, &reload_version),
+        else     => watcherPoll(rules_path, bk, args.allocator, &reload_version, 500, null),
     }
 }
 
