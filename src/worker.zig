@@ -61,6 +61,15 @@ pub const WorkerArgs = struct {
 // ---------------------------------------------------------------------------
 
 pub fn workerThread(args: WorkerArgs) void {
+    // Guard: returning while stop=false means the worker died unexpectedly.
+    // Aborting is intentional — silent capacity loss is worse than a visible crash.
+    defer {
+        if (!args.stop.load(.acquire)) {
+            log.err("worker {d}: unexpected exit — aborting process to prevent silent degradation", .{args.id});
+            std.process.abort();
+        }
+    }
+
     // Build the ApiCtx that bot.* Lua functions use.
     var api_ctx = lua_api.ApiCtx{
         .db        = args.db,
