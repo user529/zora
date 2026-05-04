@@ -64,6 +64,11 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.EnvMap) Config
     // Optional: DISPATCHER_THREADS
     const dispatcher_threads = try parseU32(env, "DISPATCHER_THREADS", 4);
 
+    // Optional: BOT_API_BASE (default: production Telegram API)
+    const bot_api_base = allocator.dupe(u8, env.get("BOT_API_BASE") orelse "https://api.telegram.org") catch
+        return error.OutOfMemory;
+    errdefer allocator.free(bot_api_base);
+
     return Config{
         .bot_token = bot_token,
         .webhook_secret = webhook_secret,
@@ -73,6 +78,7 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.EnvMap) Config
         .worker_count = worker_count,
         .queue_capacity = queue_capacity,
         .dispatcher_threads = dispatcher_threads,
+        .bot_api_base = bot_api_base,
     };
 }
 
@@ -82,6 +88,7 @@ pub fn deinit(config: Config, allocator: std.mem.Allocator) void {
     allocator.free(config.webhook_secret);
     allocator.free(config.rules_file);
     allocator.free(config.db_path);
+    allocator.free(config.bot_api_base);
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +322,33 @@ test "AC-3.2+AC-3.3: both required fields absent — first missing field errors"
 
     const result = loadFromMap(testing.allocator, env);
     try testing.expectError(error.MissingRequiredField, result);
+}
+
+test "BOT_API_BASE: custom value is loaded" {
+    var env = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN",      "tok" },
+        .{ "WEBHOOK_SECRET", "sec" },
+        .{ "BOT_API_BASE",   "http://localhost:8080" },
+    });
+    defer env.deinit();
+
+    const cfg = try loadFromMap(testing.allocator, env);
+    defer deinit(cfg, testing.allocator);
+
+    try testing.expectEqualStrings("http://localhost:8080", cfg.bot_api_base);
+}
+
+test "BOT_API_BASE: absent defaults to production Telegram API" {
+    var env = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN",      "tok" },
+        .{ "WEBHOOK_SECRET", "sec" },
+    });
+    defer env.deinit();
+
+    const cfg = try loadFromMap(testing.allocator, env);
+    defer deinit(cfg, testing.allocator);
+
+    try testing.expectEqualStrings("https://api.telegram.org", cfg.bot_api_base);
 }
 
 test "AC-3.4: WORKER_COUNT=1 is accepted (minimum boundary)" {

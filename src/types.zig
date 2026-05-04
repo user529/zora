@@ -101,6 +101,9 @@ pub const Config = struct {
     worker_count: u32,
     queue_capacity: u32,
     dispatcher_threads: u32,
+    /// Base URL for the Telegram Bot API. Override with BOT_API_BASE env var
+    /// to redirect outbound requests to a fake API during testing.
+    bot_api_base: []const u8,
 };
 
 // ---------------------------------------------------------------------------

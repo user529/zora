@@ -86,7 +86,7 @@ fn run(allocator: std.mem.Allocator) !void {
                 .id        = @intCast(i),
                 .queue     = &disp_q,
                 .bot_token = cfg.bot_token,
-                .api_base  = "https://api.telegram.org",
+                .api_base  = cfg.bot_api_base,
                 .allocator = allocator,
                 .stop      = &stop,
             },
