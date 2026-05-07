@@ -69,6 +69,9 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.EnvMap) Config
         return error.OutOfMemory;
     errdefer allocator.free(bot_api_base);
 
+    // Optional: METRICS_LOG — emit per-dispatcher stats every 5 s (default: true)
+    const metrics_log = try parseBool(env, "METRICS_LOG", true);
+
     return Config{
         .bot_token = bot_token,
         .webhook_secret = webhook_secret,
@@ -79,6 +82,7 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.EnvMap) Config
         .queue_capacity = queue_capacity,
         .dispatcher_threads = dispatcher_threads,
         .bot_api_base = bot_api_base,
+        .metrics_log = metrics_log,
     };
 }
 
@@ -110,6 +114,18 @@ fn parseU32(env: std.process.EnvMap, key: []const u8, default: u32) ConfigError!
     const raw = env.get(key) orelse return default;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     return std.fmt.parseInt(u32, trimmed, 10) catch return error.InvalidConfig;
+}
+
+/// Parse `key` from `env` as bool. Returns `default` if the key is absent.
+/// Accepted true values:  "1", "true"  (case-insensitive).
+/// Accepted false values: "0", "false" (case-insensitive).
+/// Returns error.InvalidConfig for any other non-empty value.
+fn parseBool(env: std.process.EnvMap, key: []const u8, default: bool) ConfigError!bool {
+    const raw = env.get(key) orelse return default;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "1") or std.ascii.eqlIgnoreCase(trimmed, "true"))  return true;
+    if (std.mem.eql(u8, trimmed, "0") or std.ascii.eqlIgnoreCase(trimmed, "false")) return false;
+    return error.InvalidConfig;
 }
 
 /// Returns cpu_count * 2, clamped to [1, maxInt(u32)].
@@ -349,6 +365,62 @@ test "BOT_API_BASE: absent defaults to production Telegram API" {
     defer deinit(cfg, testing.allocator);
 
     try testing.expectEqualStrings("https://api.telegram.org", cfg.bot_api_base);
+}
+
+test "METRICS_LOG: absent defaults to true" {
+    var env = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN",      "tok" },
+        .{ "WEBHOOK_SECRET", "sec" },
+    });
+    defer env.deinit();
+
+    const cfg = try loadFromMap(testing.allocator, env);
+    defer deinit(cfg, testing.allocator);
+
+    try testing.expect(cfg.metrics_log == true);
+}
+
+test "METRICS_LOG: '0' and 'false' disable metrics" {
+    for ([_][]const u8{ "0", "false", "False", "FALSE" }) |val| {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN",      "tok" },
+            .{ "WEBHOOK_SECRET", "sec" },
+            .{ "METRICS_LOG",    val },
+        });
+        defer env.deinit();
+
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+
+        try testing.expect(cfg.metrics_log == false);
+    }
+}
+
+test "METRICS_LOG: '1' and 'true' enable metrics" {
+    for ([_][]const u8{ "1", "true", "True", "TRUE" }) |val| {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN",      "tok" },
+            .{ "WEBHOOK_SECRET", "sec" },
+            .{ "METRICS_LOG",    val },
+        });
+        defer env.deinit();
+
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+
+        try testing.expect(cfg.metrics_log == true);
+    }
+}
+
+test "METRICS_LOG: invalid value returns error.InvalidConfig" {
+    var env = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN",      "tok" },
+        .{ "WEBHOOK_SECRET", "sec" },
+        .{ "METRICS_LOG",    "yes" },
+    });
+    defer env.deinit();
+
+    try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
 }
 
 test "AC-3.4: WORKER_COUNT=1 is accepted (minimum boundary)" {

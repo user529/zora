@@ -38,8 +38,8 @@ pub const WorkerArgs = struct {
     /// Used for Update→JSON conversion, action string allocation, and Lua
     /// engine internals.  Must be thread-safe (e.g., a GPA).
     allocator: std.mem.Allocator,
-    /// Input queue: server pushes Update values, worker pops them.
-    queue: *queue_mod.Queue(types.Update),
+    /// Input queue: server pushes Parsed(Update) values, worker pops and deinits them.
+    queue: *queue_mod.Queue(std.json.Parsed(types.Update)),
     /// Output queue: worker pushes Action values, dispatcher pops them.
     /// String payloads inside each Action are allocated from `allocator`;
     /// the dispatcher is responsible for freeing them after sending.
@@ -101,15 +101,36 @@ pub fn workerThread(args: WorkerArgs) void {
     // Track which reload generation this worker has applied.
     var local_ver: u64 = args.reload_ver.load(.acquire);
 
+    // Metrics counters (reset each reporting period).
+    var processed:  u64 = 0;
+    var lua_errors: u64 = 0;
+    var dropped:    u64 = 0;
+    var last_log_ns: i128 = std.time.nanoTimestamp();
+    const log_interval_ns: i128 = 5 * std.time.ns_per_s;
+
     // Main loop.
     while (!args.stop.load(.acquire)) {
+        // Periodic metrics log every 5 seconds.
+        const now_ns = std.time.nanoTimestamp();
+        if (now_ns - last_log_ns >= log_interval_ns) {
+            log.info("worker {d}: processed={d} lua_errors={d} dropped={d} queue_depth={d}", .{
+                args.id, processed, lua_errors, dropped, args.queue.len(),
+            });
+            processed  = 0;
+            lua_errors = 0;
+            dropped    = 0;
+            last_log_ns = now_ns;
+        }
+
         // Non-blocking pop so we can honour the stop flag promptly.
-        const maybe_update = args.queue.tryPop();
-        if (maybe_update == null) {
+        const maybe_parsed = args.queue.tryPop();
+        if (maybe_parsed == null) {
             std.Thread.sleep(1 * std.time.ns_per_ms);
             continue;
         }
-        const update = maybe_update.?;
+        const parsed = maybe_parsed.?;
+        defer parsed.deinit();
+        const update = parsed.value;
 
         // ── Hot-reload check ───────────────────────────────────────────────
         const global_ver = args.reload_ver.load(.acquire);
@@ -124,8 +145,10 @@ pub fn workerThread(args: WorkerArgs) void {
         // ── Call on_message ────────────────────────────────────────────────
         const actions = engine.callOnMessage(args.allocator, update) catch |err| {
             log.err("worker {d}: callOnMessage OOM: {s}", .{ args.id, @errorName(err) });
+            lua_errors += 1;
             continue;
         };
+        if (actions.len == 0) lua_errors += 1; // callOnMessage returns empty on Lua error
 
         // ── Forward to dispatcher ──────────────────────────────────────────
         // String payloads inside each Action are transferred to the dispatcher.
@@ -134,9 +157,11 @@ pub fn workerThread(args: WorkerArgs) void {
             args.dispatcher_queue.push(action) catch {
                 log.warn("worker {d}: dispatcher queue full, dropping action", .{args.id});
                 freeActionPayload(action, args.allocator);
+                dropped += 1;
             };
         }
         args.allocator.free(actions);
+        processed += 1;
     }
 }
 
@@ -202,10 +227,17 @@ fn freeAction(action: types.Action, allocator: std.mem.Allocator) void {
 
 // ── Shared test setup ────────────────────────────────────────────────────────
 
+/// Wrap a bare Update in a Parsed(Update) for tests (no string allocations).
+fn testUpdate(allocator: std.mem.Allocator, update: types.Update) !std.json.Parsed(types.Update) {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    return .{ .arena = arena, .value = update };
+}
+
 const TestCtx = struct {
     tmp: testing.TmpDir,
     db: state_store.StateStore,
-    input_q: Queue(types.Update),
+    input_q: Queue(std.json.Parsed(types.Update)),
     output_q: Queue(types.Action),
     stop: std.atomic.Value(bool),
     reload_ver: std.atomic.Value(u64),
@@ -232,7 +264,7 @@ const TestCtx = struct {
         self.db = try state_store.StateStore.open(allocator, ":memory:");
         errdefer self.db.close();
 
-        self.input_q  = try Queue(types.Update).init(allocator, 64);
+        self.input_q  = try Queue(std.json.Parsed(types.Update)).init(allocator, 64);
         errdefer self.input_q.deinit(allocator);
 
         self.output_q = try Queue(types.Action).init(allocator, 256);
@@ -281,8 +313,7 @@ test "AC-8.1: single update → dispatcher receives expected action" {
     // Give worker time to start and load rules.
     std.Thread.sleep(30 * std.time.ns_per_ms);
 
-    const update = types.Update{ .update_id = 1 };
-    try ctx.input_q.push(update);
+    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 1 }));
 
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
@@ -320,7 +351,7 @@ test "AC-8.2: reload_version incremented → worker reloads before on_message" {
     // Signal reload via the isolated per-test counter (TD-2 fix).
     _ = ctx.reload_ver.fetchAdd(1, .release);
 
-    try ctx.input_q.push(types.Update{ .update_id = 2 });
+    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 2 }));
 
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
@@ -345,7 +376,7 @@ test "AC-8.3: update that triggers reload is still processed (not dropped)" {
     _ = ctx.reload_ver.fetchAdd(1, .release);
 
     // Push the update — it should be processed after the reload, not dropped.
-    try ctx.input_q.push(types.Update{ .update_id = 3 });
+    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 3 }));
 
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
@@ -372,9 +403,9 @@ test "AC-8.4: Lua error on first update → worker continues; second update succ
     std.Thread.sleep(30 * std.time.ns_per_ms);
 
     // First update → Lua error, empty slice returned, nothing pushed.
-    try ctx.input_q.push(types.Update{ .update_id = 4 });
+    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 4 }));
     // Second update → succeeds.
-    try ctx.input_q.push(types.Update{ .update_id = 5 });
+    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 5 }));
 
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
@@ -399,7 +430,7 @@ test "AC-8.5: worker thread alive (not exited) after 200ms with empty queue" {
     // independent), but we verify the thread is still alive via a liveness probe:
     // push an update and check the dispatcher gets a response (which requires
     // the worker to still be running).
-    try ctx.input_q.push(types.Update{ .update_id = 6 });
+    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 6 }));
 
     // on_message returns {}, so no actions expected — but the worker must
     // still be alive to pop and process the update.
@@ -433,7 +464,7 @@ test "fallback: broken primary rules.lua → worker loads from rules.lua.bak" {
     // Give worker time to start and load rules via backup.
     std.Thread.sleep(50 * std.time.ns_per_ms);
 
-    try ctx.input_q.push(types.Update{ .update_id = 20 });
+    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 20 }));
 
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 

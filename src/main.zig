@@ -27,6 +27,17 @@ const log = std.log.scoped(.main);
 pub const BUILD_NUMBER: u32 = build_opts.build_number;
 
 // ---------------------------------------------------------------------------
+// Signal handling — SIGTERM / SIGINT set this flag; main loop polls it.
+// ---------------------------------------------------------------------------
+
+var g_stop = std.atomic.Value(bool).init(false);
+
+fn sigStop(sig: c_int) callconv(std.builtin.CallingConvention.c) void {
+    _ = sig;
+    g_stop.store(true, .release);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -61,6 +72,20 @@ fn run(allocator: std.mem.Allocator) !void {
         db.close();
     }
 
+    // ── Signal handlers (SIGTERM / SIGINT → clean shutdown + GPA leak check) ───
+    // SA.RESTART causes interrupted slow syscalls (nanosleep, accept, poll) to
+    // be restarted automatically rather than returning EINTR.  The server uses
+    // a poll-based accept loop that tolerates EINTR anyway, but SA.RESTART is
+    // the conventional production choice and future-proofs against any blocking
+    // call path we add later.
+    const sa = std.posix.Sigaction{
+        .handler = .{ .handler = sigStop },
+        .mask    = std.posix.sigemptyset(),
+        .flags   = std.posix.SA.RESTART,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+    std.posix.sigaction(std.posix.SIG.INT,  &sa, null);
+
     // ── Startup banner — before server.init (AC-11.1) ─────────────────────────
     log.info("zora starting  build={d}  schema={d}  rules_api={d}", .{
         BUILD_NUMBER,
@@ -83,38 +108,41 @@ fn run(allocator: std.mem.Allocator) !void {
     for (0..cfg.dispatcher_threads) |i| {
         disp_threads[i] = try std.Thread.spawn(.{}, disp_mod.dispatcherThread, .{
             disp_mod.DispatcherArgs{
-                .id        = @intCast(i),
-                .queue     = &disp_q,
-                .bot_token = cfg.bot_token,
-                .api_base  = cfg.bot_api_base,
-                .allocator = allocator,
-                .stop      = &stop,
+                .id          = @intCast(i),
+                .queue       = &disp_q,
+                .bot_token   = cfg.bot_token,
+                .api_base    = cfg.bot_api_base,
+                .allocator   = allocator,
+                .stop        = &stop,
+                .metrics_log = cfg.metrics_log,
             },
         });
     }
 
     // ── Worker queues + threads ───────────────────────────────────────────────
-    const wqs = try allocator.alloc(queue_mod.Queue(types.Update), cfg.worker_count);
+    const wqs = try allocator.alloc(queue_mod.Queue(std.json.Parsed(types.Update)), cfg.worker_count);
     defer {
         for (wqs) |*q| q.deinit(allocator);
         allocator.free(wqs);
     }
-    const wq_ptrs = try allocator.alloc(*queue_mod.Queue(types.Update), cfg.worker_count);
+    const wq_ptrs = try allocator.alloc(*queue_mod.Queue(std.json.Parsed(types.Update)), cfg.worker_count);
     defer allocator.free(wq_ptrs);
 
     for (0..cfg.worker_count) |i| {
-        wqs[i] = try queue_mod.Queue(types.Update).init(allocator, cfg.queue_capacity);
+        wqs[i] = try queue_mod.Queue(std.json.Parsed(types.Update)).init(allocator, cfg.queue_capacity);
         wq_ptrs[i] = &wqs[i];
     }
 
     const worker_threads = try allocator.alloc(std.Thread, cfg.worker_count);
     defer allocator.free(worker_threads);
 
+    // Track per-worker DB pointers so they can be freed after workers join.
+    const dbs = try allocator.alloc(*state_store.StateStore, cfg.worker_count);
+    defer allocator.free(dbs);
+
     for (0..cfg.worker_count) |i| {
-        // Each worker owns its own DB connection (heap-allocated; lives for
-        // the entire process lifetime in the prototype — no graceful shutdown).
-        const db = try allocator.create(state_store.StateStore);
-        db.* = try state_store.StateStore.open(allocator, db_path_z);
+        dbs[i] = try allocator.create(state_store.StateStore);
+        dbs[i].* = try state_store.StateStore.open(allocator, db_path_z);
         worker_threads[i] = try std.Thread.spawn(.{}, worker_mod.workerThread, .{
             worker_mod.WorkerArgs{
                 .id               = @intCast(i),
@@ -122,7 +150,7 @@ fn run(allocator: std.mem.Allocator) !void {
                 .allocator        = allocator,
                 .queue            = &wqs[i],
                 .dispatcher_queue = &disp_q,
-                .db               = db,
+                .db               = dbs[i],
                 .stop             = &stop,
                 .reload_ver       = &reload.reload_version,
             },
@@ -147,10 +175,25 @@ fn run(allocator: std.mem.Allocator) !void {
         .queues         = wq_ptrs,
         .allocator      = allocator,
     });
-    _ = srv; // runs until process is killed (graceful shutdown is out of scope)
 
-    // ── Block forever ─────────────────────────────────────────────────────────
-    while (true) std.Thread.sleep(1 * std.time.ns_per_s);
+    // ── Block until SIGTERM / SIGINT ──────────────────────────────────────────
+    while (!g_stop.load(.acquire)) std.Thread.sleep(100 * std.time.ns_per_ms);
+    log.info("shutdown signal received — draining and stopping", .{});
+
+    // Shutdown order: stop accepting → stop workers → free DBs → stop dispatchers.
+    // This lets in-flight requests complete before the queues are freed.
+    srv.deinit();
+    stop.store(true, .release);
+    for (worker_threads) |t| t.join();
+    // Drain Parsed(Update) items workers didn't pop before stop (free their arenas).
+    for (wqs) |*q| while (q.tryPop()) |p| p.deinit();
+    for (dbs) |db| { db.close(); allocator.destroy(db); }
+    for (disp_threads) |t| t.join();
+    // Drain Action items dispatchers didn't send before stop (free string payloads).
+    while (disp_q.tryPop()) |action| disp_mod.freeActionPayload(action, allocator);
+    // Watcher thread is detached and cannot be joined; its rules_path dupe
+    // is freed by the OS on process exit. Documented in KNOWN_ALLOCATIONS.md.
+    log.info("shutdown complete", .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -249,9 +292,9 @@ fn apiMockHandle(mock: *ApiMock, conn: std.net.Server.Connection) void {
 // IntegrationStack — full bot stack for integration tests.
 //
 // Uses std.testing.allocator for queue buffers (tracked).
-// Uses std.heap.page_allocator for server + worker + dispatcher internals
-// (Update JSON strings are prototype-leaked; Action strings are freed by
-// the dispatcher).
+// Uses std.heap.page_allocator for server + worker + dispatcher internals.
+// Each Update's Parsed arena is freed by the worker after on_message returns.
+// Action strings are freed by the dispatcher after sending.
 // ---------------------------------------------------------------------------
 
 const IntegrationStack = struct {
@@ -259,9 +302,9 @@ const IntegrationStack = struct {
     // pointers passed to spawned threads remain stable).
 
     stop:       std.atomic.Value(bool),
-    worker_q:   Queue(types.Update),
+    worker_q:   Queue(std.json.Parsed(types.Update)),
     disp_q:     Queue(types.Action),
-    q_ptrs:     [1]*Queue(types.Update),
+    q_ptrs:     [1]*Queue(std.json.Parsed(types.Update)),
     db:         state_store.StateStore,
     worker_t:   std.Thread,
     disp_t:     std.Thread,
@@ -292,7 +335,7 @@ const IntegrationStack = struct {
         self.rules_path = self.rules_path_buf[0..ps.len :0];
 
         self.stop     = std.atomic.Value(bool).init(false);
-        self.worker_q = try Queue(types.Update).init(test_alloc, 64);
+        self.worker_q = try Queue(std.json.Parsed(types.Update)).init(test_alloc, 64);
         errdefer self.worker_q.deinit(test_alloc);
         self.disp_q   = try Queue(types.Action).init(test_alloc, 256);
         errdefer self.disp_q.deinit(test_alloc);
@@ -316,12 +359,13 @@ const IntegrationStack = struct {
 
         self.disp_t = try std.Thread.spawn(.{}, disp_mod.dispatcherThread, .{
             disp_mod.DispatcherArgs{
-                .id        = 0,
-                .queue     = &self.disp_q,
-                .bot_token = "TESTTOKEN",
-                .api_base  = api_base,
-                .allocator = std.heap.page_allocator,
-                .stop      = &self.stop,
+                .id          = 0,
+                .queue       = &self.disp_q,
+                .bot_token   = "TESTTOKEN",
+                .api_base    = api_base,
+                .allocator   = std.heap.page_allocator,
+                .stop        = &self.stop,
+                .metrics_log = false,
             },
         });
 

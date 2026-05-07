@@ -104,6 +104,9 @@ pub const Config = struct {
     /// Base URL for the Telegram Bot API. Override with BOT_API_BASE env var
     /// to redirect outbound requests to a fake API during testing.
     bot_api_base: []const u8,
+    /// Whether dispatcher threads emit periodic sent/discarded/queue-depth
+    /// log lines every 5 seconds.  Controlled by METRICS_LOG env var.
+    metrics_log: bool,
 };
 
 // ---------------------------------------------------------------------------

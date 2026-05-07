@@ -30,6 +30,7 @@ pub fn build(b: *std.Build) void {
         "-DSQLITE_THREADSAFE=2",
         "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
         "-fno-sanitize=undefined",
+        "-fno-omit-frame-pointer",
     };
 
     // --- helper: configure a compile step with shared deps ---

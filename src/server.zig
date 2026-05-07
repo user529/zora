@@ -7,12 +7,11 @@
 ///   - Parses body as JSON into types.Update, routes by hashUserId % len(queues)
 ///   - Responds 200 OK immediately; the worker thread does the Lua processing
 ///
-/// Memory note (prototype):
-///   std.json.parseFromSlice allocates Update strings in an arena backed by
-///   `args.allocator`.  The Parsed handle is intentionally not freed here
-///   because the Update is pushed to a worker queue and the strings must
-///   remain valid until the worker processes the update.  Each enqueued update
-///   leaks its arena — acceptable for the prototype scope.
+/// Memory ownership:
+///   std.json.parseFromSlice allocates Update strings in an arena.  The full
+///   Parsed(Update) value (arena pointer + value) is pushed into the worker
+///   queue.  The worker calls parsed.deinit() after processing, which frees the
+///   arena and all strings it owns.
 
 const std    = @import("std");
 const types  = @import("types.zig");
@@ -34,14 +33,14 @@ pub const ServerArgs = struct {
     webhook_secret: []const u8,
     /// Slice of worker input queues.  Server routes updates by
     /// hashUserId(user_id, queues.len).  Must remain valid for the Server lifetime.
-    queues:         []*q_mod.Queue(types.Update),
+    queues:         []*q_mod.Queue(std.json.Parsed(types.Update)),
     allocator:      std.mem.Allocator,
 };
 
 pub const Server = struct {
     allocator:      std.mem.Allocator,
     webhook_secret: []const u8,
-    queues:         []*q_mod.Queue(types.Update),
+    queues:         []*q_mod.Queue(std.json.Parsed(types.Update)),
     listener:       std.net.Server,
     stop:           std.atomic.Value(bool),
     thread:         std.Thread,
@@ -206,7 +205,8 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
     };
 
     // ── JSON parse ───────────────────────────────────────────────────────────
-    // parsed.deinit() is intentionally omitted — see module doc comment.
+    // Parsed(Update) is pushed into the worker queue; the worker calls
+    // parsed.deinit() after processing, freeing the arena and all string data.
     const parsed = std.json.parseFromSlice(types.Update, srv.allocator, body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always, // force string copies into Parsed arena — body may be freed before worker runs
@@ -218,8 +218,9 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
     // ── Route to worker queue ─────────────────────────────────────────────────
     const user_id = parsed.value.effectiveUserId() orelse parsed.value.update_id;
     const idx     = worker.hashUserId(user_id, @intCast(srv.queues.len));
-    srv.queues[idx].push(parsed.value) catch {
+    srv.queues[idx].push(parsed) catch {
         log.warn("queue {d} full — dropping update {d}", .{ idx, parsed.value.update_id });
+        parsed.deinit();
     };
 
     // ── Respond 200 immediately ───────────────────────────────────────────────

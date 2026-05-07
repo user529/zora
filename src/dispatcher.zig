@@ -39,6 +39,9 @@ pub const DispatcherArgs = struct {
     api_base: []const u8,
     allocator: std.mem.Allocator,
     stop: *std.atomic.Value(bool),
+    /// When true, emit sent/discarded/queue-depth stats every 5 s.
+    /// Controlled by the METRICS_LOG config key.
+    metrics_log: bool,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,7 +56,23 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
     var client = std.http.Client{ .allocator = args.allocator };
     defer client.deinit();
 
+    var m_sent:    u64  = 0;
+    var m_discard: u64  = 0;
+    var m_last_ns: i128 = if (args.metrics_log) std.time.nanoTimestamp() else 0;
+
     while (!args.stop.load(.acquire)) {
+        if (args.metrics_log) {
+            const now = std.time.nanoTimestamp();
+            if (now - m_last_ns >= 5 * std.time.ns_per_s) {
+                log.info("dispatcher {d}: sent={d} discarded={d} queue_depth={d}", .{
+                    args.id, m_sent, m_discard, args.queue.len(),
+                });
+                m_sent    = 0;
+                m_discard = 0;
+                m_last_ns = now;
+            }
+        }
+
         const maybe_action = args.queue.tryPop();
         if (maybe_action == null) {
             std.Thread.sleep(1 * std.time.ns_per_ms);
@@ -65,7 +84,10 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
 
         sendWithRetry(&client, action, args.bot_token, args.api_base, args.allocator) catch |err| {
             log.warn("dispatcher {d}: dropped action after retry failure: {s}", .{ args.id, @errorName(err) });
+            if (args.metrics_log) m_discard += 1;
+            continue;
         };
+        if (args.metrics_log) m_sent += 1;
     }
     log.info("dispatcher {d}: stopped", .{args.id});
 }
@@ -536,12 +558,13 @@ const TestDispatcher = struct {
         self.queue     = try queue_mod.Queue(types.Action).init(allocator, 256);
         errdefer self.queue.deinit(allocator);
         const args = DispatcherArgs{
-            .id           = 0,
-            .queue        = &self.queue,
-            .bot_token    = bot_token,
-            .api_base     = api_base,
-            .allocator    = allocator,
-            .stop         = &self.stop,
+            .id          = 0,
+            .queue       = &self.queue,
+            .bot_token   = bot_token,
+            .api_base    = api_base,
+            .allocator   = allocator,
+            .stop        = &self.stop,
+            .metrics_log = false,
         };
         self.thread = try std.Thread.spawn(.{}, dispatcherThread, .{args});
         return self;
@@ -770,12 +793,13 @@ test "AC-9.7: 100 actions dispatched — all 100 received by mock server" {
     var threads: [4]std.Thread = undefined;
     for (&threads, 0..) |*t, i| {
         t.* = try std.Thread.spawn(.{}, dispatcherThread, .{DispatcherArgs{
-            .id           = @intCast(i),
-            .queue        = &queue,
-            .bot_token    = "TOK",
-            .api_base     = mock.baseUrl(&url_buf),
-            .allocator    = testing.allocator,
-            .stop         = &stop,
+            .id          = @intCast(i),
+            .queue       = &queue,
+            .bot_token   = "TOK",
+            .api_base    = mock.baseUrl(&url_buf),
+            .allocator   = testing.allocator,
+            .stop        = &stop,
+            .metrics_log = false,
         }});
     }
     defer {
