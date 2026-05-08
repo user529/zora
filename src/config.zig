@@ -55,14 +55,14 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.EnvMap) Config
         return error.OutOfMemory;
     errdefer allocator.free(db_path);
 
-    // Optional: WORKER_COUNT (default: cpu_count * 2, minimum 1)
+    // Optional: WORKER_COUNT (default: cpu_count, minimum 2)
     const worker_count = try parseU32(env, "WORKER_COUNT", defaultWorkerCount());
 
     // Optional: QUEUE_CAPACITY
-    const queue_capacity = try parseU32(env, "QUEUE_CAPACITY", 1024);
+    const queue_capacity = try parseU32(env, "QUEUE_CAPACITY", 256);
 
     // Optional: DISPATCHER_THREADS
-    const dispatcher_threads = try parseU32(env, "DISPATCHER_THREADS", 4);
+    const dispatcher_threads = try parseU32(env, "DISPATCHER_THREADS", 2);
 
     // Optional: BOT_API_BASE (default: production Telegram API)
     const bot_api_base = allocator.dupe(u8, env.get("BOT_API_BASE") orelse "https://api.telegram.org") catch
@@ -128,11 +128,12 @@ fn parseBool(env: std.process.EnvMap, key: []const u8, default: bool) ConfigErro
     return error.InvalidConfig;
 }
 
-/// Returns cpu_count * 2, clamped to [1, maxInt(u32)].
+/// Returns cpu_count, clamped to [2, maxInt(u32)].
+/// One worker per CPU core is ample for Telegram's ~30 msg/s outbound limit.
+/// Minimum 2 ensures a second worker is available during SQLite write contention.
 fn defaultWorkerCount() u32 {
     const cpu_count = std.Thread.getCpuCount() catch 1;
-    const doubled = cpu_count *| 2; // saturating multiply — never overflows
-    return @max(1, @as(u32, @intCast(@min(doubled, @as(usize, std.math.maxInt(u32))))));
+    return @max(2, @as(u32, @intCast(@min(cpu_count, @as(usize, std.math.maxInt(u32))))));
 }
 
 // ---------------------------------------------------------------------------
@@ -206,14 +207,14 @@ test "AC-3.4: all optional fields absent — defaults applied" {
 
     try testing.expectEqualStrings("rules/rules.lua", cfg.rules_file);
     try testing.expectEqualStrings("state.db", cfg.db_path);
-    try testing.expectEqual(@as(u32, 1024), cfg.queue_capacity);
-    try testing.expectEqual(@as(u32, 4), cfg.dispatcher_threads);
+    try testing.expectEqual(@as(u32, 256), cfg.queue_capacity);
+    try testing.expectEqual(@as(u32, 2), cfg.dispatcher_threads);
     // listen_addr default: 0.0.0.0:8443
     const expected_addr = try std.net.Address.parseIpAndPort("0.0.0.0:8443");
     try testing.expectEqual(expected_addr.in.sa.port, cfg.listen_addr.in.sa.port);
 }
 
-test "AC-3.5: WORKER_COUNT absent — defaults to cpu_count*2, minimum 1" {
+test "AC-3.5: WORKER_COUNT absent — defaults to cpu_count, minimum 2" {
     var env = try makeEnv(testing.allocator, &.{
         .{ "BOT_TOKEN",      "tok" },
         .{ "WEBHOOK_SECRET", "sec" },
@@ -224,9 +225,9 @@ test "AC-3.5: WORKER_COUNT absent — defaults to cpu_count*2, minimum 1" {
     defer deinit(cfg, testing.allocator);
 
     const cpu_count = std.Thread.getCpuCount() catch 1;
-    const expected: u32 = @max(1, @as(u32, @intCast(@min(cpu_count *| 2, @as(usize, std.math.maxInt(u32))))));
+    const expected: u32 = @max(2, @as(u32, @intCast(@min(cpu_count, @as(usize, std.math.maxInt(u32))))));
     try testing.expectEqual(expected, cfg.worker_count);
-    try testing.expect(cfg.worker_count >= 1);
+    try testing.expect(cfg.worker_count >= 2);
 }
 
 test "AC-3.6: WORKER_COUNT non-numeric returns error.InvalidConfig" {
@@ -296,7 +297,7 @@ test "AC-3.8: Config fields have correct types" {
 
     // queue_capacity is u32
     const qc: u32 = cfg.queue_capacity;
-    try testing.expectEqual(@as(u32, 1024), qc);
+    try testing.expectEqual(@as(u32, 256), qc);
 
     // listen_addr is std.net.Address — verify it holds a port
     const port = cfg.listen_addr.in.sa.port;
