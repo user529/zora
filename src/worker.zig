@@ -106,11 +106,15 @@ pub fn workerThread(args: WorkerArgs) void {
     var lua_errors: u64 = 0;
     var dropped:    u64 = 0;
     var last_log_ns: i128 = std.time.nanoTimestamp();
-    const log_interval_ns: i128 = 5 * std.time.ns_per_s;
+    const log_interval_ns: i128 = 60 * std.time.ns_per_s;
+    // Cumulative totals — never reset; emitted once on shutdown.
+    var total_processed:  u64 = 0;
+    var total_lua_errors: u64 = 0;
+    var total_dropped:    u64 = 0;
 
     // Main loop.
     while (!args.stop.load(.acquire)) {
-        // Periodic metrics log every 5 seconds.
+        // Periodic metrics log every 60 seconds.
         const now_ns = std.time.nanoTimestamp();
         if (now_ns - last_log_ns >= log_interval_ns) {
             log.info("worker {d}: processed={d} lua_errors={d} dropped={d} queue_depth={d}", .{
@@ -146,9 +150,10 @@ pub fn workerThread(args: WorkerArgs) void {
         const actions = engine.callOnMessage(args.allocator, update) catch |err| {
             log.err("worker {d}: callOnMessage OOM: {s}", .{ args.id, @errorName(err) });
             lua_errors += 1;
+            total_lua_errors += 1;
             continue;
         };
-        if (actions.len == 0) lua_errors += 1; // callOnMessage returns empty on Lua error
+        if (actions.len == 0) { lua_errors += 1; total_lua_errors += 1; }
 
         // ── Forward to dispatcher ──────────────────────────────────────────
         // String payloads inside each Action are transferred to the dispatcher.
@@ -158,11 +163,16 @@ pub fn workerThread(args: WorkerArgs) void {
                 log.warn("worker {d}: dispatcher queue full, dropping action", .{args.id});
                 freeActionPayload(action, args.allocator);
                 dropped += 1;
+                total_dropped += 1;
             };
         }
         args.allocator.free(actions);
         processed += 1;
+        total_processed += 1;
     }
+    log.info("worker {d} shutdown  total_processed={d} total_lua_errors={d} total_dropped={d}", .{
+        args.id, total_processed, total_lua_errors, total_dropped,
+    });
 }
 
 // ---------------------------------------------------------------------------
