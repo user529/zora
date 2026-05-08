@@ -63,7 +63,7 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
     while (!args.stop.load(.acquire)) {
         if (args.metrics_log) {
             const now = std.time.nanoTimestamp();
-            if (now - m_last_ns >= 5 * std.time.ns_per_s) {
+            if (now - m_last_ns >= 60 * std.time.ns_per_s) {
                 log.info("dispatcher {d}: sent={d} discarded={d} queue_depth={d}", .{
                     args.id, m_sent, m_discard, args.queue.len(),
                 });
