@@ -44,11 +44,6 @@ pub const Server = struct {
     listener:       std.net.Server,
     stop:           std.atomic.Value(bool),
     thread:         std.Thread,
-    /// Per-worker count of updates routed (incremented before queue push,
-    /// so it reflects routing decisions regardless of queue drops).
-    route_counts:   []std.atomic.Value(u64),
-    /// Per-worker count of updates dropped because the queue was full.
-    drop_counts:    []std.atomic.Value(u64),
 
     /// Start the server.  Returns a heap-allocated Server.  Call deinit() to
     /// stop the accept loop, close the socket, and free the allocation.
@@ -61,16 +56,6 @@ pub const Server = struct {
         self.listener       = try args.listen_addr.listen(.{ .reuse_address = true });
         errdefer self.listener.deinit();
         self.stop   = std.atomic.Value(bool).init(false);
-
-        const n = args.queues.len;
-        self.route_counts = try args.allocator.alloc(std.atomic.Value(u64), n);
-        errdefer args.allocator.free(self.route_counts);
-        for (self.route_counts) |*c| c.* = std.atomic.Value(u64).init(0);
-
-        self.drop_counts = try args.allocator.alloc(std.atomic.Value(u64), n);
-        errdefer args.allocator.free(self.drop_counts);
-        for (self.drop_counts) |*c| c.* = std.atomic.Value(u64).init(0);
-
         self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
         return self;
     }
@@ -80,13 +65,6 @@ pub const Server = struct {
         self.stop.store(true, .release);
         self.thread.join();
         self.listener.deinit();
-        for (self.route_counts, 0..) |*c, i| {
-            log.info("worker {d} routed={d} dropped={d}", .{
-                i, c.load(.monotonic), self.drop_counts[i].load(.monotonic),
-            });
-        }
-        self.allocator.free(self.route_counts);
-        self.allocator.free(self.drop_counts);
         self.allocator.destroy(self);
     }
 
@@ -203,7 +181,7 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
             content_length = std.fmt.parseInt(usize, v, 10) catch 0;
         } else if (std.ascii.startsWithIgnoreCase(h, "x-telegram-bot-api-secret-token:")) {
             const v = std.mem.trim(u8, h["x-telegram-bot-api-secret-token:".len..], " \t");
-            secret_valid = std.mem.eql(u8, v, srv.webhook_secret);
+            secret_valid = std.mem.eql(u8, srv.webhook_secret, v);
         }
         // Each header line is processed inline; slices are not held after this
         // iteration.  Buffer-pointer safety is maintained.
@@ -216,12 +194,14 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
 
     // ── Body ─────────────────────────────────────────────────────────────────
     if (content_length > MAX_BODY_BYTES) {
+        log.warn("rejected oversized body: Content-Length={d} > {d}", .{ content_length, MAX_BODY_BYTES });
         try sendStatus(stream, "413 Request Entity Too Large");
         return;
     }
 
     const body = try la.alloc(u8, content_length);
     rdr.readSliceAll(body) catch {
+        log.warn("rejected request: failed to read body", .{});
         try sendStatus(stream, "400 Bad Request");
         return;
     };
@@ -233,6 +213,7 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
         .ignore_unknown_fields = true,
         .allocate = .alloc_always, // force string copies into Parsed arena — body may be freed before worker runs
     }) catch {
+        log.warn("rejected request: malformed JSON body", .{});
         try sendStatus(stream, "400 Bad Request");
         return;
     };
@@ -240,10 +221,8 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
     // ── Route to worker queue ─────────────────────────────────────────────────
     const user_id = parsed.value.effectiveUserId() orelse parsed.value.update_id;
     const idx     = worker.hashUserId(user_id, @intCast(srv.queues.len));
-    _ = srv.route_counts[idx].fetchAdd(1, .monotonic);
     srv.queues[idx].push(parsed) catch {
-        _ = srv.drop_counts[idx].fetchAdd(1, .monotonic);
-        log.warn("queue {d} full — dropping update {d}", .{ idx, parsed.value.update_id });
+        log.warn("queue {d} full — update dropped", .{idx});
         parsed.deinit();
     };
 

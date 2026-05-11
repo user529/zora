@@ -123,6 +123,7 @@ pub const StateStore = struct {
             return error.SqliteError;
         if (c.sqlite3_bind_text(stmt, 2, value.ptr, @intCast(value.len), null) != c.SQLITE_OK)
             return error.SqliteError;
+
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE)
             return error.SqliteError;
     }
@@ -190,6 +191,7 @@ pub const StateStore = struct {
         if (c.sqlite3_bind_int64(stmt, 1, id) != c.SQLITE_OK) return error.SqliteError;
         if (c.sqlite3_bind_text(stmt, 2, data.ptr, @intCast(data.len), null) != c.SQLITE_OK)
             return error.SqliteError;
+
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteError;
     }
 };

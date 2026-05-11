@@ -10,19 +10,11 @@
 ///                               FreeBSD → kqueue  (EVFILT_VNODE)
 ///                               other   → poll    (stat() every 500ms, dev fallback)
 ///
-/// Before incrementing reload_version, the watcher validates the changed file
-/// by loading it in a throw-away Lua state (same safe stdlib as workers).
-/// Invalid files (syntax errors, top-level runtime errors) do NOT increment the
-/// counter — workers continue running the last known-good rules.  On successful
-/// validation the file is copied to <rules_path>.bak so that startup can fall
-/// back to it if the primary file is later corrupted or deleted.
-///
 /// Workers read reload_version with .acquire; the watcher writes with .release.
 /// The ordering guarantee is provided by std.atomic.Value(u64) — no torn reads.
 
 const std     = @import("std");
 const builtin = @import("builtin");
-const ziglua  = @import("ziglua");
 
 const log = std.log.scoped(.reload);
 
@@ -41,7 +33,7 @@ pub var reload_version = std.atomic.Value(u64).init(0);
 pub const WatcherArgs = struct {
     /// Path to the Lua rules file to watch.
     rules_path: []const u8,
-    /// Allocator used by the watcher thread for Lua validation and backup I/O.
+    /// Allocator used by the watcher thread.
     /// Must remain valid for the lifetime of the watcher thread.
     allocator: std.mem.Allocator,
 };
@@ -54,83 +46,27 @@ pub const WatcherArgs = struct {
 /// under normal operation.  Intended to be run as a dedicated `std.Thread`.
 pub fn watcherThread(args: WatcherArgs) void {
     // Own a copy of rules_path so the caller's string can be freed any time
-    // after spawning this thread. handleChange() accesses rules_path on every
-    // file-change event, so the slice must remain valid for the thread lifetime.
+    // after spawning this thread.
     const rules_path = args.allocator.dupe(u8, args.rules_path) catch {
         log.err("OOM duplicating rules_path — hot-reload disabled", .{});
         return;
     };
     defer args.allocator.free(rules_path);
 
-    var bk_buf: [std.fs.max_path_bytes + 5]u8 = undefined;
-    const bk = std.fmt.bufPrint(&bk_buf, "{s}.bak", .{rules_path}) catch {
-        log.err("rules_path too long to compute backup path — hot-reload disabled", .{});
-        return;
-    };
     switch (builtin.os.tag) {
-        .linux   => watcherInotify(rules_path, bk, args.allocator, &reload_version),
-        .freebsd => watcherKqueue(rules_path, bk, args.allocator, &reload_version),
-        else     => watcherPoll(rules_path, bk, args.allocator, &reload_version, 500, null),
+        .linux   => watcherInotify(rules_path, &reload_version),
+        .freebsd => watcherKqueue(rules_path, &reload_version),
+        else     => watcherPoll(rules_path, &reload_version, 500, null),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Validation + backup + signal
+// Signal
 // ---------------------------------------------------------------------------
 
-/// Load `rules_path` in a throw-away Lua state with the same safe stdlib as
-/// workers.  Returns true if the file loads and executes without error.
-fn validateFile(rules_path: []const u8, allocator: std.mem.Allocator) bool {
-    const path_z = allocator.dupeZ(u8, rules_path) catch return false;
-    defer allocator.free(path_z);
-
-    const lua = ziglua.Lua.init(allocator) catch return false;
-    defer lua.deinit();
-
-    // Mirror the safe stdlib opened by lua_engine.zig workers.
-    lua.openBase();
-    lua.openMath();
-    lua.openString();
-    lua.openTable();
-    lua.openUtf8();
-
-    lua.doFile(path_z) catch return false;
-    return true;
-}
-
-/// Copy the contents of `rules_path` to `backup_path`.
-fn writeBackup(
-    rules_path:  []const u8,
-    backup_path: []const u8,
-    allocator:   std.mem.Allocator,
-) !void {
-    const content = try std.fs.cwd().readFileAlloc(allocator, rules_path, 256 * 1024);
-    defer allocator.free(content);
-    const f = try std.fs.cwd().createFile(backup_path, .{});
-    defer f.close();
-    try f.writeAll(content);
-}
-
-/// Validate `rules_path`; if valid, write backup and increment the counter.
-/// Called by all three watcher implementations whenever a file change is
-/// detected.
-fn handleChange(
-    rules_path:  []const u8,
-    backup_path: []const u8,
-    allocator:   std.mem.Allocator,
-    counter:     *std.atomic.Value(u64),
-) void {
-    if (!validateFile(rules_path, allocator)) {
-        log.warn("rules.lua changed but failed Lua validation — keeping current version", .{});
-        return;
-    }
-    writeBackup(rules_path, backup_path, allocator) catch |err| {
-        log.warn("failed to write backup '{s}': {s} — proceeding without backup", .{
-            backup_path, @errorName(err),
-        });
-    };
+fn handleChange(counter: *std.atomic.Value(u64)) void {
     _ = counter.fetchAdd(1, .release);
-    log.info("rules.lua validated — workers will reload", .{});
+    log.info("rules.lua changed — workers will reload", .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -138,16 +74,21 @@ fn handleChange(
 // ---------------------------------------------------------------------------
 
 fn watcherInotify(
-    rules_path:  []const u8,
-    backup_path: []const u8,
-    allocator:   std.mem.Allocator,
-    counter:     *std.atomic.Value(u64),
+    rules_path: []const u8,
+    counter:    *std.atomic.Value(u64),
 ) void {
     if (comptime builtin.os.tag != .linux) {
         unreachable;
     }
     const posix = std.posix;
     const linux = std.os.linux;
+
+    // Watch the parent directory rather than the file inode directly.
+    // This survives deletion + re-creation: after `rm rules.lua` the inode
+    // watch would be orphaned, but the directory watch keeps firing for any
+    // new file with the same name.  We filter events by basename.
+    const dir_path = std.fs.path.dirname(rules_path) orelse ".";
+    const basename = std.fs.path.basename(rules_path);
 
     const ifd = posix.inotify_init1(linux.IN.CLOEXEC) catch |err| {
         log.err("inotify_init1: {s}", .{@errorName(err)});
@@ -157,10 +98,11 @@ fn watcherInotify(
 
     _ = posix.inotify_add_watch(
         ifd,
-        rules_path,
-        linux.IN.CLOSE_WRITE | linux.IN.MOVED_TO,
+        dir_path,
+        linux.IN.CLOSE_WRITE | linux.IN.MOVED_TO |
+        linux.IN.DELETE      | linux.IN.MOVED_FROM,
     ) catch |err| {
-        log.err("inotify_add_watch '{s}': {s}", .{ rules_path, @errorName(err) });
+        log.err("inotify_add_watch '{s}': {s}", .{ dir_path, @errorName(err) });
         return;
     };
 
@@ -171,8 +113,27 @@ fn watcherInotify(
             log.warn("inotify read: {s}", .{@errorName(err)});
             return;
         };
-        if (n > 0) {
-            handleChange(rules_path, backup_path, allocator, counter);
+        // Parse the variable-length event stream.  Each record is:
+        //   inotify_event header  (fixed size)
+        //   name field            (ev.len bytes, NUL-padded, may be 0)
+        const ev_hdr = @sizeOf(linux.inotify_event);
+        var offset: usize = 0;
+        while (offset + ev_hdr <= n) {
+            const ev: *const linux.inotify_event = @alignCast(@ptrCast(&buf[offset]));
+            const event_total = ev_hdr + ev.len;
+
+            if (ev.len > 0) {
+                const name_bytes = buf[offset + ev_hdr .. offset + event_total];
+                const name = std.mem.sliceTo(name_bytes, 0);
+                if (std.mem.eql(u8, name, basename)) {
+                    if (ev.mask & (linux.IN.DELETE | linux.IN.MOVED_FROM) != 0) {
+                        log.warn("rules file deleted — workers will continue with current rules", .{});
+                    } else if (ev.mask & (linux.IN.CLOSE_WRITE | linux.IN.MOVED_TO) != 0) {
+                        handleChange(counter);
+                    }
+                }
+            }
+            offset += event_total;
         }
     }
 }
@@ -189,10 +150,8 @@ const NOTE_WRITE:   u32 = 0x0002;
 const NOTE_RENAME:  u32 = 0x0020;
 
 fn watcherKqueue(
-    rules_path:  []const u8,
-    backup_path: []const u8,
-    allocator:   std.mem.Allocator,
-    counter:     *std.atomic.Value(u64),
+    rules_path: []const u8,
+    counter:    *std.atomic.Value(u64),
 ) void {
     if (comptime builtin.os.tag != .freebsd) {
         unreachable;
@@ -228,7 +187,7 @@ fn watcherKqueue(
             log.warn("kevent wait: {s}", .{@errorName(err)});
             return;
         };
-        handleChange(rules_path, backup_path, allocator, counter);
+        handleChange(counter);
     }
 }
 
@@ -237,12 +196,10 @@ fn watcherKqueue(
 // ---------------------------------------------------------------------------
 
 fn watcherPoll(
-    rules_path:  []const u8,
-    backup_path: []const u8,
-    allocator:   std.mem.Allocator,
-    counter:     *std.atomic.Value(u64),
-    poll_ms:     u64,
-    stop:        ?*const std.atomic.Value(bool),
+    rules_path: []const u8,
+    counter:    *std.atomic.Value(u64),
+    poll_ms:    u64,
+    stop:       ?*const std.atomic.Value(bool),
 ) void {
     var last_mtime: i128 = 0;
     while (stop == null or !stop.?.load(.acquire)) {
@@ -254,7 +211,7 @@ fn watcherPoll(
         };
         const mtime = stat.mtime;
         if (last_mtime != 0 and mtime != last_mtime) {
-            handleChange(rules_path, backup_path, allocator, counter);
+            handleChange(counter);
         }
         last_mtime = mtime;
     }
@@ -287,7 +244,6 @@ const testing = std.testing;
 const LUA_V0 = "-- rules v0";
 const LUA_V1 = "-- rules v1";
 const LUA_V2 = "-- rules v2";
-const LUA_INVALID = "function ( -- syntax error";
 
 test "AC-7.1: reload_version starts at 0" {
     // We verify the initial value of the global, not a local counter.
@@ -300,51 +256,12 @@ test "AC-7.1: reload_version starts at 0" {
 }
 
 test "AC-7.7: std.atomic.Value(u64) provides .release/.acquire ordering" {
-    // This is a type-system / documentation test.
-    // The ordering guarantees are enforced by the Zig std.atomic API:
-    //   fetchAdd(..., .release) — the store is visible before subsequent loads
-    //   load(..., .acquire)    — all stores before the corresponding release
-    //                            are visible after this load
-    // On x86_64, .release and .acquire map to regular stores/loads (TSO model).
-    // The test exercises the API to confirm it compiles and returns expected values.
     var v = std.atomic.Value(u64).init(0);
     _ = v.fetchAdd(1, .release);
     try testing.expectEqual(@as(u64, 1), v.load(.acquire));
     _ = v.fetchAdd(1, .release);
     _ = v.fetchAdd(1, .release);
     try testing.expectEqual(@as(u64, 3), v.load(.acquire));
-}
-
-test "validateFile: valid Lua file returns true" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll("function on_message(u) return {} end");
-    }
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("rules.lua", &path_buf);
-
-    try testing.expect(validateFile(path, testing.allocator));
-}
-
-test "validateFile: invalid Lua file returns false" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_INVALID);
-    }
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("rules.lua", &path_buf);
-
-    try testing.expect(!validateFile(path, testing.allocator));
 }
 
 test "AC-7.5: watcherPoll detects file write within 1500ms" {
@@ -361,22 +278,18 @@ test "AC-7.5: watcherPoll detects file write within 1500ms" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try tmp.dir.realpath("rules.lua", &path_buf);
 
-    var bk_buf: [std.fs.max_path_bytes + 5]u8 = undefined;
-    const backup = try std.fmt.bufPrint(&bk_buf, "{s}.bak", .{path});
-
     var counter = std.atomic.Value(u64).init(0);
     var stop    = std.atomic.Value(bool).init(false);
 
     const Ctx = struct {
-        path:   []const u8,
-        backup: []const u8,
-        ctr:    *std.atomic.Value(u64),
-        stp:    *std.atomic.Value(bool),
+        path: []const u8,
+        ctr:  *std.atomic.Value(u64),
+        stp:  *std.atomic.Value(bool),
     };
-    const ctx = Ctx{ .path = path, .backup = backup, .ctr = &counter, .stp = &stop };
+    const ctx = Ctx{ .path = path, .ctr = &counter, .stp = &stop };
     const t = try std.Thread.spawn(.{}, struct {
         fn run(c: Ctx) void {
-            watcherPoll(c.path, c.backup, std.heap.page_allocator, c.ctr, 50, c.stp);
+            watcherPoll(c.path, c.ctr, 50, c.stp);
         }
     }.run, .{ctx});
     defer { stop.store(true, .release); t.join(); }
@@ -395,102 +308,6 @@ test "AC-7.5: watcherPoll detects file write within 1500ms" {
     try testing.expect(waitForCount(&counter, 1, 1400));
 }
 
-test "watcherPoll: invalid Lua file does not increment counter" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_V0);
-    }
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("rules.lua", &path_buf);
-
-    var bk_buf: [std.fs.max_path_bytes + 5]u8 = undefined;
-    const backup = try std.fmt.bufPrint(&bk_buf, "{s}.bak", .{path});
-
-    var counter = std.atomic.Value(u64).init(0);
-    var stop    = std.atomic.Value(bool).init(false);
-
-    const Ctx = struct {
-        path:   []const u8,
-        backup: []const u8,
-        ctr:    *std.atomic.Value(u64),
-        stp:    *std.atomic.Value(bool),
-    };
-    const ctx = Ctx{ .path = path, .backup = backup, .ctr = &counter, .stp = &stop };
-    const t = try std.Thread.spawn(.{}, struct {
-        fn run(c: Ctx) void {
-            watcherPoll(c.path, c.backup, std.heap.page_allocator, c.ctr, 50, c.stp);
-        }
-    }.run, .{ctx});
-    defer { stop.store(true, .release); t.join(); }
-
-    // Let the watcher record the initial mtime.
-    std.Thread.sleep(110 * std.time.ns_per_ms);
-
-    // Write INVALID Lua — counter must NOT increment.
-    {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_INVALID);
-    }
-
-    std.Thread.sleep(250 * std.time.ns_per_ms); // three poll cycles at 50ms
-    try testing.expectEqual(@as(u64, 0), counter.load(.acquire));
-}
-
-test "watcherPoll: valid file change writes backup file" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_V0);
-    }
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("rules.lua", &path_buf);
-
-    var bk_buf: [std.fs.max_path_bytes + 5]u8 = undefined;
-    const backup = try std.fmt.bufPrint(&bk_buf, "{s}.bak", .{path});
-
-    var counter = std.atomic.Value(u64).init(0);
-    var stop    = std.atomic.Value(bool).init(false);
-
-    const Ctx = struct {
-        path:   []const u8,
-        backup: []const u8,
-        ctr:    *std.atomic.Value(u64),
-        stp:    *std.atomic.Value(bool),
-    };
-    const ctx = Ctx{ .path = path, .backup = backup, .ctr = &counter, .stp = &stop };
-    const t = try std.Thread.spawn(.{}, struct {
-        fn run(c: Ctx) void {
-            watcherPoll(c.path, c.backup, std.heap.page_allocator, c.ctr, 50, c.stp);
-        }
-    }.run, .{ctx});
-    defer { stop.store(true, .release); t.join(); }
-
-    std.Thread.sleep(110 * std.time.ns_per_ms);
-
-    {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_V1);
-    }
-
-    try testing.expect(waitForCount(&counter, 1, 1400));
-
-    // Backup must contain the new content.
-    const bak_content = try tmp.dir.readFileAlloc(testing.allocator, "rules.lua.bak", 256);
-    defer testing.allocator.free(bak_content);
-    try testing.expectEqualStrings(LUA_V1, bak_content);
-}
-
 test "AC-7.2: (Linux) inotify detects CLOSE_WRITE within 1000ms" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
@@ -507,19 +324,15 @@ test "AC-7.2: (Linux) inotify detects CLOSE_WRITE within 1000ms" {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = try tmp.dir.realpath("rules.lua", &path_buf);
 
-        var bk_buf: [std.fs.max_path_bytes + 5]u8 = undefined;
-        const backup = try std.fmt.bufPrint(&bk_buf, "{s}.bak", .{path});
-
         var counter = std.atomic.Value(u64).init(0);
 
         const Ctx = struct {
-            path:   []const u8,
-            backup: []const u8,
-            ctr:    *std.atomic.Value(u64),
+            path: []const u8,
+            ctr:  *std.atomic.Value(u64),
         };
-        const ctx = Ctx{ .path = path, .backup = backup, .ctr = &counter };
+        const ctx = Ctx{ .path = path, .ctr = &counter };
         const t = try std.Thread.spawn(.{}, struct {
-            fn run(c: Ctx) void { watcherInotify(c.path, c.backup, std.heap.page_allocator, c.ctr); }
+            fn run(c: Ctx) void { watcherInotify(c.path, c.ctr); }
         }.run, .{ctx});
         t.detach();
 
@@ -553,19 +366,15 @@ test "AC-7.3: (Linux) 3 writes 200ms apart → counter >= 3 within 2s of last wr
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = try tmp.dir.realpath("rules.lua", &path_buf);
 
-        var bk_buf: [std.fs.max_path_bytes + 5]u8 = undefined;
-        const backup = try std.fmt.bufPrint(&bk_buf, "{s}.bak", .{path});
-
         var counter = std.atomic.Value(u64).init(0);
 
         const Ctx = struct {
-            path:   []const u8,
-            backup: []const u8,
-            ctr:    *std.atomic.Value(u64),
+            path: []const u8,
+            ctr:  *std.atomic.Value(u64),
         };
-        const ctx = Ctx{ .path = path, .backup = backup, .ctr = &counter };
+        const ctx = Ctx{ .path = path, .ctr = &counter };
         const t = try std.Thread.spawn(.{}, struct {
-            fn run(c: Ctx) void { watcherInotify(c.path, c.backup, std.heap.page_allocator, c.ctr); }
+            fn run(c: Ctx) void { watcherInotify(c.path, c.ctr); }
         }.run, .{ctx});
         t.detach();
 
@@ -599,19 +408,15 @@ test "AC-7.4: (Linux) atomic rename (tmp → rules.lua) → counter incremented 
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = try tmp.dir.realpath("rules.lua", &path_buf);
 
-        var bk_buf: [std.fs.max_path_bytes + 5]u8 = undefined;
-        const backup = try std.fmt.bufPrint(&bk_buf, "{s}.bak", .{path});
-
         var counter = std.atomic.Value(u64).init(0);
 
         const Ctx = struct {
-            path:   []const u8,
-            backup: []const u8,
-            ctr:    *std.atomic.Value(u64),
+            path: []const u8,
+            ctr:  *std.atomic.Value(u64),
         };
-        const ctx = Ctx{ .path = path, .backup = backup, .ctr = &counter };
+        const ctx = Ctx{ .path = path, .ctr = &counter };
         const t = try std.Thread.spawn(.{}, struct {
-            fn run(c: Ctx) void { watcherInotify(c.path, c.backup, std.heap.page_allocator, c.ctr); }
+            fn run(c: Ctx) void { watcherInotify(c.path, c.ctr); }
         }.run, .{ctx});
         t.detach();
 
@@ -645,19 +450,15 @@ test "AC-7.6: (Linux) file deleted and recreated — watcher does not panic" {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = try tmp.dir.realpath("rules.lua", &path_buf);
 
-        var bk_buf: [std.fs.max_path_bytes + 5]u8 = undefined;
-        const backup = try std.fmt.bufPrint(&bk_buf, "{s}.bak", .{path});
-
         var counter = std.atomic.Value(u64).init(0);
 
         const Ctx = struct {
-            path:   []const u8,
-            backup: []const u8,
-            ctr:    *std.atomic.Value(u64),
+            path: []const u8,
+            ctr:  *std.atomic.Value(u64),
         };
-        const ctx = Ctx{ .path = path, .backup = backup, .ctr = &counter };
+        const ctx = Ctx{ .path = path, .ctr = &counter };
         const t = try std.Thread.spawn(.{}, struct {
-            fn run(c: Ctx) void { watcherInotify(c.path, c.backup, std.heap.page_allocator, c.ctr); }
+            fn run(c: Ctx) void { watcherInotify(c.path, c.ctr); }
         }.run, .{ctx});
         t.detach();
 

@@ -17,6 +17,15 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption(u32, "build_number", build_number);
 
+    // --- ThreadSanitizer option ---
+    // Enable with: zig build -Dsanitize-thread
+    // Requires the LLVM backend: Zig's self-hosted backend silently accepts
+    // -fsanitize-thread but emits no instrumentation.  When this option is
+    // set, use_llvm is forced true on the exe step so Debug builds also work.
+    // SQLite C code is excluded via -fno-sanitize=thread to avoid false
+    // positives from SQLITE_THREADSAFE=2 global-init (safe but unguarded).
+    const sanitize_thread: ?bool = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer (TSan); forces LLVM backend");
+
     // --- ziglua dependency ---
     const ziglua_dep = b.dependency("ziglua", .{
         .target = target,
@@ -26,21 +35,24 @@ pub fn build(b: *std.Build) void {
     const ziglua_mod = ziglua_dep.module("zlua");
 
     // --- SQLite compile flags ---
+    // -fno-sanitize=thread: exclude SQLite C code from TSan instrumentation.
+    // Each worker owns its own connection (SQLITE_THREADSAFE=2 guarantee), so
+    // SQLite's global-init races are structural false positives, not real bugs.
+    // The flag is a no-op when TSan is not enabled.
     const sqlite_flags: []const []const u8 = &.{
         "-DSQLITE_THREADSAFE=2",
         "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
         "-fno-sanitize=undefined",
+        "-fno-sanitize=thread",
         "-fno-omit-frame-pointer",
     };
-
-    // --- helper: configure a compile step with shared deps ---
-    // (inline helper — avoids repetition between exe and test steps)
 
     // --- root module for executable ---
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
     });
     exe_mod.addOptions("build_options", options);
     exe_mod.addImport("ziglua", ziglua_mod);
@@ -55,6 +67,10 @@ pub fn build(b: *std.Build) void {
     });
     exe.addIncludePath(b.path("vendor"));
     exe.linkLibC();
+
+    // TSan requires the LLVM backend; self-hosted backend silently drops
+    // instrumentation.  Forcing use_llvm here makes Debug+TSan work too.
+    if (sanitize_thread != null) exe.use_llvm = true;
 
     b.installArtifact(exe);
 

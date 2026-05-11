@@ -25,19 +25,6 @@ const log = std.log.scoped(.lua_engine);
 
 pub const RULES_API_VERSION: u32 = 1;
 
-// Maximum Lua instructions per on_message call.  Kills infinite loops without
-// blocking a worker thread indefinitely.  At ~100M instructions/sec in Lua 5.4,
-// this gives a hard ceiling of ~100 ms per call.
-const INSTRUCTION_LIMIT: i32 = 10_000_000;
-
-// C-callable hook invoked by Lua every INSTRUCTION_LIMIT bytecode instructions.
-// Raises a Lua error caught by protectedCall — no worker crash.
-fn countHook(state: ?*ziglua.LuaState, ar: ?*anyopaque) callconv(.c) void {
-    _ = ar;
-    const lua: *Lua = @ptrCast(state.?);
-    lua.raiseErrorStr("execution limit exceeded: infinite loop/recursion or huge allocation detected", .{});
-}
-
 // ---------------------------------------------------------------------------
 // LuaEngine
 // ---------------------------------------------------------------------------
@@ -58,7 +45,14 @@ pub const LuaEngine = struct {
         lua.openString();
         lua.openTable();
         lua.openUtf8();
-        // io, os, package are intentionally NOT opened.
+        // io, os, package, debug are intentionally NOT opened.
+
+        // dofile and loadfile are registered by openBase but read from the
+        // filesystem — remove them so rules cannot escape the sandbox.
+        lua.pushNil();
+        lua.setGlobal("dofile");
+        lua.pushNil();
+        lua.setGlobal("loadfile");
 
         // Register bot.* API and bot.rules_api_version.
         lua_api.register(lua, ctx, RULES_API_VERSION);
@@ -133,15 +127,12 @@ pub const LuaEngine = struct {
         };
 
         // ── 4. Protected call: on_message(update_table) ───────────────────
-        lua.setHook(@ptrCast(&countHook), .{ .count = true }, INSTRUCTION_LIMIT);
         lua.protectedCall(.{ .args = 1, .results = 1, .msg_handler = 0 }) catch {
-            lua.setHook(@ptrCast(&countHook), .{}, 0);
             const err_msg = lua.toString(-1) catch "(no message)";
             log.warn("on_message error: {s}", .{err_msg});
             lua.setTop(stack_base);
             return try allocator.alloc(types.Action, 0);
         };
-        lua.setHook(@ptrCast(&countHook), .{}, 0);
 
         // Stack: [..., result_table]   (base + 1 element)
         defer lua.setTop(stack_base);
@@ -464,36 +455,6 @@ test "AC-6.5: on_message error → empty slice logged, next call succeeds" {
     const actions2 = try engine.callOnMessage(testing.allocator, update);
     defer LuaEngine.freeActions(actions2, testing.allocator);
     try testing.expectEqual(@as(usize, 1), actions2.len);
-}
-
-test "AC-6.7: infinite loop → callOnMessage returns empty slice; engine still usable" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator };
-    var engine = try LuaEngine.init(testing.allocator, &ctx);
-    defer engine.deinit();
-
-    try engine.loadString(
-        \\function on_message(u)
-        \\  while true do end
-        \\end
-    );
-
-    const update = types.Update{ .update_id = 99 };
-    const actions = try engine.callOnMessage(testing.allocator, update);
-    defer LuaEngine.freeActions(actions, testing.allocator);
-    try testing.expectEqual(@as(usize, 0), actions.len);
-
-    // Engine must be usable after the limit fires.
-    try engine.loadString(
-        \\function on_message(u)
-        \\  return { {action="send_message", chat_id=1, text="recovered"} }
-        \\end
-    );
-    const actions2 = try engine.callOnMessage(testing.allocator, update);
-    defer LuaEngine.freeActions(actions2, testing.allocator);
-    try testing.expectEqual(@as(usize, 1), actions2.len);
-    try testing.expectEqualStrings("recovered", actions2[0].send_message.text);
 }
 
 test "AC-6.6: invalid Lua syntax → loadString returns error; engine still usable" {

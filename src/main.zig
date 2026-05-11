@@ -105,16 +105,19 @@ fn run(allocator: std.mem.Allocator) !void {
     const disp_threads = try allocator.alloc(std.Thread, cfg.dispatcher_threads);
     defer allocator.free(disp_threads);
 
+    // BOT_API_BASE redirects outbound requests to a stub during testing.
+    // Reads the OS env block directly — stable for the process lifetime.
+    const api_base = std.posix.getenv("BOT_API_BASE") orelse "https://api.telegram.org";
+
     for (0..cfg.dispatcher_threads) |i| {
         disp_threads[i] = try std.Thread.spawn(.{}, disp_mod.dispatcherThread, .{
             disp_mod.DispatcherArgs{
-                .id          = @intCast(i),
-                .queue       = &disp_q,
-                .bot_token   = cfg.bot_token,
-                .api_base    = cfg.bot_api_base,
-                .allocator   = allocator,
-                .stop        = &stop,
-                .metrics_log = cfg.metrics_log,
+                .id        = @intCast(i),
+                .queue     = &disp_q,
+                .bot_token = cfg.bot_token,
+                .api_base  = api_base,
+                .allocator = allocator,
+                .stop      = &stop,
             },
         });
     }
@@ -359,13 +362,12 @@ const IntegrationStack = struct {
 
         self.disp_t = try std.Thread.spawn(.{}, disp_mod.dispatcherThread, .{
             disp_mod.DispatcherArgs{
-                .id          = 0,
-                .queue       = &self.disp_q,
-                .bot_token   = "TESTTOKEN",
-                .api_base    = api_base,
-                .allocator   = std.heap.page_allocator,
-                .stop        = &self.stop,
-                .metrics_log = false,
+                .id        = 0,
+                .queue     = &self.disp_q,
+                .bot_token = "TESTTOKEN",
+                .api_base  = api_base,
+                .allocator = std.heap.page_allocator,
+                .stop      = &self.stop,
             },
         });
 

@@ -83,49 +83,17 @@ pub fn workerThread(args: WorkerArgs) void {
     };
     defer engine.deinit();
 
-    // Load the initial rules file, falling back to the backup if the primary
-    // fails.  A load failure is non-fatal: the worker continues with no rules
-    // and will retry on the next reload signal.
+    // Load the initial rules file.  A load failure is non-fatal: the worker
+    // continues with no rules and will retry on the next reload signal.
     engine.loadFile(args.rules_path) catch {
-        log.warn("worker {d}: initial load failed, trying backup", .{args.id});
-        var bk_buf: [std.fs.max_path_bytes + 5]u8 = undefined;
-        if (std.fmt.bufPrintZ(&bk_buf, "{s}.bak", .{args.rules_path})) |bk| {
-            engine.loadFile(bk) catch {
-                log.warn("worker {d}: backup also failed, no rules loaded", .{args.id});
-            };
-        } else |_| {
-            log.warn("worker {d}: backup path too long, no rules loaded", .{args.id});
-        }
+        log.warn("worker {d}: initial rules load failed — no rules loaded", .{args.id});
     };
 
     // Track which reload generation this worker has applied.
     var local_ver: u64 = args.reload_ver.load(.acquire);
 
-    // Metrics counters (reset each reporting period).
-    var processed:  u64 = 0;
-    var lua_errors: u64 = 0;
-    var dropped:    u64 = 0;
-    var last_log_ns: i128 = std.time.nanoTimestamp();
-    const log_interval_ns: i128 = 60 * std.time.ns_per_s;
-    // Cumulative totals — never reset; emitted once on shutdown.
-    var total_processed:  u64 = 0;
-    var total_lua_errors: u64 = 0;
-    var total_dropped:    u64 = 0;
-
     // Main loop.
     while (!args.stop.load(.acquire)) {
-        // Periodic metrics log every 60 seconds.
-        const now_ns = std.time.nanoTimestamp();
-        if (now_ns - last_log_ns >= log_interval_ns) {
-            log.info("worker {d}: processed={d} lua_errors={d} dropped={d} queue_depth={d}", .{
-                args.id, processed, lua_errors, dropped, args.queue.len(),
-            });
-            processed  = 0;
-            lua_errors = 0;
-            dropped    = 0;
-            last_log_ns = now_ns;
-        }
-
         // Non-blocking pop so we can honour the stop flag promptly.
         const maybe_parsed = args.queue.tryPop();
         if (maybe_parsed == null) {
@@ -149,11 +117,8 @@ pub fn workerThread(args: WorkerArgs) void {
         // ── Call on_message ────────────────────────────────────────────────
         const actions = engine.callOnMessage(args.allocator, update) catch |err| {
             log.err("worker {d}: callOnMessage OOM: {s}", .{ args.id, @errorName(err) });
-            lua_errors += 1;
-            total_lua_errors += 1;
             continue;
         };
-        if (actions.len == 0) { lua_errors += 1; total_lua_errors += 1; }
 
         // ── Forward to dispatcher ──────────────────────────────────────────
         // String payloads inside each Action are transferred to the dispatcher.
@@ -162,17 +127,11 @@ pub fn workerThread(args: WorkerArgs) void {
             args.dispatcher_queue.push(action) catch {
                 log.warn("worker {d}: dispatcher queue full, dropping action", .{args.id});
                 freeActionPayload(action, args.allocator);
-                dropped += 1;
-                total_dropped += 1;
             };
         }
         args.allocator.free(actions);
-        processed += 1;
-        total_processed += 1;
     }
-    log.info("worker {d} shutdown  total_processed={d} total_lua_errors={d} total_dropped={d}", .{
-        args.id, total_processed, total_lua_errors, total_dropped,
-    });
+    log.info("worker {d}: stopped", .{args.id});
 }
 
 // ---------------------------------------------------------------------------
@@ -450,37 +409,6 @@ test "AC-8.5: worker thread alive (not exited) after 200ms with empty queue" {
         std.Thread.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expectEqual(@as(usize, 0), ctx.input_q.len());
-}
-
-test "fallback: broken primary rules.lua → worker loads from rules.lua.bak" {
-    // Write an invalid primary rules file.
-    var ctx = try TestCtx.init(testing.allocator, "function ( -- INVALID SYNTAX");
-
-    // Write a valid backup BEFORE spawning the worker so it is available on
-    // the initial load attempt.
-    {
-        var f = try ctx.tmp.dir.createFile("rules.lua.bak", .{});
-        defer f.close();
-        try f.writeAll(
-            \\function on_message(u)
-            \\  return { {action="send_message", chat_id=99, text="from-backup"} }
-            \\end
-        );
-    }
-
-    const t = try ctx.spawnWorker();
-    defer ctx.deinit(t);
-
-    // Give worker time to start and load rules via backup.
-    std.Thread.sleep(50 * std.time.ns_per_ms);
-
-    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 20 }));
-
-    try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
-
-    const action = popAction(&ctx.output_q);
-    defer freeAction(action, testing.allocator);
-    try testing.expectEqualStrings("from-backup", action.send_message.text);
 }
 
 test "AC-8.6: hashUserId is deterministic — 10k ids × 8 workers always same index" {
