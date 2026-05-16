@@ -8,8 +8,6 @@ _zig Telegram bot with Lua hot-reload rules_
 
 The prototype is ready - see the `prototype` branch.
 
-Be careful: internal tests unveiled some memory leaks and security issues.
-
 ## About
 
 The vision is simple: a high-performance core that stays stable, while interpretable layer for message processing provides agility for rule updates without recompilation.
