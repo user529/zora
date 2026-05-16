@@ -46,23 +46,23 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.EnvMap) Config
         return error.InvalidConfig;
 
     // Optional: RULES_FILE
-    const rules_file = allocator.dupe(u8, env.get("RULES_FILE") orelse "rules/rules.lua") catch
+    const rules_file = allocator.dupeZ(u8, env.get("RULES_FILE") orelse "rules/rules.lua") catch
         return error.OutOfMemory;
     errdefer allocator.free(rules_file);
 
     // Optional: DB_PATH
-    const db_path = allocator.dupe(u8, env.get("DB_PATH") orelse "state.db") catch
+    const db_path = allocator.dupeZ(u8, env.get("DB_PATH") orelse "state.db") catch
         return error.OutOfMemory;
     errdefer allocator.free(db_path);
 
     // Optional: WORKER_COUNT (default: cpu_count, minimum 2)
-    const worker_count = try parseU32(env, "WORKER_COUNT", defaultWorkerCount());
+    const worker_count = try parseUint(u8, env, "WORKER_COUNT", defaultWorkerCount());
 
     // Optional: QUEUE_CAPACITY
-    const queue_capacity = try parseU32(env, "QUEUE_CAPACITY", 256);
+    const queue_capacity = try parseUint(u16, env, "QUEUE_CAPACITY", 255);
 
     // Optional: DISPATCHER_THREADS
-    const dispatcher_threads = try parseU32(env, "DISPATCHER_THREADS", 2);
+    const dispatcher_threads = try parseUint(u8, env, "DISPATCHER_THREADS", 2);
 
     return Config{
         .bot_token = bot_token,
@@ -97,20 +97,20 @@ fn getRequired(
     return allocator.dupe(u8, val) catch return error.OutOfMemory;
 }
 
-/// Parse `key` from `env` as u32. Returns `default` if the key is absent.
-/// Returns error.InvalidConfig if the value is present but not a valid u32.
-fn parseU32(env: std.process.EnvMap, key: []const u8, default: u32) ConfigError!u32 {
+/// Parse `key` from `env` as T. Returns `default` if the key is absent.
+/// Returns error.InvalidConfig if the value is present but not a valid T.
+fn parseUint(comptime T: type, env: std.process.EnvMap, key: []const u8, default: T) ConfigError!T {
     const raw = env.get(key) orelse return default;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    return std.fmt.parseInt(u32, trimmed, 10) catch return error.InvalidConfig;
+    return std.fmt.parseInt(T, trimmed, 10) catch return error.InvalidConfig;
 }
 
 /// Returns cpu_count, clamped to [2, maxInt(u32)].
 /// One worker per CPU core is ample for Telegram's ~30 msg/s outbound limit.
 /// Minimum 2 ensures a second worker is available during SQLite write contention.
-fn defaultWorkerCount() u32 {
+fn defaultWorkerCount() u8 {
     const cpu_count = std.Thread.getCpuCount() catch 1;
-    return @max(2, @as(u32, @intCast(@min(cpu_count, @as(usize, std.math.maxInt(u32))))));
+    return @max(2, @as(u8, @intCast(@min(cpu_count, @as(usize, std.math.maxInt(u8))))));
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ test "AC-3.4: all optional fields absent — defaults applied" {
 
     try testing.expectEqualStrings("rules/rules.lua", cfg.rules_file);
     try testing.expectEqualStrings("state.db", cfg.db_path);
-    try testing.expectEqual(@as(u32, 256), cfg.queue_capacity);
+    try testing.expectEqual(@as(u32, 255), cfg.queue_capacity);
     try testing.expectEqual(@as(u32, 2), cfg.dispatcher_threads);
     // listen_addr default: 0.0.0.0:8443
     const expected_addr = try std.net.Address.parseIpAndPort("0.0.0.0:8443");
@@ -272,7 +272,7 @@ test "AC-3.8: Config fields have correct types" {
 
     // queue_capacity is u32
     const qc: u32 = cfg.queue_capacity;
-    try testing.expectEqual(@as(u32, 256), qc);
+    try testing.expectEqual(@as(u32, 255), qc);
 
     // listen_addr is std.net.Address — verify it holds a port
     const port = cfg.listen_addr.in.sa.port;

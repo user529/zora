@@ -7,7 +7,6 @@
 /// Thread safety: all operations are protected by a Mutex.
 /// Multiple producers and a single consumer is the intended use pattern,
 /// but the implementation is safe for any number of consumers too.
-
 const std = @import("std");
 
 pub fn Queue(comptime T: type) type {
@@ -75,13 +74,15 @@ pub fn Queue(comptime T: type) type {
             return item;
         }
 
-        /// Non-blocking pop. Returns null if the queue is empty.
-        pub fn tryPop(self: *Self) ?T {
+        /// Pop an item with timeout. Blocks the queue only for the timeot, allowing CPU to sleep, and don't waste CPU for no reasnon
+        /// With timeout_ns=0 this bacame the non-blocking pop
+        pub fn popTimeout(self: *Self, timeout_ns: u64) ?T {
             self.mutex.lock();
             defer self.mutex.unlock();
-
+            if (self.count == 0) {
+                self.not_empty.timedWait(&self.mutex, timeout_ns) catch {};
+            }
             if (self.count == 0) return null;
-
             const item = self.buf[self.head];
             self.head = (self.head + 1) % self.buf.len;
             self.count -= 1;
@@ -286,8 +287,8 @@ test "AC-4.6: Queue([]const u8) handles slice items" {
 test "AC-4.6: tryPop returns null on empty queue" {
     var q = try Queue(u32).init(testing.allocator, 4);
     defer q.deinit(testing.allocator);
-    try testing.expectEqual(@as(?u32, null), q.tryPop());
+    try testing.expectEqual(@as(?u32, null), q.popTimeout(0));
     try q.push(7);
-    try testing.expectEqual(@as(?u32, 7), q.tryPop());
-    try testing.expectEqual(@as(?u32, null), q.tryPop());
+    try testing.expectEqual(@as(?u32, 7), q.popTimeout(0));
+    try testing.expectEqual(@as(?u32, null), q.popTimeout(0));
 }

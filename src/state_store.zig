@@ -12,6 +12,7 @@ const c = @cImport({
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+const PRAGMA_SQL: [:0]const u8 = @embedFile("pragma.sql");
 const SCHEMA_SQL: [:0]const u8 = @embedFile("schema.sql");
 
 // ---------------------------------------------------------------------------
@@ -24,7 +25,8 @@ pub const StateStore = struct {
 
     /// Open (or create) the database at `path`.
     /// For in-memory databases use path = ":memory:".
-    /// Applies schema and verifies schema_version on every open.
+    /// Open schema and verifies schema_version on every open,
+    /// applies schema as fallback.
     pub fn open(allocator: std.mem.Allocator, path: [:0]const u8) !StateStore {
         var raw: ?*c.sqlite3 = null;
         const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE;
@@ -33,7 +35,11 @@ pub const StateStore = struct {
             return error.OpenFailed;
         }
         var store = StateStore{ .db = raw.?, .allocator = allocator };
-        store.applySchema() catch |err| {
+        store.applyPragma() catch |err| {
+           _ = c.sqlite3_close(store.db);
+           return err;
+        };
+        store.checkSchemaVersion() catch |err| {
             _ = c.sqlite3_close(store.db);
             return err;
         };
@@ -95,8 +101,7 @@ pub const StateStore = struct {
         const stmt = try self.prepare("SELECT value FROM global_state WHERE key = ?");
         defer _ = c.sqlite3_finalize(stmt);
 
-        if (c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null) != c.SQLITE_OK)
-            return error.SqliteError;
+        try sqliteOk(c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null));
 
         return switch (c.sqlite3_step(stmt)) {
             c.SQLITE_ROW => blk: {
@@ -119,45 +124,55 @@ pub const StateStore = struct {
         );
         defer _ = c.sqlite3_finalize(stmt);
 
-        if (c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null) != c.SQLITE_OK)
-            return error.SqliteError;
-        if (c.sqlite3_bind_text(stmt, 2, value.ptr, @intCast(value.len), null) != c.SQLITE_OK)
-            return error.SqliteError;
-
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE)
-            return error.SqliteError;
+        try sqliteOk(c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null));
+        try sqliteOk(c.sqlite3_bind_text(stmt, 2, value.ptr, @intCast(value.len), null));
+        try sqliteDone(c.sqlite3_step(stmt));
     }
 
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
 
+    fn applyPragma(self: *StateStore) !void {
+        try sqliteOk(c.sqlite3_exec(self.db, PRAGMA_SQL.ptr, null, null, null));
+    }
+
     fn applySchema(self: *StateStore) !void {
-        if (c.sqlite3_exec(self.db, SCHEMA_SQL.ptr, null, null, null) != c.SQLITE_OK)
-            return error.SqliteError;
-        try self.checkSchemaVersion();
+        try sqliteOk(c.sqlite3_exec(self.db, SCHEMA_SQL.ptr, null, null, null));
+    }
+
+    fn checkSchemaExistence(self: *StateStore) !bool {
+        const schema_stmt = try self.prepare(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' and name = 'meta'",
+        );
+        defer _ = c.sqlite3_finalize(schema_stmt);
+
+        if (c.sqlite3_step(schema_stmt) != c.SQLITE_ROW) return error.SchemaError;
+        const cnt = c.sqlite3_column_int(schema_stmt, 0);
+        return cnt == 1;
     }
 
     fn checkSchemaVersion(self: *StateStore) !void {
-        const stmt = try self.prepare(
+        if (!try self.checkSchemaExistence()) try self.applySchema();
+
+        const version_stmt = try self.prepare(
             "SELECT value FROM meta WHERE key = 'schema_version'",
         );
-        defer _ = c.sqlite3_finalize(stmt);
+        defer _ = c.sqlite3_finalize(version_stmt);
 
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.SchemaMismatch;
+        if (c.sqlite3_step(version_stmt) != c.SQLITE_ROW) return error.SchemaError;
 
-        const text = c.sqlite3_column_text(stmt, 0) orelse return error.SchemaMismatch;
-        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        const text = c.sqlite3_column_text(version_stmt, 0) orelse return error.SchemaError;
+        const len: usize = @intCast(c.sqlite3_column_bytes(version_stmt, 0));
         const version_str = text[0..len];
 
-        const version = std.fmt.parseInt(u32, version_str, 10) catch return error.SchemaMismatch;
+        const version = std.fmt.parseInt(u32, version_str, 10) catch return error.SchemaError;
         if (version != SCHEMA_VERSION) return error.SchemaMismatch;
     }
 
     fn prepare(self: *StateStore, sql: [:0]const u8) !*c.sqlite3_stmt {
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, sql.ptr, -1, &stmt, null) != c.SQLITE_OK)
-            return error.SqliteError;
+        try sqliteOk(c.sqlite3_prepare_v2(self.db, sql.ptr, -1, &stmt, null));
         return stmt.?;
     }
 
@@ -167,7 +182,7 @@ pub const StateStore = struct {
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
 
-        if (c.sqlite3_bind_int64(stmt, 1, id) != c.SQLITE_OK) return error.SqliteError;
+        try sqliteOk(c.sqlite3_bind_int64(stmt, 1, id));
 
         return switch (c.sqlite3_step(stmt)) {
             c.SQLITE_ROW => blk: {
@@ -188,13 +203,25 @@ pub const StateStore = struct {
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
 
-        if (c.sqlite3_bind_int64(stmt, 1, id) != c.SQLITE_OK) return error.SqliteError;
-        if (c.sqlite3_bind_text(stmt, 2, data.ptr, @intCast(data.len), null) != c.SQLITE_OK)
-            return error.SqliteError;
-
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteError;
+        try sqliteOk(c.sqlite3_bind_int64(stmt, 1, id));
+        try sqliteOk(c.sqlite3_bind_text(stmt, 2, data.ptr, @intCast(data.len), null));
+        try sqliteDone(c.sqlite3_step(stmt));
     }
+
+    inline fn sqliteOk(rc: c_int) !void {
+        if (rc != c.SQLITE_OK) return error.SqliteError;
+    }
+
+    inline fn sqliteDone(rc: c_int) !void {
+        if (rc != c.SQLITE_DONE) return error.SqliteError;
+    }
+    //
+    // try sqliteOk(c.sqlite3_bind_int64(stmt, 1, id));
+    // try sqliteOk(c.sqlite3_bind_text(stmt, 2, data.ptr, @intCast(data.len), null));
+    // try sqliteDone(c.sqlite3_step(stmt));
+    //
 };
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -423,9 +450,15 @@ test "AC-5.11: busy_timeout set — concurrent writers complete without BUSY err
     }
 
     // Verify busy_timeout pragma is 5000
-    const stmt = try s1.prepare("PRAGMA busy_timeout");
-    defer _ = c.sqlite3_finalize(stmt);
-    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
-    const timeout = c.sqlite3_column_int64(stmt, 0);
-    try testing.expectEqual(@as(i64, 5000), timeout);
+    const stmt1 = try s1.prepare("PRAGMA busy_timeout");
+    defer _ = c.sqlite3_finalize(stmt1);
+    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt1));
+    const timeout1 = c.sqlite3_column_int64(stmt1, 0);
+    try testing.expectEqual(@as(i64, 5000), timeout1);
+
+    const stmt2 = try s1.prepare("PRAGMA busy_timeout");
+    defer _ = c.sqlite3_finalize(stmt2);
+    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt2));
+    const timeout2 = c.sqlite3_column_int64(stmt2, 0);
+    try testing.expectEqual(@as(i64, 5000), timeout2);
 }

@@ -89,6 +89,48 @@ fn getCtx(lua: *Lua) *ApiCtx {
     return @constCast(@alignCast(@ptrCast(ptr)));
 }
 
+
+// ---------------------------------------------------------------------------
+// Private: getStateImpl
+// ---------------------------------------------------------------------------
+//
+fn getStateImpl(
+    lua: *Lua,
+    ctx: *ApiCtx,
+    id: ziglua.Integer,
+    comptime dbFn: fn (*state_store.StateStore, i64) anyerror![]u8,
+    comptime errPrefix: []const u8,
+) c_int {
+    const json = dbFn(ctx.db, id) catch |err| {
+        lua.raiseErrorStr(errPrefix ++ " db error: %s", .{@errorName(err).ptr});
+    };
+    defer ctx.db.allocator.free(json);
+    serializer.jsonToLuaTable(lua, json, ctx.allocator) catch |err| {
+        lua.raiseErrorStr(errPrefix ++ " deserialize error: %s", .{@errorName(err).ptr});
+    };
+    return 1;
+}
+
+fn setStateImpl(
+    lua: *Lua,
+    ctx: *ApiCtx,
+    id: ziglua.Integer,
+    comptime dbFn: fn (*state_store.StateStore, i64, []const u8) anyerror!void,
+    comptime errPrefix: []const u8,
+) c_int {
+    lua.checkType(2, .table);
+
+    const json = serializer.luaTableToJson(lua, 2, ctx.allocator) catch |err| {
+        lua.raiseErrorStr(errPrefix ++ " serialize error: %s", .{@errorName(err).ptr});
+    };
+    defer ctx.allocator.free(json);
+
+    dbFn(ctx.db, id, json) catch |err| {
+        lua.raiseErrorStr(errPrefix ++ " db error: %s", .{@errorName(err).ptr});
+    };
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // bot.get_user_state(user_id: integer) -> table
 // ---------------------------------------------------------------------------
@@ -98,15 +140,7 @@ fn botGetUserState(state: ?*ziglua.LuaState) callconv(.c) c_int {
     const ctx = getCtx(lua);
     const user_id = lua.checkInteger(1);
 
-    const json = ctx.db.getUserState(user_id) catch |err| {
-        lua.raiseErrorStr("get_user_state db error: %s", .{@errorName(err).ptr});
-    };
-    defer ctx.db.allocator.free(json);
-
-    serializer.jsonToLuaTable(lua, json, ctx.allocator) catch |err| {
-        lua.raiseErrorStr("get_user_state deserialize error: %s", .{@errorName(err).ptr});
-    };
-    return 1;
+    return getStateImpl(lua, ctx, user_id, state_store.StateStore.getUserState, "getUserState");
 }
 
 // ---------------------------------------------------------------------------
@@ -117,17 +151,9 @@ fn botSetUserState(state: ?*ziglua.LuaState) callconv(.c) c_int {
     const lua: *Lua = @ptrCast(state.?);
     const ctx = getCtx(lua);
     const user_id = lua.checkInteger(1);
-    lua.checkType(2, .table);
+    // lua.checkType(2, .table);
 
-    const json = serializer.luaTableToJson(lua, 2, ctx.allocator) catch |err| {
-        lua.raiseErrorStr("set_user_state serialize error: %s", .{@errorName(err).ptr});
-    };
-    defer ctx.allocator.free(json);
-
-    ctx.db.setUserState(user_id, json) catch |err| {
-        lua.raiseErrorStr("set_user_state db error: %s", .{@errorName(err).ptr});
-    };
-    return 0;
+    return setStateImpl(lua, ctx, user_id, state_store.StateStore.setUserState, "setUserState");
 }
 
 // ---------------------------------------------------------------------------
@@ -139,15 +165,7 @@ fn botGetChatState(state: ?*ziglua.LuaState) callconv(.c) c_int {
     const ctx = getCtx(lua);
     const chat_id = lua.checkInteger(1);
 
-    const json = ctx.db.getChatState(chat_id) catch |err| {
-        lua.raiseErrorStr("get_chat_state db error: %s", .{@errorName(err).ptr});
-    };
-    defer ctx.db.allocator.free(json);
-
-    serializer.jsonToLuaTable(lua, json, ctx.allocator) catch |err| {
-        lua.raiseErrorStr("get_chat_state deserialize error: %s", .{@errorName(err).ptr});
-    };
-    return 1;
+    return getStateImpl(lua, ctx, chat_id, state_store.StateStore.getChatState, "getChatState");
 }
 
 // ---------------------------------------------------------------------------
@@ -160,15 +178,7 @@ fn botSetChatState(state: ?*ziglua.LuaState) callconv(.c) c_int {
     const chat_id = lua.checkInteger(1);
     lua.checkType(2, .table);
 
-    const json = serializer.luaTableToJson(lua, 2, ctx.allocator) catch |err| {
-        lua.raiseErrorStr("set_chat_state serialize error: %s", .{@errorName(err).ptr});
-    };
-    defer ctx.allocator.free(json);
-
-    ctx.db.setChatState(chat_id, json) catch |err| {
-        lua.raiseErrorStr("set_chat_state db error: %s", .{@errorName(err).ptr});
-    };
-    return 0;
+    return setStateImpl(lua, ctx, chat_id, state_store.StateStore.setChatState, "setChatState");
 }
 
 // ---------------------------------------------------------------------------

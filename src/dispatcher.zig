@@ -30,7 +30,7 @@ const log = std.log.scoped(.dispatcher);
 // ---------------------------------------------------------------------------
 
 pub const DispatcherArgs = struct {
-    id: u32,
+    id: u8,
     queue: *queue_mod.Queue(types.Action),
     bot_token: []const u8,
     /// Base URL for the Telegram Bot API.
@@ -52,18 +52,25 @@ pub const DispatcherArgs = struct {
 pub fn dispatcherThread(args: DispatcherArgs) void {
     var client = std.http.Client{ .allocator = args.allocator };
     defer client.deinit();
+    const url_prefix = std.fmt.allocPrint(
+        args.allocator,
+        "{s}/bot{s}/",
+        .{ args.api_base, args.bot_token },
+    ) catch unreachable;
+    defer args.allocator.free(url_prefix);
 
     while (!args.stop.load(.acquire)) {
-        const maybe_action = args.queue.tryPop();
+        // const maybe_action = args.queue.tryPop();
+        const maybe_action = args.queue.popTimeout(10 * std.time.ns_per_ms);
         if (maybe_action == null) {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            // std.Thread.sleep(1 * std.time.ns_per_ms);
             continue;
         }
         const action = maybe_action.?;
         // Always free string payloads, whether send succeeds or not.
-        defer freeActionPayload(action, args.allocator);
+        defer types.freeActionPayload(action, args.allocator);
 
-        sendWithRetry(&client, action, args.bot_token, args.api_base, args.allocator) catch |err| {
+        sendWithRetry(&client, action, url_prefix, args.allocator) catch |err| {
             log.warn("dispatcher {d}: dropped action after retry failure: {s}", .{ args.id, @errorName(err) });
         };
     }
@@ -77,11 +84,10 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
 fn sendWithRetry(
     client: *std.http.Client,
     action: types.Action,
-    bot_token: []const u8,
-    api_base: []const u8,
+    url_prefix: []const u8,
     allocator: std.mem.Allocator,
 ) !void {
-    if (send(client, action, bot_token, api_base, allocator)) {
+    if (send(client, action, url_prefix, allocator)) {
         return;
     } else |err| {
         log.warn("send failed ({s}), retrying in 1s", .{@errorName(err)});
@@ -91,7 +97,7 @@ fn sendWithRetry(
         // broken and would cause a second WriteFailed/ReadFailed.
         client.deinit();
         client.* = std.http.Client{ .allocator = allocator };
-        try send(client, action, bot_token, api_base, allocator);
+        try send(client, action, url_prefix, allocator);
     }
 }
 
@@ -102,8 +108,7 @@ fn sendWithRetry(
 fn send(
     client: *std.http.Client,
     action: types.Action,
-    bot_token: []const u8,
-    api_base: []const u8,
+    url_prefix: []const u8,
     allocator: std.mem.Allocator,
 ) !void {
     const method_path = actionMethod(action);
@@ -111,19 +116,15 @@ fn send(
     const body = try buildBody(action, allocator);
     defer allocator.free(body);
 
-    const url = try std.fmt.allocPrint(
-        allocator,
-        "{s}/bot{s}/{s}",
-        .{ api_base, bot_token, method_path },
-    );
-    defer allocator.free(url);
+    var buf: [256]u8 = undefined;
+    const url = std.fmt.bufPrint(&buf, "{s}{s}", .{ url_prefix, method_path }) catch unreachable;
 
     log.info("→ {s}  {s}", .{ method_path, body });
 
     const result = try client.fetch(.{
-        .location      = .{ .url = url },
-        .payload       = body,
-        .keep_alive    = false, // each send uses a fresh connection; simplifies retry logic
+        .location = .{ .url = url },
+        .payload = body,
+        .keep_alive = false, // each send uses a fresh connection; simplifies retry logic
         .extra_headers = &.{
             .{ .name = "Content-Type", .value = "application/json" },
         },
@@ -146,8 +147,8 @@ fn send(
 fn actionMethod(action: types.Action) [:0]const u8 {
     return switch (action) {
         .send_message, .send_message_ex => "sendMessage",
-        .answer_callback               => "answerCallbackQuery",
-        .delete_message                => "deleteMessage",
+        .answer_callback => "answerCallbackQuery",
+        .delete_message => "deleteMessage",
     };
 }
 
@@ -159,37 +160,27 @@ pub fn buildBody(action: types.Action, allocator: std.mem.Allocator) ![]u8 {
     return switch (action) {
         .send_message => |a| std.json.Stringify.valueAlloc(allocator, .{
             .chat_id = a.chat_id,
-            .text    = a.text,
+            .text = a.text,
         }, .{}),
 
         .send_message_ex => |a| blk: {
-            // Serialize the base fields, then splice in the opts JSON object.
-            const base = try std.json.Stringify.valueAlloc(allocator, .{
-                .chat_id = a.chat_id,
-                .text    = a.text,
-            }, .{});
-            defer allocator.free(base);
-
-            if (std.mem.eql(u8, a.opts, "{}")) {
-                break :blk try allocator.dupe(u8, base);
+            var aw: std.io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            try aw.writer.print("{{\"chat_id\":{d},\"text\":", .{a.chat_id});
+            try std.json.Stringify.value(a.text, .{}, &aw.writer);
+            if (!std.mem.eql(u8, a.opts, "{}")) {
+                try aw.writer.writeByte(',');
+                try aw.writer.writeAll(a.opts[1 .. a.opts.len - 1]); // strip outer { }
             }
-            // base ends with '}', opts starts with '{'.
-            // Drop the trailing '}' from base and the leading '{' from opts,
-            // join with ',' to produce a valid merged JSON object.
-            std.debug.assert(base[base.len - 1] == '}');
-            std.debug.assert(a.opts[0] == '{');
-            break :blk try std.mem.concat(allocator, u8, &.{
-                base[0 .. base.len - 1],
-                ",",
-                a.opts[1..],
-            });
+            try aw.writer.writeByte('}');
+            break :blk try aw.toOwnedSlice();
         },
 
         .answer_callback => |a| blk: {
             if (a.text) |text| {
                 break :blk std.json.Stringify.valueAlloc(allocator, .{
                     .callback_query_id = a.callback_query_id,
-                    .text              = text,
+                    .text = text,
                 }, .{});
             } else {
                 break :blk std.json.Stringify.valueAlloc(allocator, .{
@@ -199,29 +190,10 @@ pub fn buildBody(action: types.Action, allocator: std.mem.Allocator) ![]u8 {
         },
 
         .delete_message => |a| std.json.Stringify.valueAlloc(allocator, .{
-            .chat_id    = a.chat_id,
+            .chat_id = a.chat_id,
             .message_id = a.message_id,
         }, .{}),
     };
-}
-
-// ---------------------------------------------------------------------------
-// Private: free all heap-allocated strings inside one Action
-// ---------------------------------------------------------------------------
-
-pub fn freeActionPayload(action: types.Action, allocator: std.mem.Allocator) void {
-    switch (action) {
-        .send_message    => |a| allocator.free(a.text),
-        .send_message_ex => |a| {
-            allocator.free(a.text);
-            allocator.free(a.opts);
-        },
-        .answer_callback => |a| {
-            allocator.free(a.callback_query_id);
-            if (a.text) |t| allocator.free(t);
-        },
-        .delete_message => {},
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,8 +207,8 @@ const testing = std.testing;
 test "AC-9.1: send_message body contains chat_id and text" {
     const action = types.Action{ .send_message = .{
         .chat_id = 123,
-        .text    = "hello",
-    }};
+        .text = "hello",
+    } };
     const body = try buildBody(action, testing.allocator);
     defer testing.allocator.free(body);
 
@@ -246,9 +218,9 @@ test "AC-9.1: send_message body contains chat_id and text" {
 test "AC-9.2: send_message_ex merges opts fields into body" {
     const action = types.Action{ .send_message_ex = .{
         .chat_id = 7,
-        .text    = "bold",
-        .opts    = try testing.allocator.dupe(u8, "{\"parse_mode\":\"HTML\"}"),
-    }};
+        .text = "bold",
+        .opts = try testing.allocator.dupe(u8, "{\"parse_mode\":\"HTML\"}"),
+    } };
     defer testing.allocator.free(action.send_message_ex.opts);
 
     const body = try buildBody(action, testing.allocator);
@@ -263,9 +235,9 @@ test "AC-9.2: send_message_ex merges opts fields into body" {
 test "AC-9.2: send_message_ex with empty opts == send_message body" {
     const action = types.Action{ .send_message_ex = .{
         .chat_id = 1,
-        .text    = "plain",
-        .opts    = try testing.allocator.dupe(u8, "{}"),
-    }};
+        .text = "plain",
+        .opts = try testing.allocator.dupe(u8, "{}"),
+    } };
     defer testing.allocator.free(action.send_message_ex.opts);
 
     const body = try buildBody(action, testing.allocator);
@@ -277,8 +249,8 @@ test "AC-9.2: send_message_ex with empty opts == send_message body" {
 test "AC-9.3: answer_callback body with text" {
     const action = types.Action{ .answer_callback = .{
         .callback_query_id = "cq42",
-        .text              = "done",
-    }};
+        .text = "done",
+    } };
     const body = try buildBody(action, testing.allocator);
     defer testing.allocator.free(body);
 
@@ -291,8 +263,8 @@ test "AC-9.3: answer_callback body with text" {
 test "AC-9.3: answer_callback body without text" {
     const action = types.Action{ .answer_callback = .{
         .callback_query_id = "cq99",
-        .text              = null,
-    }};
+        .text = null,
+    } };
     const body = try buildBody(action, testing.allocator);
     defer testing.allocator.free(body);
 
@@ -301,9 +273,9 @@ test "AC-9.3: answer_callback body without text" {
 
 test "AC-9.4: delete_message body contains chat_id and message_id" {
     const action = types.Action{ .delete_message = .{
-        .chat_id    = 55,
+        .chat_id = 55,
         .message_id = 1001,
-    }};
+    } };
     const body = try buildBody(action, testing.allocator);
     defer testing.allocator.free(body);
 
@@ -311,14 +283,10 @@ test "AC-9.4: delete_message body contains chat_id and message_id" {
 }
 
 test "AC-9.1: actionMethod returns correct paths" {
-    try testing.expectEqualStrings("sendMessage",
-        actionMethod(.{ .send_message = .{ .chat_id = 0, .text = "" } }));
-    try testing.expectEqualStrings("sendMessage",
-        actionMethod(.{ .send_message_ex = .{ .chat_id = 0, .text = "", .opts = "{}" } }));
-    try testing.expectEqualStrings("answerCallbackQuery",
-        actionMethod(.{ .answer_callback = .{ .callback_query_id = "", .text = null } }));
-    try testing.expectEqualStrings("deleteMessage",
-        actionMethod(.{ .delete_message = .{ .chat_id = 0, .message_id = 0 } }));
+    try testing.expectEqualStrings("sendMessage", actionMethod(.{ .send_message = .{ .chat_id = 0, .text = "" } }));
+    try testing.expectEqualStrings("sendMessage", actionMethod(.{ .send_message_ex = .{ .chat_id = 0, .text = "", .opts = "{}" } }));
+    try testing.expectEqualStrings("answerCallbackQuery", actionMethod(.{ .answer_callback = .{ .callback_query_id = "", .text = null } }));
+    try testing.expectEqualStrings("deleteMessage", actionMethod(.{ .delete_message = .{ .chat_id = 0, .message_id = 0 } }));
 }
 
 // ── Mock HTTP server ─────────────────────────────────────────────────────────
@@ -327,11 +295,12 @@ test "AC-9.1: actionMethod returns correct paths" {
 /// Accepts connections, records each POST request, and replies with
 /// {"ok":true}. Closes cleanly when `stop` is set or when `server.deinit()`
 /// is called (which unblocks `accept` with an error).
-const MockServer = struct {
-    server:   std.net.Server,
-    thread:   std.Thread,
+pub const MockServer = struct {
+    server: std.net.Server,
+    thread: std.Thread,
     received: queue_mod.Queue(MockRequest),
-    stop:     std.atomic.Value(bool),
+    stop: std.atomic.Value(bool),
+    call_cnt: std.atomic.Value(u32),
     allocator: std.mem.Allocator,
 
     const MockRequest = struct {
@@ -348,21 +317,22 @@ const MockServer = struct {
     // Heap-allocated so that `&self` passed to the spawned thread remains valid
     // after init() returns.  A by-value return would copy the struct and
     // invalidate the pointer held by mockLoop.
-    fn init(allocator: std.mem.Allocator) !*MockServer {
+    pub fn init(allocator: std.mem.Allocator) !*MockServer {
         const self = try allocator.create(MockServer);
         errdefer allocator.destroy(self);
         const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
-        self.server    = try addr.listen(.{ .reuse_address = true });
+        self.server = try addr.listen(.{ .reuse_address = true });
         errdefer self.server.deinit();
         self.allocator = allocator;
-        self.stop      = std.atomic.Value(bool).init(false);
-        self.received  = try queue_mod.Queue(MockRequest).init(allocator, 512);
+        self.call_cnt = std.atomic.Value(u32).init(0);
+        self.stop = std.atomic.Value(bool).init(false);
+        self.received = try queue_mod.Queue(MockRequest).init(allocator, 512);
         errdefer self.received.deinit(allocator);
         self.thread = try std.Thread.spawn(.{}, mockLoop, .{self});
         return self;
     }
 
-    fn deinit(self: *MockServer) void {
+    pub fn deinit(self: *MockServer) void {
         self.stop.store(true, .release);
         // mockLoop polls with a 10ms timeout and re-checks stop on each
         // iteration, so it will exit within ~10ms of seeing stop = true.
@@ -371,7 +341,7 @@ const MockServer = struct {
         self.thread.join();
         self.server.deinit();
         // Drain any unread requests.
-        while (self.received.tryPop()) |req| {
+        while (self.received.popTimeout(0)) |req| {
             var r = req;
             r.deinit();
         }
@@ -383,13 +353,13 @@ const MockServer = struct {
         return self.server.listen_address.in.sa.port;
     }
 
-    fn baseUrl(self: *const MockServer, buf: []u8) []u8 {
+    pub fn baseUrl(self: *const MockServer, buf: []u8) []u8 {
         return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}", .{
             std.mem.bigToNative(u16, self.port()),
         }) catch unreachable;
     }
 
-    fn waitForN(self: *MockServer, n: usize, timeout_ms: u64) bool {
+    pub fn waitForN(self: *MockServer, n: usize, timeout_ms: u64) bool {
         const t0 = std.time.milliTimestamp();
         while (self.received.len() < n) {
             if (@as(u64, @intCast(std.time.milliTimestamp() - t0)) >= timeout_ms)
@@ -407,7 +377,7 @@ fn mockLoop(srv: *MockServer) void {
         // ever calling accept() on a closed fd.  The fd is only closed in
         // MockServer.deinit() *after* thread.join(), so it is always valid here.
         var pfd = std.posix.pollfd{
-            .fd     = fd,
+            .fd = fd,
             .events = std.posix.POLL.IN,
             .revents = 0,
         };
@@ -445,6 +415,7 @@ fn mockHandle(srv: *MockServer, conn: std.net.Server.Connection) void {
             "\r\n" ++
             "{\"ok\":true}\r\n\r\n";
         conn.stream.writeAll(response) catch return;
+        _ = srv.call_cnt.fetchAdd(1, .release);
     }
 }
 
@@ -472,7 +443,7 @@ fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?Mock
     // Parse request line: "POST /path HTTP/1.1"
     const rl_end = std.mem.indexOf(u8, header_section, "\r\n") orelse return null;
     var parts = std.mem.splitScalar(u8, header_section[0..rl_end], ' ');
-    _ = parts.next() orelse return null;           // skip method
+    _ = parts.next() orelse return null; // skip method
     const raw_path = parts.next() orelse return null;
     const path = try allocator.dupe(u8, raw_path);
     errdefer allocator.free(path);
@@ -482,7 +453,7 @@ fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?Mock
     var lines = std.mem.splitSequence(u8, header_section[rl_end + 2 ..], "\r\n");
     while (lines.next()) |line| {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const name  = line[0..colon];
+        const name = line[0..colon];
         const value = std.mem.trim(u8, line[colon + 1 ..], " ");
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             content_length = std.fmt.parseInt(usize, value, 10) catch 0;
@@ -492,7 +463,7 @@ fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?Mock
 
     // Ensure we have the full body.
     const body_start = he + 4;
-    const needed     = body_start + content_length;
+    const needed = body_start + content_length;
     while (buf.items.len < needed) {
         const n = stream.read(&tmp) catch |err| switch (err) {
             error.ConnectionResetByPeer, error.BrokenPipe => break,
@@ -507,8 +478,8 @@ fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?Mock
     errdefer allocator.free(body);
 
     return MockServer.MockRequest{
-        .path      = path,
-        .body      = body,
+        .path = path,
+        .body = body,
         .allocator = allocator,
     };
 }
@@ -519,8 +490,8 @@ fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?Mock
 // returns.  A by-value return would copy the struct to the caller's stack and
 // invalidate the pointers passed to the spawned thread.
 const TestDispatcher = struct {
-    stop:   std.atomic.Value(bool),
-    queue:  queue_mod.Queue(types.Action),
+    stop: std.atomic.Value(bool),
+    queue: queue_mod.Queue(types.Action),
     thread: std.Thread,
     allocator: std.mem.Allocator,
 
@@ -532,17 +503,16 @@ const TestDispatcher = struct {
         const self = try allocator.create(TestDispatcher);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
-        self.stop      = std.atomic.Value(bool).init(false);
-        self.queue     = try queue_mod.Queue(types.Action).init(allocator, 256);
+        self.stop = std.atomic.Value(bool).init(false);
+        self.queue = try queue_mod.Queue(types.Action).init(allocator, 256);
         errdefer self.queue.deinit(allocator);
         const args = DispatcherArgs{
-            .id          = 0,
-            .queue       = &self.queue,
-            .bot_token   = bot_token,
-            .api_base    = api_base,
-            .allocator   = allocator,
-            .stop        = &self.stop,
-
+            .id = 0,
+            .queue = &self.queue,
+            .bot_token = bot_token,
+            .api_base = api_base,
+            .allocator = allocator,
+            .stop = &self.stop,
         };
         self.thread = try std.Thread.spawn(.{}, dispatcherThread, .{args});
         return self;
@@ -570,8 +540,8 @@ test "AC-9.1: send_message POSTs to /bot{token}/sendMessage with JSON body" {
 
     try d.queue.push(.{ .send_message = .{
         .chat_id = 42,
-        .text    = try testing.allocator.dupe(u8, "hello"),
-    }});
+        .text = try testing.allocator.dupe(u8, "hello"),
+    } });
 
     try testing.expect(mock.waitForN(1, 2000));
 
@@ -594,9 +564,9 @@ test "AC-9.2: send_message_ex merges opts in the sent body" {
 
     try d.queue.push(.{ .send_message_ex = .{
         .chat_id = 1,
-        .text    = try testing.allocator.dupe(u8, "hi"),
-        .opts    = try testing.allocator.dupe(u8, "{\"parse_mode\":\"HTML\"}"),
-    }});
+        .text = try testing.allocator.dupe(u8, "hi"),
+        .opts = try testing.allocator.dupe(u8, "{\"parse_mode\":\"HTML\"}"),
+    } });
 
     try testing.expect(mock.waitForN(1, 2000));
 
@@ -620,8 +590,8 @@ test "AC-9.3: answer_callback POSTs to answerCallbackQuery" {
 
     try d.queue.push(.{ .answer_callback = .{
         .callback_query_id = try testing.allocator.dupe(u8, "cq1"),
-        .text              = try testing.allocator.dupe(u8, "done"),
-    }});
+        .text = try testing.allocator.dupe(u8, "done"),
+    } });
 
     try testing.expect(mock.waitForN(1, 2000));
     var req = mock.received.pop();
@@ -643,9 +613,9 @@ test "AC-9.4: delete_message POSTs to deleteMessage" {
     defer d.deinit();
 
     try d.queue.push(.{ .delete_message = .{
-        .chat_id    = 99,
+        .chat_id = 99,
         .message_id = 777,
-    }});
+    } });
 
     try testing.expect(mock.waitForN(1, 2000));
     var req = mock.received.pop();
@@ -673,7 +643,7 @@ test "AC-9.5: dispatcher retries once after server closes connection; exactly 2 
     // Spawn a thread that drops the first connection and serves the second.
     var attempt_count = std.atomic.Value(u32).init(0);
     const Ctx = struct {
-        server:        *std.net.Server,
+        server: *std.net.Server,
         attempt_count: *std.atomic.Value(u32),
     };
     const ctx = Ctx{ .server = &server, .attempt_count = &attempt_count };
@@ -693,7 +663,7 @@ test "AC-9.5: dispatcher retries once after server closes connection; exactly 2 
             _ = c2.stream.read(&buf) catch {};
             c2.stream.writeAll(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
-                "Content-Length: 15\r\n\r\n{\"ok\":true}\r\n\r\n",
+                    "Content-Length: 15\r\n\r\n{\"ok\":true}\r\n\r\n",
             ) catch {};
         }
     }.run, .{ctx});
@@ -703,8 +673,8 @@ test "AC-9.5: dispatcher retries once after server closes connection; exactly 2 
 
     try d.queue.push(.{ .send_message = .{
         .chat_id = 1,
-        .text    = try testing.allocator.dupe(u8, "retry test"),
-    }});
+        .text = try testing.allocator.dupe(u8, "retry test"),
+    } });
 
     srv_thread.join();
 
@@ -724,7 +694,7 @@ test "AC-9.6: both attempts fail — action discarded, no third attempt, no cras
 
     var attempt_count = std.atomic.Value(u32).init(0);
     const Ctx = struct {
-        server:        *std.net.Server,
+        server: *std.net.Server,
         attempt_count: *std.atomic.Value(u32),
     };
     const ctx = Ctx{ .server = &server, .attempt_count = &attempt_count };
@@ -747,8 +717,8 @@ test "AC-9.6: both attempts fail — action discarded, no third attempt, no cras
 
     try d.queue.push(.{ .send_message = .{
         .chat_id = 2,
-        .text    = try testing.allocator.dupe(u8, "both-fail"),
-    }});
+        .text = try testing.allocator.dupe(u8, "both-fail"),
+    } });
 
     srv_thread.join();
     server.deinit(); // safe to call after thread exits
@@ -771,13 +741,12 @@ test "AC-9.7: 100 actions dispatched — all 100 received by mock server" {
     var threads: [4]std.Thread = undefined;
     for (&threads, 0..) |*t, i| {
         t.* = try std.Thread.spawn(.{}, dispatcherThread, .{DispatcherArgs{
-            .id          = @intCast(i),
-            .queue       = &queue,
-            .bot_token   = "TOK",
-            .api_base    = mock.baseUrl(&url_buf),
-            .allocator   = testing.allocator,
-            .stop        = &stop,
-
+            .id = @intCast(i),
+            .queue = &queue,
+            .bot_token = "TOK",
+            .api_base = mock.baseUrl(&url_buf),
+            .allocator = testing.allocator,
+            .stop = &stop,
         }});
     }
     defer {
@@ -788,15 +757,15 @@ test "AC-9.7: 100 actions dispatched — all 100 received by mock server" {
     for (0..100) |i| {
         try queue.push(.{ .send_message = .{
             .chat_id = @intCast(i),
-            .text    = try testing.allocator.dupe(u8, "bulk"),
-        }});
+            .text = try testing.allocator.dupe(u8, "bulk"),
+        } });
     }
 
     try testing.expect(mock.waitForN(100, 10_000));
     try testing.expectEqual(@as(usize, 100), mock.received.len());
 
     // Drain to free memory.
-    while (mock.received.tryPop()) |req| {
+    while (mock.received.popTimeout(0)) |req| {
         var r = req;
         r.deinit();
     }
@@ -817,8 +786,8 @@ test "AC-9.8: actions from one on_message call dispatched in original order" {
     for (0..N) |i| {
         try d.queue.push(.{ .send_message = .{
             .chat_id = @intCast(i),
-            .text    = try testing.allocator.dupe(u8, "ordered"),
-        }});
+            .text = try testing.allocator.dupe(u8, "ordered"),
+        } });
     }
 
     try testing.expect(mock.waitForN(N, 5000));
@@ -840,7 +809,7 @@ test "AC-9.8: actions from one on_message call dispatched in original order" {
 // ── Live integration test ─────────────────────────────────────────────────────
 
 test "AC-9.live: send real Telegram message via dispatcher" {
-    const token   = std.posix.getenv("TELEGRAM_BOT_TOKEN") orelse return error.SkipZigTest;
+    const token = std.posix.getenv("TELEGRAM_BOT_TOKEN") orelse return error.SkipZigTest;
     const chat_id_str = std.posix.getenv("TELEGRAM_CHAT_ID") orelse return error.SkipZigTest;
     const chat_id = try std.fmt.parseInt(i64, chat_id_str, 10);
 
@@ -850,8 +819,8 @@ test "AC-9.live: send real Telegram message via dispatcher" {
     const msg = "zora dispatcher live — Phase 9 wired up. Actions reach Telegram.";
     try d.queue.push(.{ .send_message = .{
         .chat_id = chat_id,
-        .text    = try testing.allocator.dupe(u8, msg),
-    }});
+        .text = try testing.allocator.dupe(u8, msg),
+    } });
 
     // Give the dispatcher enough time to send and confirm.
     std.Thread.sleep(4 * std.time.ns_per_s);

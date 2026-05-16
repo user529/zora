@@ -1,7 +1,3 @@
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous  = NORMAL;
-PRAGMA busy_timeout = 5000;
-PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS meta (
     key    TEXT PRIMARY KEY,
@@ -23,4 +19,4 @@ CREATE TABLE IF NOT EXISTS global_state (
     value    TEXT NOT NULL
 ) STRICT;
 
-INSERT OR IGNORE INTO meta VALUES ('schema_version', '1');
+INSERT INTO meta VALUES ('schema_version', '1');

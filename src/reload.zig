@@ -47,16 +47,10 @@ pub const WatcherArgs = struct {
 pub fn watcherThread(args: WatcherArgs) void {
     // Own a copy of rules_path so the caller's string can be freed any time
     // after spawning this thread.
-    const rules_path = args.allocator.dupe(u8, args.rules_path) catch {
-        log.err("OOM duplicating rules_path — hot-reload disabled", .{});
-        return;
-    };
-    defer args.allocator.free(rules_path);
-
     switch (builtin.os.tag) {
-        .linux   => watcherInotify(rules_path, &reload_version),
-        .freebsd => watcherKqueue(rules_path, &reload_version),
-        else     => watcherPoll(rules_path, &reload_version, 500, null),
+        .linux   => watcherInotify(args.rules_path, &reload_version),
+        .freebsd => watcherKqueue(args.rules_path, &reload_version),
+        else     => watcherPoll(args.rules_path, &reload_version, 500, null),
     }
 }
 

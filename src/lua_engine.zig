@@ -140,25 +140,6 @@ pub const LuaEngine = struct {
         // ── 5. Parse result table → []Action ─────────────────────────────
         return parseActions(lua, lua.getTop(), allocator);
     }
-
-    /// Free a slice of Actions previously returned by callOnMessage.
-    pub fn freeActions(actions: []types.Action, allocator: std.mem.Allocator) void {
-        for (actions) |action| {
-            switch (action) {
-                .send_message => |a| allocator.free(a.text),
-                .send_message_ex => |a| {
-                    allocator.free(a.text);
-                    allocator.free(a.opts);
-                },
-                .answer_callback => |a| {
-                    allocator.free(a.callback_query_id);
-                    if (a.text) |t| allocator.free(t);
-                },
-                .delete_message => {}, // no owned strings
-            }
-        }
-        allocator.free(actions);
-    }
 };
 
 // ---------------------------------------------------------------------------
@@ -178,15 +159,7 @@ fn parseActions(lua: *Lua, table_idx: i32, allocator: std.mem.Allocator) ![]type
     errdefer {
         // Free all string payloads accumulated so far, then the list itself.
         for (list.items) |action| {
-            switch (action) {
-                .send_message    => |a| allocator.free(a.text),
-                .send_message_ex => |a| { allocator.free(a.text); allocator.free(a.opts); },
-                .answer_callback => |a| {
-                    allocator.free(a.callback_query_id);
-                    if (a.text) |t| allocator.free(t);
-                },
-                .delete_message => {},
-            }
+            types.freeActionPayload(action, allocator);
         }
         list.deinit(allocator);
     }
@@ -372,7 +345,7 @@ test "AC-6.2: on_message returning one send_message → one correct Action" {
 
     const update = types.Update{ .update_id = 1 };
     const actions = try engine.callOnMessage(testing.allocator, update);
-    defer LuaEngine.freeActions(actions, testing.allocator);
+    defer types.freeActions(actions, testing.allocator);
 
     try testing.expectEqual(@as(usize, 1), actions.len);
     try testing.expectEqual(types.ActionTag.send_message, std.meta.activeTag(actions[0]));
@@ -393,7 +366,7 @@ test "AC-6.3: on_message returning {} → empty slice" {
 
     const update = types.Update{ .update_id = 2 };
     const actions = try engine.callOnMessage(testing.allocator, update);
-    defer LuaEngine.freeActions(actions, testing.allocator);
+    defer types.freeActions(actions, testing.allocator);
 
     try testing.expectEqual(@as(usize, 0), actions.len);
 }
@@ -417,7 +390,7 @@ test "AC-6.4: on_message returning 3 mixed actions → all 3 parsed" {
 
     const update = types.Update{ .update_id = 3 };
     const actions = try engine.callOnMessage(testing.allocator, update);
-    defer LuaEngine.freeActions(actions, testing.allocator);
+    defer types.freeActions(actions, testing.allocator);
 
     try testing.expectEqual(@as(usize, 3), actions.len);
     try testing.expectEqual(types.ActionTag.send_message,    std.meta.activeTag(actions[0]));
@@ -443,7 +416,8 @@ test "AC-6.5: on_message error → empty slice logged, next call succeeds" {
 
     const update = types.Update{ .update_id = 4 };
     const actions = try engine.callOnMessage(testing.allocator, update);
-    defer LuaEngine.freeActions(actions, testing.allocator);
+    defer types.freeActions(actions, testing.allocator);
+
     try testing.expectEqual(@as(usize, 0), actions.len);
 
     // Replace the function with a good one; next call must succeed.
@@ -453,7 +427,8 @@ test "AC-6.5: on_message error → empty slice logged, next call succeeds" {
         \\end
     );
     const actions2 = try engine.callOnMessage(testing.allocator, update);
-    defer LuaEngine.freeActions(actions2, testing.allocator);
+    defer types.freeActions(actions2, testing.allocator);
+
     try testing.expectEqual(@as(usize, 1), actions2.len);
 }
 
@@ -470,6 +445,7 @@ test "AC-6.6: invalid Lua syntax → loadString returns error; engine still usab
     try engine.loadString("function on_message(u) return {} end");
     const update = types.Update{ .update_id = 5 };
     const actions = try engine.callOnMessage(testing.allocator, update);
-    defer LuaEngine.freeActions(actions, testing.allocator);
+    defer types.freeActions(actions, testing.allocator);
+
     try testing.expectEqual(@as(usize, 0), actions.len);
 }

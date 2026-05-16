@@ -9,17 +9,16 @@
 ///   6. Spawn hot-reload watcher (detached; no graceful shutdown in prototype)
 ///   7. Bind HTTP server and start accept loop
 ///   8. Block forever
-
-const std        = @import("std");
+const std = @import("std");
 const build_opts = @import("build_options");
-const types      = @import("types.zig");
+const types = @import("types.zig");
 const config_mod = @import("config.zig");
 const state_store = @import("state_store.zig");
-const queue_mod  = @import("queue.zig");
+const queue_mod = @import("queue.zig");
 const worker_mod = @import("worker.zig");
-const disp_mod   = @import("dispatcher.zig");
+const disp_mod = @import("dispatcher.zig");
 const server_mod = @import("server.zig");
-const reload     = @import("reload.zig");
+const reload = @import("reload.zig");
 const lua_engine = @import("lua_engine.zig");
 
 const log = std.log.scoped(.main);
@@ -60,12 +59,8 @@ fn run(allocator: std.mem.Allocator) !void {
     };
     defer config_mod.deinit(cfg, allocator);
 
-    // ── Verify DB schema before binding the socket (AC-11.3) ─────────────────
-    const db_path_z = try allocator.dupeZ(u8, cfg.db_path);
-    defer allocator.free(db_path_z);
-
     {
-        var db = state_store.StateStore.open(allocator, db_path_z) catch |err| {
+        var db = state_store.StateStore.open(allocator, cfg.db_path) catch |err| {
             log.err("database '{s}': {s}", .{ cfg.db_path, @errorName(err) });
             std.process.exit(1);
         };
@@ -80,11 +75,11 @@ fn run(allocator: std.mem.Allocator) !void {
     // call path we add later.
     const sa = std.posix.Sigaction{
         .handler = .{ .handler = sigStop },
-        .mask    = std.posix.sigemptyset(),
-        .flags   = std.posix.SA.RESTART,
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART,
     };
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
-    std.posix.sigaction(std.posix.SIG.INT,  &sa, null);
+    std.posix.sigaction(std.posix.SIG.INT, &sa, null);
 
     // ── Startup banner — before server.init (AC-11.1) ─────────────────────────
     log.info("zora starting  build={d}  schema={d}  rules_api={d}", .{
@@ -92,9 +87,6 @@ fn run(allocator: std.mem.Allocator) !void {
         state_store.SCHEMA_VERSION,
         lua_engine.RULES_API_VERSION,
     });
-
-    const rules_z = try allocator.dupeZ(u8, cfg.rules_file);
-    defer allocator.free(rules_z);
 
     var stop = std.atomic.Value(bool).init(false);
 
@@ -112,12 +104,12 @@ fn run(allocator: std.mem.Allocator) !void {
     for (0..cfg.dispatcher_threads) |i| {
         disp_threads[i] = try std.Thread.spawn(.{}, disp_mod.dispatcherThread, .{
             disp_mod.DispatcherArgs{
-                .id        = @intCast(i),
-                .queue     = &disp_q,
+                .id = @intCast(i),
+                .queue = &disp_q,
                 .bot_token = cfg.bot_token,
-                .api_base  = api_base,
+                .api_base = api_base,
                 .allocator = allocator,
-                .stop      = &stop,
+                .stop = &stop,
             },
         });
     }
@@ -140,22 +132,22 @@ fn run(allocator: std.mem.Allocator) !void {
     defer allocator.free(worker_threads);
 
     // Track per-worker DB pointers so they can be freed after workers join.
-    const dbs = try allocator.alloc(*state_store.StateStore, cfg.worker_count);
-    defer allocator.free(dbs);
+    const dbs = try allocator.alloc(state_store.StateStore, cfg.worker_count);
+    defer allocator.free(dbs); // only frees the slice backing array
 
     for (0..cfg.worker_count) |i| {
-        dbs[i] = try allocator.create(state_store.StateStore);
-        dbs[i].* = try state_store.StateStore.open(allocator, db_path_z);
+        // dbs[i] = try allocator.create(state_store.StateStore);
+        dbs[i] = try state_store.StateStore.open(allocator, cfg.db_path);
         worker_threads[i] = try std.Thread.spawn(.{}, worker_mod.workerThread, .{
             worker_mod.WorkerArgs{
-                .id               = @intCast(i),
-                .rules_path       = rules_z,
-                .allocator        = allocator,
-                .queue            = &wqs[i],
+                .id = @intCast(i),
+                .rules_path = cfg.rules_file,
+                .allocator = allocator,
+                .queue = &wqs[i],
                 .dispatcher_queue = &disp_q,
-                .db               = dbs[i],
-                .stop             = &stop,
-                .reload_ver       = &reload.reload_version,
+                .db = &dbs[i],
+                .stop = &stop,
+                .reload_ver = &reload.reload_version,
             },
         });
     }
@@ -165,7 +157,7 @@ fn run(allocator: std.mem.Allocator) !void {
         const watcher_t = try std.Thread.spawn(.{}, reload.watcherThread, .{
             reload.WatcherArgs{
                 .rules_path = cfg.rules_file,
-                .allocator  = allocator,
+                .allocator = allocator,
             },
         });
         watcher_t.detach();
@@ -173,10 +165,10 @@ fn run(allocator: std.mem.Allocator) !void {
 
     // ── HTTP server (accept loop runs in its own thread) ──────────────────────
     const srv = try server_mod.Server.init(.{
-        .listen_addr    = cfg.listen_addr,
+        .listen_addr = cfg.listen_addr,
         .webhook_secret = cfg.webhook_secret,
-        .queues         = wq_ptrs,
-        .allocator      = allocator,
+        .queues = wq_ptrs,
+        .allocator = allocator,
     });
 
     // ── Block until SIGTERM / SIGINT ──────────────────────────────────────────
@@ -189,11 +181,11 @@ fn run(allocator: std.mem.Allocator) !void {
     stop.store(true, .release);
     for (worker_threads) |t| t.join();
     // Drain Parsed(Update) items workers didn't pop before stop (free their arenas).
-    for (wqs) |*q| while (q.tryPop()) |p| p.deinit();
-    for (dbs) |db| { db.close(); allocator.destroy(db); }
+    for (wqs) |*q| while (q.popTimeout(0)) |p| p.deinit();
+    for (dbs) |*db| db.close();
     for (disp_threads) |t| t.join();
     // Drain Action items dispatchers didn't send before stop (free string payloads).
-    while (disp_q.tryPop()) |action| disp_mod.freeActionPayload(action, allocator);
+    while (disp_q.popTimeout(0)) |action| types.freeActionPayload(action, allocator);
     // Watcher thread is detached and cannot be joined; its rules_path dupe
     // is freed by the OS on process exit. Documented in KNOWN_ALLOCATIONS.md.
     log.info("shutdown complete", .{});
@@ -203,93 +195,8 @@ fn run(allocator: std.mem.Allocator) !void {
 // Tests
 // ---------------------------------------------------------------------------
 
-const testing   = std.testing;
-const Queue     = queue_mod.Queue;
-
-// ---------------------------------------------------------------------------
-// ApiMock — minimal HTTP server for integration tests.
-// Accepts any POST, responds {"ok":true}, counts calls.
-// ---------------------------------------------------------------------------
-
-const ApiMock = struct {
-    server:     std.net.Server,
-    thread:     std.Thread,
-    call_count: std.atomic.Value(u32),
-    stop:       std.atomic.Value(bool),
-    allocator:  std.mem.Allocator,
-
-    fn init(allocator: std.mem.Allocator) !*ApiMock {
-        const self = try allocator.create(ApiMock);
-        errdefer allocator.destroy(self);
-        const addr      = try std.net.Address.parseIp4("127.0.0.1", 0);
-        self.server     = try addr.listen(.{ .reuse_address = true });
-        errdefer self.server.deinit();
-        self.allocator  = allocator;
-        self.call_count = std.atomic.Value(u32).init(0);
-        self.stop       = std.atomic.Value(bool).init(false);
-        self.thread     = try std.Thread.spawn(.{}, apiMockLoop, .{self});
-        return self;
-    }
-
-    fn deinit(self: *ApiMock) void {
-        self.stop.store(true, .release);
-        self.thread.join();
-        self.server.deinit();
-        self.allocator.destroy(self);
-    }
-
-    fn baseUrl(self: *const ApiMock, buf: []u8) []u8 {
-        const port = std.mem.bigToNative(u16, self.server.listen_address.in.sa.port);
-        return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}", .{port}) catch unreachable;
-    }
-
-    fn waitForCalls(self: *ApiMock, n: u32, timeout_ms: u64) bool {
-        const t0 = std.time.milliTimestamp();
-        while (self.call_count.load(.acquire) < n) {
-            if (@as(u64, @intCast(std.time.milliTimestamp() - t0)) >= timeout_ms) return false;
-            std.Thread.sleep(5 * std.time.ns_per_ms);
-        }
-        return true;
-    }
-};
-
-fn apiMockLoop(mock: *ApiMock) void {
-    const fd = mock.server.stream.handle;
-    while (!mock.stop.load(.acquire)) {
-        var pfd = std.posix.pollfd{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
-        const n = std.posix.poll(@as(*[1]std.posix.pollfd, &pfd)[0..1], 10) catch return;
-        if (n == 0) continue;
-        if (pfd.revents & std.posix.POLL.IN == 0) continue;
-        const conn = mock.server.accept() catch continue;
-        const t = std.Thread.spawn(.{}, apiMockHandle, .{ mock, conn }) catch {
-            conn.stream.close();
-            continue;
-        };
-        t.detach();
-    }
-}
-
-fn apiMockHandle(mock: *ApiMock, conn: std.net.Server.Connection) void {
-    defer conn.stream.close();
-    // Drain until end-of-headers so the dispatcher's HTTP client sees a clean response.
-    var buf: [8192]u8 = undefined;
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = conn.stream.read(buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
-    }
-    conn.stream.writeAll(
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: application/json\r\n" ++
-        "Content-Length: 11\r\n" ++
-        "Connection: close\r\n" ++
-        "\r\n" ++
-        "{\"ok\":true}",
-    ) catch {};
-    _ = mock.call_count.fetchAdd(1, .release);
-}
+const testing = std.testing;
+const Queue = queue_mod.Queue;
 
 // ---------------------------------------------------------------------------
 // IntegrationStack — full bot stack for integration tests.
@@ -304,22 +211,22 @@ const IntegrationStack = struct {
     // All fields live in heap memory (this struct is heap-allocated so that
     // pointers passed to spawned threads remain stable).
 
-    stop:       std.atomic.Value(bool),
-    worker_q:   Queue(std.json.Parsed(types.Update)),
-    disp_q:     Queue(types.Action),
-    q_ptrs:     [1]*Queue(std.json.Parsed(types.Update)),
-    db:         state_store.StateStore,
-    worker_t:   std.Thread,
-    disp_t:     std.Thread,
-    srv:        *server_mod.Server,
-    tmp:        testing.TmpDir,
+    stop: std.atomic.Value(bool),
+    worker_q: Queue(std.json.Parsed(types.Update)),
+    disp_q: Queue(types.Action),
+    q_ptrs: [1]*Queue(std.json.Parsed(types.Update)),
+    db: state_store.StateStore,
+    worker_t: std.Thread,
+    disp_t: std.Thread,
+    srv: *server_mod.Server,
+    tmp: testing.TmpDir,
     rules_path_buf: [std.fs.max_path_bytes + 1]u8,
     rules_path: [:0]const u8,
 
     fn init(
         test_alloc: std.mem.Allocator,
-        api_base:   []const u8,
-        rules_lua:  []const u8,
+        api_base: []const u8,
+        rules_lua: []const u8,
     ) !*IntegrationStack {
         const self = try test_alloc.create(IntegrationStack);
         errdefer test_alloc.destroy(self);
@@ -332,15 +239,16 @@ const IntegrationStack = struct {
 
         // Resolve the absolute path (null-terminated for Lua).
         const ps = try self.tmp.dir.realpath(
-            "rules.lua", self.rules_path_buf[0..std.fs.max_path_bytes],
+            "rules.lua",
+            self.rules_path_buf[0..std.fs.max_path_bytes],
         );
         self.rules_path_buf[ps.len] = 0;
         self.rules_path = self.rules_path_buf[0..ps.len :0];
 
-        self.stop     = std.atomic.Value(bool).init(false);
+        self.stop = std.atomic.Value(bool).init(false);
         self.worker_q = try Queue(std.json.Parsed(types.Update)).init(test_alloc, 64);
         errdefer self.worker_q.deinit(test_alloc);
-        self.disp_q   = try Queue(types.Action).init(test_alloc, 256);
+        self.disp_q = try Queue(types.Action).init(test_alloc, 256);
         errdefer self.disp_q.deinit(test_alloc);
         self.q_ptrs[0] = &self.worker_q;
 
@@ -349,34 +257,34 @@ const IntegrationStack = struct {
 
         self.worker_t = try std.Thread.spawn(.{}, worker_mod.workerThread, .{
             worker_mod.WorkerArgs{
-                .id               = 0,
-                .rules_path       = self.rules_path,
-                .allocator        = std.heap.page_allocator,
-                .queue            = &self.worker_q,
+                .id = 0,
+                .rules_path = self.rules_path,
+                .allocator = std.heap.page_allocator,
+                .queue = &self.worker_q,
                 .dispatcher_queue = &self.disp_q,
-                .db               = &self.db,
-                .stop             = &self.stop,
-                .reload_ver       = &reload.reload_version,
+                .db = &self.db,
+                .stop = &self.stop,
+                .reload_ver = &reload.reload_version,
             },
         });
 
         self.disp_t = try std.Thread.spawn(.{}, disp_mod.dispatcherThread, .{
             disp_mod.DispatcherArgs{
-                .id        = 0,
-                .queue     = &self.disp_q,
+                .id = 0,
+                .queue = &self.disp_q,
                 .bot_token = "TESTTOKEN",
-                .api_base  = api_base,
+                .api_base = api_base,
                 .allocator = std.heap.page_allocator,
-                .stop      = &self.stop,
+                .stop = &self.stop,
             },
         });
 
         const srv_addr = try std.net.Address.parseIp4("127.0.0.1", 0);
         self.srv = try server_mod.Server.init(.{
-            .listen_addr    = srv_addr,
+            .listen_addr = srv_addr,
             .webhook_secret = "test-secret",
-            .queues         = &self.q_ptrs,
-            .allocator      = std.heap.page_allocator,
+            .queues = &self.q_ptrs,
+            .allocator = std.heap.page_allocator,
         });
 
         return self;
@@ -443,9 +351,9 @@ fn postWebhook(address: std.net.Address, body: []const u8) !u16 {
     var fbs = std.io.fixedBufferStream(&hdr);
     try fbs.writer().print(
         "POST /webhook HTTP/1.1\r\n" ++
-        "X-Telegram-Bot-Api-Secret-Token: {s}\r\n" ++
-        "Content-Length: {d}\r\n" ++
-        "Connection: close\r\n\r\n",
+            "X-Telegram-Bot-Api-Secret-Token: {s}\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n\r\n",
         .{ WEBHOOK_SECRET, body.len },
     );
     try stream.writeAll(fbs.getWritten());
@@ -468,7 +376,7 @@ fn postWebhook(address: std.net.Address, body: []const u8) !u16 {
 test "AC-11.1: startup log line printed before server accepts connections" {
     // We verify by code structure: log.info(...) appears before server.init()
     // in run().  This test verifies the stack starts up and accepts connections.
-    const mock = try ApiMock.init(testing.allocator);
+    const mock = try disp_mod.MockServer.init(testing.allocator);
     defer mock.deinit();
 
     var url_buf: [64]u8 = undefined;
@@ -521,7 +429,7 @@ test "AC-11.3: schema version mismatch → SchemaMismatch error" {
 // ---------------------------------------------------------------------------
 
 test "AC-11.4: POST webhook → worker processes → dispatcher calls mock Telegram API" {
-    const mock = try ApiMock.init(testing.allocator);
+    const mock = try disp_mod.MockServer.init(testing.allocator);
     defer mock.deinit();
 
     var url_buf: [64]u8 = undefined;
@@ -535,8 +443,8 @@ test "AC-11.4: POST webhook → worker processes → dispatcher calls mock Teleg
     try testing.expectEqual(@as(u16, 200), status);
 
     // Dispatcher should POST to mock within 2 s.
-    try testing.expect(mock.waitForCalls(1, 2000));
-    try testing.expectEqual(@as(u32, 1), mock.call_count.load(.acquire));
+    try testing.expect(mock.waitForN(1, 2000));
+    try testing.expectEqual(@as(u32, 1), mock.call_cnt.load(.acquire));
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +452,7 @@ test "AC-11.4: POST webhook → worker processes → dispatcher calls mock Teleg
 // ---------------------------------------------------------------------------
 
 test "AC-11.5: rules.lua updated → next request uses new rules within 2 s" {
-    const mock = try ApiMock.init(testing.allocator);
+    const mock = try disp_mod.MockServer.init(testing.allocator);
     defer mock.deinit();
 
     var url_buf: [64]u8 = undefined;
@@ -556,7 +464,7 @@ test "AC-11.5: rules.lua updated → next request uses new rules within 2 s" {
     const watcher_t = try std.Thread.spawn(.{}, reload.watcherThread, .{
         reload.WatcherArgs{
             .rules_path = stack.rules_path,
-            .allocator  = std.heap.page_allocator,
+            .allocator = std.heap.page_allocator,
         },
     });
     watcher_t.detach();
@@ -565,7 +473,7 @@ test "AC-11.5: rules.lua updated → next request uses new rules within 2 s" {
 
     // Verify v1 behavior: POST → mock receives 1 call.
     _ = try postWebhook(stack.webhookAddr(), UPDATE_JSON);
-    try testing.expect(mock.waitForCalls(1, 2000));
+    try testing.expect(mock.waitForN(1, 2000));
 
     // Record current reload version and overwrite rules with v2 (no actions).
     const ver_before = reload.reload_version.load(.acquire);
@@ -587,7 +495,7 @@ test "AC-11.5: rules.lua updated → next request uses new rules within 2 s" {
     // POST again — v2 returns no actions, so mock call count must not increase.
     _ = try postWebhook(stack.webhookAddr(), UPDATE_JSON);
     std.Thread.sleep(200 * std.time.ns_per_ms); // let dispatcher attempt
-    try testing.expectEqual(@as(u32, 1), mock.call_count.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), mock.call_cnt.load(.acquire));
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-/// types.zig — shared structs: Update, Action, WorkerCtx, Config
+/// types.zig — shared structs: Update, Action, Config
 ///
 /// This file imports only the standard library and the ziglua external
 /// dependency (not project files), keeping it free of circular imports.
@@ -89,6 +89,27 @@ pub const Action = union(ActionTag) {
 };
 
 // ---------------------------------------------------------------------------
+//  Free the string payloads owned by a single Action
+// ---------------------------------------------------------------------------
+/// Free all heap-allocated strings inside `action`.
+/// Does NOT free the Action value itself (it is stack/queue allocated).
+pub fn freeActionPayload(action: Action, allocator: std.mem.Allocator) void {
+    switch (action) {
+        .send_message    => |a| allocator.free(a.text),
+        .send_message_ex => |a| { allocator.free(a.text); allocator.free(a.opts); },
+        .answer_callback => |a| {
+            allocator.free(a.callback_query_id);
+            if (a.text) |t| allocator.free(t);
+        },
+        .delete_message => {},
+    }
+}
+
+pub fn freeActions(actions: []Action, allocator: std.mem.Allocator) void {
+    for (actions) |action| freeActionPayload(action, allocator);
+    allocator.free(actions);
+}
+// ---------------------------------------------------------------------------
 // Configuration (populated by config.zig from env vars)
 // ---------------------------------------------------------------------------
 
@@ -96,31 +117,11 @@ pub const Config = struct {
     bot_token: []const u8,
     webhook_secret: []const u8,
     listen_addr: std.net.Address,
-    rules_file: []const u8,
-    db_path: []const u8,
-    worker_count: u32,
-    queue_capacity: u32,
-    dispatcher_threads: u32,
-};
-
-// ---------------------------------------------------------------------------
-// WorkerCtx — per-worker context passed through Lua registry and state store
-//
-// Queue and SQLite connection are held as *anyopaque because WorkerCtx must
-// not import project files (AC-1.5). Callers in worker.zig cast them to the
-// concrete types Queue(*Update) and StateStore.
-// The Lua state is typed via ziglua (an external dep, not a project file).
-// ---------------------------------------------------------------------------
-
-pub const WorkerCtx = struct {
-    id: u32,
-    lua: *ziglua.Lua,
-    /// Pointer to this worker's Queue(*Update). Cast to concrete type in worker.zig.
-    queue: *anyopaque,
-    /// Pointer to the shared dispatcher Queue(*Action). Cast in worker.zig.
-    dispatcher_queue: *anyopaque,
-    /// Pointer to this worker's StateStore (owns its own SQLite conn). Cast in state_store.zig.
-    db: *anyopaque,
+    rules_file: [:0]const u8,
+    db_path: [:0]const u8,
+    worker_count: u8,
+    queue_capacity: u16,
+    dispatcher_threads: u8,
 };
 
 // ---------------------------------------------------------------------------
@@ -180,24 +181,6 @@ test "AC-1.2: Action tagged union payload access" {
     try std.testing.expectEqualStrings("hello", a.send_message.text);
 }
 
-test "AC-1.3: WorkerCtx has all required fields" {
-    // We cannot construct a real WorkerCtx (requires a live Lua state),
-    // but we can verify all field names and types compile via @TypeOf checks.
-    const info = @typeInfo(WorkerCtx).@"struct";
-    const field_names = comptime blk: {
-        var names: [info.fields.len][]const u8 = undefined;
-        for (info.fields, 0..) |f, i| names[i] = f.name;
-        break :blk names;
-    };
-    const required = [_][]const u8{ "id", "lua", "queue", "dispatcher_queue", "db" };
-    for (required) |req| {
-        var found = false;
-        for (field_names) |name| {
-            if (std.mem.eql(u8, name, req)) { found = true; break; }
-        }
-        try std.testing.expect(found);
-    }
-}
 
 test "AC-1.1: Update.effectiveUserId from message" {
     const u = Update{

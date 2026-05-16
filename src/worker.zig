@@ -32,7 +32,7 @@ const log = std.log.scoped(.worker);
 // ---------------------------------------------------------------------------
 
 pub const WorkerArgs = struct {
-    id: u32,
+    id: u8,
     /// Null-terminated path to the Lua rules file (for initial load + reload).
     rules_path: [:0]const u8,
     /// Used for Update→JSON conversion, action string allocation, and Lua
@@ -95,9 +95,10 @@ pub fn workerThread(args: WorkerArgs) void {
     // Main loop.
     while (!args.stop.load(.acquire)) {
         // Non-blocking pop so we can honour the stop flag promptly.
-        const maybe_parsed = args.queue.tryPop();
+        // const maybe_parsed = args.queue.tryPop();
+        const maybe_parsed = args.queue.popTimeout(10*std.time.ns_per_ms);
         if (maybe_parsed == null) {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            // std.Thread.sleep(1 * std.time.ns_per_ms);
             continue;
         }
         const parsed = maybe_parsed.?;
@@ -126,7 +127,7 @@ pub fn workerThread(args: WorkerArgs) void {
         for (actions) |action| {
             args.dispatcher_queue.push(action) catch {
                 log.warn("worker {d}: dispatcher queue full, dropping action", .{args.id});
-                freeActionPayload(action, args.allocator);
+                types.freeActionPayload(action, args.allocator);
             };
         }
         args.allocator.free(actions);
@@ -145,24 +146,6 @@ pub fn hashUserId(user_id: i64, worker_count: u32) u32 {
     // Knuth multiplicative hash (64-bit variant).
     const h = u *% 0x9e3779b97f4a7c15;
     return @intCast(h % @as(u64, worker_count));
-}
-
-// ---------------------------------------------------------------------------
-// Private helper: free the string payloads owned by a single Action
-// ---------------------------------------------------------------------------
-
-/// Free all heap-allocated strings inside `action`.
-/// Does NOT free the Action value itself (it is stack/queue allocated).
-fn freeActionPayload(action: types.Action, allocator: std.mem.Allocator) void {
-    switch (action) {
-        .send_message    => |a| allocator.free(a.text),
-        .send_message_ex => |a| { allocator.free(a.text); allocator.free(a.opts); },
-        .answer_callback => |a| {
-            allocator.free(a.callback_query_id);
-            if (a.text) |t| allocator.free(t);
-        },
-        .delete_message => {},
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,11 +170,6 @@ fn waitQueue(q: anytype, n: usize, timeout_ms: u64) bool {
 /// Returns the Action for inspection.
 fn popAction(q: *Queue(types.Action)) types.Action {
     return q.pop();
-}
-
-/// Free an Action's string payloads (test-side cleanup).
-fn freeAction(action: types.Action, allocator: std.mem.Allocator) void {
-    freeActionPayload(action, allocator);
 }
 
 // ── Shared test setup ────────────────────────────────────────────────────────
@@ -287,7 +265,7 @@ test "AC-8.1: single update → dispatcher receives expected action" {
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
     const action = popAction(&ctx.output_q);
-    defer freeAction(action, testing.allocator);
+    defer types.freeActionPayload(action, testing.allocator);
 
     try testing.expectEqual(types.ActionTag.send_message, std.meta.activeTag(action));
     try testing.expectEqual(@as(i64, 42), action.send_message.chat_id);
@@ -325,7 +303,7 @@ test "AC-8.2: reload_version incremented → worker reloads before on_message" {
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
     const action = popAction(&ctx.output_q);
-    defer freeAction(action, testing.allocator);
+    defer types.freeActionPayload(action, testing.allocator);
 
     try testing.expectEqualStrings("v2", action.send_message.text);
 }
@@ -350,7 +328,7 @@ test "AC-8.3: update that triggers reload is still processed (not dropped)" {
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
     const action = popAction(&ctx.output_q);
-    defer freeAction(action, testing.allocator);
+    defer types.freeActionPayload(action, testing.allocator);
 
     try testing.expectEqualStrings("ok", action.send_message.text);
 }
@@ -379,7 +357,7 @@ test "AC-8.4: Lua error on first update → worker continues; second update succ
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
     const action = popAction(&ctx.output_q);
-    defer freeAction(action, testing.allocator);
+    defer types.freeActionPayload(action, testing.allocator);
     try testing.expectEqualStrings("second", action.send_message.text);
 
     // Confirm no second action appeared (first update produced nothing).
