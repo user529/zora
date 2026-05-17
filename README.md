@@ -4,9 +4,9 @@ _zig Telegram bot with Lua hot-reload rules_
 
 ## Status
 
-**PROTOTYPE**
+**BETA**
 
-The prototype is ready - see the `prototype` branch.
+The prototype is ready - see the `dev` branch.
 
 ## About
 
