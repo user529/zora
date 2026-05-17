@@ -119,12 +119,12 @@ fn send(
     var buf: [256]u8 = undefined;
     const url = std.fmt.bufPrint(&buf, "{s}{s}", .{ url_prefix, method_path }) catch unreachable;
 
-    log.info("→ {s}  {s}", .{ method_path, body });
+    log.debug("→ {s}  {s}", .{ method_path, body });
 
     const result = try client.fetch(.{
         .location = .{ .url = url },
         .payload = body,
-        .keep_alive = false, // each send uses a fresh connection; simplifies retry logic
+        .keep_alive = true,
         .extra_headers = &.{
             .{ .name = "Content-Type", .value = "application/json" },
         },
@@ -137,7 +137,7 @@ fn send(
         return error.TelegramApiError;
     }
 
-    log.info("← {d} {s}", .{ @intFromEnum(result.status), method_path });
+    log.debug("← {d} {s}", .{ @intFromEnum(result.status), method_path });
 }
 
 // ---------------------------------------------------------------------------

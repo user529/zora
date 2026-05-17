@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     // SQLite's global-init races are structural false positives, not real bugs.
     // The flag is a no-op when TSan is not enabled.
     const sqlite_flags: []const []const u8 = &.{
-        "-DSQLITE_THREADSAFE=2",
+        "-DSQLITE_THREADSAFE=1",
         "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
         "-fno-sanitize=undefined",
         "-fno-sanitize=thread",
