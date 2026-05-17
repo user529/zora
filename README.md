@@ -52,7 +52,7 @@ Config:
 |  steady-2 | 157.4% | 157.8% | 10.5 MB | 11.1 MB |
 |  cooldown | 156.0% | 157.8% | 10.6 MB | 11.4 MB |
 
-
+CPU% is per-core (100% = 1 core fully used). At 2,500 req/s the bot used ~1.1–1.3 cores; at 5,000 req/s ~1.4 cores, out of 12 available workers.
 
 ## Features
 
