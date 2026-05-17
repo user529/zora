@@ -84,7 +84,7 @@ Missing required variables cause a clear error and immediate exit before the soc
 * On valid request: parses body as types.Update, routes to queue[hash(user_id) % worker_count], responds 200 OK immediately
 * Server returns 200 without waiting for Lua or dispatch — Telegram gets its fast ACK
 
-### Lua Rules Engine (lua_engine.zig, lua_api.zig)
+### Lua Rules Engine
 
 One lua_State per worker, not shared.
 *Sandbox*: only standard libraries are loaded: base, math, string, table, utf8. The following are explicitly blocked after base opens:
