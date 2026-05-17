@@ -11,6 +11,10 @@
 ///   8. Block forever
 const std = @import("std");
 const build_opts = @import("build_options");
+
+// Show info/warn in all build modes so soak-test logs and hot-reload events
+// are visible even in ReleaseFast (Zig defaults to .err in release builds).
+pub const log_level: std.log.Level = .info;
 const types = @import("types.zig");
 const config_mod = @import("config.zig");
 const state_store = @import("state_store.zig");
@@ -23,7 +27,8 @@ const lua_engine = @import("lua_engine.zig");
 
 const log = std.log.scoped(.main);
 
-pub const BUILD_NUMBER: u32 = build_opts.build_number;
+pub const RELEASE: u32 = build_opts.release;
+pub const GIT_BRANCH: []const u8 = build_opts.git_branch;
 
 // ---------------------------------------------------------------------------
 // Signal handling — SIGTERM / SIGINT set this flag; main loop polls it.
@@ -82,8 +87,9 @@ fn run(allocator: std.mem.Allocator) !void {
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
 
     // ── Startup banner — before server.init (AC-11.1) ─────────────────────────
-    log.info("zora starting  build={d}  schema={d}  rules_api={d}", .{
-        BUILD_NUMBER,
+    log.info("zora starting (branch={s} release={d} schema={d} rules_api={d})", .{
+        RELEASE,
+        GIT_BRANCH,
         state_store.SCHEMA_VERSION,
         lua_engine.RULES_API_VERSION,
     });

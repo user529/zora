@@ -4,18 +4,34 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // --- build_number: count git commits, fall back to 0 ---
-    const build_number: u32 = blk: {
+    // --- release: read from RELEASE file, auto-increment on each build ---
+    const release_number: u32 = blk: {
+        const content = b.build_root.handle.readFileAlloc(b.allocator, "RELEASE", 16) catch break :blk 0;
+        defer b.allocator.free(content);
+        const n = std.fmt.parseInt(u32, std.mem.trim(u8, content, " \n\r\t"), 10) catch break :blk 0;
+        const f = b.build_root.handle.createFile("RELEASE", .{}) catch break :blk n;
+        defer f.close();
+        var nbuf: [16]u8 = undefined;
+        const next_str = std.fmt.bufPrint(&nbuf, "{d}\n", .{n + 1}) catch break :blk n;
+        f.writeAll(next_str) catch {};
+        break :blk n;
+    };
+
+    // --- git_branch: branch name at build time, falls back to "unknown" ---
+    const git_branch: []const u8 = blk: {
         const result = std.process.Child.run(.{
             .allocator = b.allocator,
-            .argv = &.{ "git", "rev-list", "--count", "HEAD" },
+            .argv = &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
             .cwd = b.build_root.path orelse ".",
-        }) catch break :blk 0;
-        break :blk std.fmt.parseInt(u32, std.mem.trim(u8, result.stdout, " \n\r\t"), 10) catch 0;
+        }) catch break :blk "unknown";
+        const trimmed = std.mem.trim(u8, result.stdout, " \n\r\t");
+        if (trimmed.len == 0) break :blk "unknown";
+        break :blk trimmed;
     };
 
     const options = b.addOptions();
-    options.addOption(u32, "build_number", build_number);
+    options.addOption(u32, "release", release_number);
+    options.addOption([]const u8, "git_branch", git_branch);
 
     // --- ThreadSanitizer option ---
     // Enable with: zig build -Dsanitize-thread
