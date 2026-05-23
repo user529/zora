@@ -19,6 +19,7 @@ const std = @import("std");
 const ziglua = @import("ziglua");
 const state_store = @import("state_store.zig");
 const serializer = @import("serializer.zig");
+const types = @import("types.zig");
 
 const Lua = ziglua.Lua;
 
@@ -34,10 +35,26 @@ pub const ApiCtx = struct {
     /// Allocator for temporary allocations inside bot.* functions
     /// (e.g., JSON intermediate buffers).  Must be an arena or GPA —
     /// every allocation is freed before the C function returns.
-    allocator: std.mem.Allocator,
+    allocator:      std.mem.Allocator,
+    /// Maximum file size in bytes for multipart upload descriptors.
+    max_file_bytes: usize,
 };
 
 const REGISTRY_KEY: [:0]const u8 = "_zora_ctx";
+
+/// Registry key for the per-invocation `bot.emit` accumulator table.
+const EMIT_KEY: [:0]const u8 = "_zora_emit";
+
+/// The tg.* ergonomic facade (ADR-0001 §AD-1).  `tg.<method>{params}` is
+/// exactly `bot.emit{ method = "<method>", params = {params} }` — pure sugar;
+/// the call is schema-validated downstream regardless of which form is used.
+const TG_FACADE_LUA: [:0]const u8 =
+    \\tg = setmetatable({}, { __index = function(_, method)
+    \\  return function(params)
+    \\    return bot.emit{ method = method, params = params }
+    \\  end
+    \\end })
+;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -64,6 +81,7 @@ pub fn register(lua: *Lua, ctx: *ApiCtx, rules_api_version: u32) void {
         .{ .name = "get_global",     .func = botGetGlobal },
         .{ .name = "set_global",     .func = botSetGlobal },
         .{ .name = "log",            .func = botLog },
+        .{ .name = "emit",           .func = botEmit },
     };
     for (fns) |f| {
         lua.pushFunction(f.func);
@@ -76,19 +94,212 @@ pub fn register(lua: *Lua, ctx: *ApiCtx, rules_api_version: u32) void {
 
     // _G.bot = bot_table
     lua.setGlobal("bot");
+
+    // Install an initial (empty) emit accumulator so the registry slot is
+    // always a table; callOnMessage replaces it per invocation.
+    beginEmitBatch(lua);
+
+    // Install the tg.* facade.  The snippet is a fixed constant — a failure
+    // here would be a build-time bug, not a runtime condition.
+    lua.doString(TG_FACADE_LUA) catch unreachable;
 }
 
 // ---------------------------------------------------------------------------
 // Private: retrieve ApiCtx from the Lua registry
 // ---------------------------------------------------------------------------
 
-fn getCtx(lua: *Lua) *ApiCtx {
+pub fn getCtx(lua: *Lua) *ApiCtx {
     _ = lua.getField(ziglua.registry_index, REGISTRY_KEY);
     const ptr = lua.toPointer(-1) catch unreachable; // always a light userdata
     lua.pop(1);
     return @constCast(@alignCast(@ptrCast(ptr)));
 }
 
+// ---------------------------------------------------------------------------
+// Public: buildApiCall — build an ApiCall from a Lua params table (Phase 15)
+// ---------------------------------------------------------------------------
+
+/// Build an ApiCall from a Lua params table at stack index `params_idx`.
+/// Single scan: if any value is a file-descriptor table → multipart payload;
+/// otherwise → JSON payload. `method` is duped into the returned ApiCall.
+///
+/// File-descriptor tables:
+///   { __file = "/abs/path" }                      — read from disk
+///   { __file_bytes = "...", filename = "name" }   — inline bytes
+///
+/// Errors: error.FileTooLarge, error.MissingFilename, file-read errors, OOM.
+pub fn buildApiCall(
+    lua:        *Lua,
+    params_idx: i32,
+    method:     []const u8,
+    ctx:        *ApiCtx,
+) !types.ApiCall {
+    const alloc = ctx.allocator;
+    const method_owned = try alloc.dupe(u8, method);
+    errdefer alloc.free(method_owned);
+
+    // No params → JSON "{}"
+    if (!lua.isTable(params_idx)) {
+        return .{
+            .method  = method_owned,
+            .payload = .{ .json = try alloc.dupe(u8, "{}") },
+        };
+    }
+
+    // Single-pass scan over the params table.
+    var parts: std.ArrayListUnmanaged(types.MultipartPart) = .empty;
+    errdefer {
+        for (parts.items) |p| {
+            alloc.free(p.name);
+            alloc.free(p.content);
+            if (p.filename) |f| alloc.free(f);
+        }
+        parts.deinit(alloc);
+    }
+    var has_files = false;
+
+    lua.pushNil(); // initial key for lua.next()
+    while (lua.next(params_idx)) {
+        // Stack: [..., params_table, key, value]
+        // defer pops value at end of every iteration (including continue/return).
+        defer lua.pop(1);
+
+        const key_type = lua.typeOf(-2);
+        if (key_type != .string and key_type != .number) continue;
+        const key_z = lua.toString(-2) catch continue;
+        const key = try alloc.dupe(u8, key_z);
+        // key_in_parts: true once key is transferred to parts (so defer must not free it).
+        var key_in_parts = false;
+        defer if (!key_in_parts) alloc.free(key);
+
+        if (lua.isTable(-1)) {
+            // Check for __file (file-path descriptor)
+            const ft = lua.getField(-1, "__file");
+            if (ft == .string) {
+                const path_z = lua.toString(-1) catch {
+                    lua.pop(1); // pop __file value
+                    return error.InvalidDescriptor; // defer frees key
+                };
+                lua.pop(1); // pop __file value
+
+                const bytes = std.fs.cwd().readFileAlloc(
+                    alloc, path_z, ctx.max_file_bytes +| 1,
+                ) catch |err| {
+                    return if (err == error.FileTooBig) error.FileTooLarge else err; // defer frees key
+                };
+                if (bytes.len > ctx.max_file_bytes) {
+                    alloc.free(bytes);
+                    return error.FileTooLarge; // defer frees key
+                }
+
+                const fname = alloc.dupe(u8, std.fs.path.basename(path_z)) catch |err| {
+                    alloc.free(bytes);
+                    return err; // defer frees key
+                };
+                parts.append(alloc, .{ .name = key, .content = bytes, .filename = fname }) catch |err| {
+                    alloc.free(fname);
+                    alloc.free(bytes);
+                    return err; // defer frees key
+                };
+                key_in_parts = true; // parts owns key; defer must not free it
+                has_files = true;
+                continue;
+            }
+            lua.pop(1); // pop nil __file result
+
+            // Check for __file_bytes (inline-bytes descriptor)
+            const fbt = lua.getField(-1, "__file_bytes");
+            if (fbt == .string) {
+                const src = lua.toString(-1) catch {
+                    lua.pop(1); // pop __file_bytes value
+                    return error.InvalidDescriptor; // defer frees key
+                };
+                if (src.len > ctx.max_file_bytes) {
+                    lua.pop(1); // pop __file_bytes value
+                    return error.FileTooLarge; // defer frees key
+                }
+                const bytes = alloc.dupe(u8, src) catch |err| {
+                    lua.pop(1); // pop __file_bytes value
+                    return err; // defer frees key
+                };
+                lua.pop(1); // pop __file_bytes value
+
+                // filename sub-key is required
+                const fn_type = lua.getField(-1, "filename");
+                if (fn_type != .string) {
+                    lua.pop(1); // pop nil filename result
+                    alloc.free(bytes);
+                    return error.MissingFilename; // defer frees key
+                }
+                const fname_z = lua.toString(-1) catch unreachable;
+                const fname   = alloc.dupe(u8, fname_z) catch |err| {
+                    lua.pop(1); // pop filename value
+                    alloc.free(bytes);
+                    return err; // defer frees key
+                };
+                lua.pop(1); // pop filename value
+
+                parts.append(alloc, .{ .name = key, .content = bytes, .filename = fname }) catch |err| {
+                    alloc.free(fname);
+                    alloc.free(bytes);
+                    return err; // defer frees key
+                };
+                key_in_parts = true; // parts owns key; defer must not free it
+                has_files = true;
+                continue;
+            }
+            lua.pop(1); // pop nil __file_bytes result
+            // Fall through: table value that is not a descriptor → skip as scalar
+        }
+
+        // Scalar value — stringify into a text part, or skip unsupported types.
+        const val_type = lua.typeOf(-1);
+        const scalar: []const u8 = switch (val_type) {
+            .string  => alloc.dupe(u8, lua.toString(-1) catch "") catch |err| return err,
+            .number  => blk: {
+                if (lua.isInteger(-1)) {
+                    const n = lua.toInteger(-1) catch 0;
+                    break :blk std.fmt.allocPrint(alloc, "{d}", .{n}) catch |err| return err;
+                } else {
+                    const f = lua.toNumber(-1) catch 0;
+                    break :blk std.fmt.allocPrint(alloc, "{d}", .{f}) catch |err| return err;
+                }
+            },
+            .boolean => blk: {
+                const b = lua.toBoolean(-1);
+                break :blk alloc.dupe(u8, if (b) "true" else "false") catch |err| return err;
+            },
+            else => continue, // skip nil, tables, etc. — defer frees key
+        };
+
+        parts.append(alloc, .{ .name = key, .content = scalar, .filename = null }) catch |err| {
+            alloc.free(scalar);
+            return err; // defer frees key
+        };
+        key_in_parts = true; // parts owns key; defer must not free it
+    }
+
+    if (has_files) {
+        return .{
+            .method  = method_owned,
+            .payload = .{ .multipart = try parts.toOwnedSlice(alloc) },
+        };
+    }
+
+    // No file parts — free accumulated scalar parts; serialize table as JSON.
+    for (parts.items) |p| {
+        alloc.free(p.name);
+        alloc.free(p.content);
+        // filename is always null for scalar parts
+    }
+    parts.deinit(alloc);
+
+    const body = try serializer.luaTableToJson(lua, params_idx, alloc);
+    return .{
+        .method  = method_owned,
+        .payload = .{ .json = body },
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Private: getStateImpl
@@ -151,8 +362,6 @@ fn botSetUserState(state: ?*ziglua.LuaState) callconv(.c) c_int {
     const lua: *Lua = @ptrCast(state.?);
     const ctx = getCtx(lua);
     const user_id = lua.checkInteger(1);
-    // lua.checkType(2, .table);
-
     return setStateImpl(lua, ctx, user_id, state_store.StateStore.setUserState, "setUserState");
 }
 
@@ -245,6 +454,38 @@ fn botLog(state: ?*ziglua.LuaState) callconv(.c) c_int {
 }
 
 // ---------------------------------------------------------------------------
+// bot.emit — fire-and-forget API-call accumulator (ADR-0001 §AD-1)
+//
+// `bot.emit{ method = ..., params = {...} }` appends an API-call table to a
+// per-invocation accumulator held in the Lua registry.  lua_engine drains the
+// accumulator after on_message returns: emitted calls are dispatched in call
+// order, before the on_message return-list.
+// ---------------------------------------------------------------------------
+
+/// Install a fresh, empty emit accumulator.  Call once before each on_message.
+pub fn beginEmitBatch(lua: *Lua) void {
+    lua.newTable();
+    lua.setField(ziglua.registry_index, EMIT_KEY);
+}
+
+/// Push the current emit accumulator table onto the Lua stack.
+pub fn pushEmitBatch(lua: *Lua) void {
+    _ = lua.getField(ziglua.registry_index, EMIT_KEY);
+}
+
+fn botEmit(state: ?*ziglua.LuaState) callconv(.c) c_int {
+    const lua: *Lua = @ptrCast(state.?);
+    lua.checkType(1, .table); // bot.emit{ method = ..., params = {...} }
+
+    _ = lua.getField(ziglua.registry_index, EMIT_KEY); // [arg1, batch]
+    const next: ziglua.Integer = @intCast(lua.rawLen(-1) + 1);
+    lua.pushValue(1);          // [arg1, batch, arg1]
+    lua.rawSetIndex(-2, next); // batch[next] = arg1 (pops value) → [arg1, batch]
+    lua.pop(1);                // [arg1]
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -254,7 +495,7 @@ test "AC-6.7: bot.set_user_state + bot.get_user_state round-trip" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
 
-    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator };
+    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
 
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
@@ -278,7 +519,7 @@ test "AC-6.8: bot.set_chat_state + bot.get_chat_state round-trip" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
 
-    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator };
+    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
 
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
@@ -297,7 +538,7 @@ test "AC-6.9: bot.get_global / bot.set_global" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
 
-    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator };
+    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
 
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
@@ -318,7 +559,7 @@ test "AC-6.10: bot.log valid levels succeed; invalid level errors" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
 
-    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator };
+    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
 
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
@@ -345,7 +586,7 @@ test "AC-6.11: bot.rules_api_version matches Zig constant" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
 
-    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator };
+    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
 
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
@@ -371,7 +612,7 @@ test "AC-6.12: bot.get_user_state with non-integer arg → Lua error" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
 
-    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator };
+    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
 
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
@@ -385,6 +626,30 @@ test "AC-6.12: bot.get_user_state with non-integer arg → Lua error" {
     if (result) |_| return error.TestExpectedLuaError else |_| {}
 }
 
+test "AC-14.4: tg.<method>{...} == bot.emit{method=...,params=...}" {
+    const lua_engine = @import("lua_engine.zig");
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+    var ctx = ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var engine = try lua_engine.LuaEngine.init(testing.allocator, &ctx);
+    defer engine.deinit();
+
+    try engine.loadString(
+        \\function on_message(u)
+        \\  tg.sendMessage{ chat_id = 7, text = "via facade" }
+        \\  return {}
+        \\end
+    );
+    const actions = try engine.callOnMessage(testing.allocator, "{}");
+    defer types.freeApiCalls(actions, testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), actions.len);
+    try testing.expectEqualStrings("sendMessage", actions[0].method);
+    const json_body = actions[0].payload.json;
+    try testing.expect(std.mem.indexOf(u8, json_body, "\"chat_id\":7") != null);
+    try testing.expect(std.mem.indexOf(u8, json_body, "\"text\":\"via facade\"") != null);
+}
+
 test "AC-6.13: two engines have independent ApiCtx (no registry aliasing)" {
     const lua_engine = @import("lua_engine.zig");
 
@@ -393,8 +658,8 @@ test "AC-6.13: two engines have independent ApiCtx (no registry aliasing)" {
     var db2 = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db2.close();
 
-    var ctx1 = ApiCtx{ .db = &db1, .allocator = testing.allocator };
-    var ctx2 = ApiCtx{ .db = &db2, .allocator = testing.allocator };
+    var ctx1 = ApiCtx{ .db = &db1, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx2 = ApiCtx{ .db = &db2, .allocator = testing.allocator, .max_file_bytes = 52428800 };
 
     var engine1 = try lua_engine.LuaEngine.init(testing.allocator, &ctx1);
     defer engine1.deinit();
@@ -417,4 +682,78 @@ test "AC-6.13: two engines have independent ApiCtx (no registry aliasing)" {
         \\local v = bot.get_global("x")
         \\assert(v == "from_engine1", "engine1 lost its state")
     );
+}
+
+// ---------------------------------------------------------------------------
+// AC-15.1 (unit) — buildApiCall detects __file and returns multipart
+// AC-15.3 — file larger than max_file_bytes → error.FileTooLarge
+// ---------------------------------------------------------------------------
+
+test "AC-15.1 (unit): buildApiCall with __file descriptor returns multipart" {
+    const alloc = testing.allocator;
+    var db = try state_store.StateStore.open(alloc, ":memory:");
+    defer db.close();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "img.jpg", .data = "\xff\xd8\xff" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("img.jpg", &path_buf);
+
+    var ctx = ApiCtx{ .db = &db, .allocator = alloc, .max_file_bytes = 1024 };
+    var lua = try Lua.init(alloc);
+    defer lua.deinit();
+    lua.openBase();
+    register(lua, &ctx, 1);
+
+    // Build params table: { photo = { __file = path } }
+    lua.newTable();           // params at index 1
+    lua.newTable();           // descriptor at index 2
+    _ = lua.pushString(path);
+    lua.setField(-2, "__file"); // descriptor.__file = path
+    lua.setField(-2, "photo");  // params.photo = descriptor
+    const params_idx: i32 = lua.getTop();
+
+    const call = try buildApiCall(lua, params_idx, "sendPhoto", &ctx);
+    defer types.freeApiCall(call, alloc);
+
+    try testing.expectEqualStrings("sendPhoto", call.method);
+    switch (call.payload) {
+        .multipart => |parts| {
+            try testing.expectEqual(@as(usize, 1), parts.len);
+            try testing.expectEqualStrings("photo", parts[0].name);
+            try testing.expectEqualStrings("\xff\xd8\xff", parts[0].content);
+            try testing.expectEqualStrings("img.jpg", parts[0].filename.?);
+        },
+        .json => return error.ExpectedMultipart,
+    }
+}
+
+test "AC-15.3: buildApiCall returns FileTooLarge when file exceeds limit" {
+    const alloc = testing.allocator;
+    var db = try state_store.StateStore.open(alloc, ":memory:");
+    defer db.close();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 11 bytes, limit is 10
+    try tmp.dir.writeFile(.{ .sub_path = "big.bin", .data = "hello world" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("big.bin", &path_buf);
+
+    var ctx = ApiCtx{ .db = &db, .allocator = alloc, .max_file_bytes = 10 };
+    var lua = try Lua.init(alloc);
+    defer lua.deinit();
+    lua.openBase();
+    register(lua, &ctx, 1);
+
+    lua.newTable();
+    lua.newTable();
+    _ = lua.pushString(path);
+    lua.setField(-2, "__file");
+    lua.setField(-2, "photo");
+    const params_idx: i32 = lua.getTop();
+
+    const result = buildApiCall(lua, params_idx, "sendPhoto", &ctx);
+    try testing.expectError(error.FileTooLarge, result);
 }

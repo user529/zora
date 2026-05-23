@@ -106,6 +106,7 @@ pub fn build(b: *std.Build) void {
         "src/queue.zig",
         "src/serializer.zig",
         "src/state_store.zig",
+        "src/schema_store.zig",
         "src/lua_engine.zig",
         "src/lua_api.zig",
         "src/reload.zig",

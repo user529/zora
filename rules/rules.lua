@@ -1,5 +1,8 @@
 -- Zora example rules file
 -- RULES_API_VERSION: 1
+--
+-- Actions are generic Telegram API calls: { method = "<apiMethod>", params = {...} }
+-- (ADR-0001 §AD-1).  `params` is serialized to the JSON request body verbatim.
 
 function on_message(update)
     local msg = update.message
@@ -23,24 +26,30 @@ function on_message(update)
     if text == "/start" then
         state.step = "started"
         table.insert(actions, {
-            action  = "send_message",
-            chat_id = chat_id,
-            text    = "Welcome! You are message #" .. total
+            method = "sendMessage",
+            params = {
+                chat_id = chat_id,
+                text    = "Welcome! You are message #" .. total,
+            },
         })
 
     elseif text == "/stats" then
         table.insert(actions, {
-            action  = "send_message",
-            chat_id = chat_id,
-            text    = string.format("Your messages: %d | Total: %d",
-                          state.count, total)
+            method = "sendMessage",
+            params = {
+                chat_id = chat_id,
+                text    = string.format("Your messages: %d | Total: %d",
+                              state.count, total),
+            },
         })
 
     else
         table.insert(actions, {
-            action  = "send_message",
-            chat_id = chat_id,
-            text    = "Echo: " .. text
+            method = "sendMessage",
+            params = {
+                chat_id = chat_id,
+                text    = "Echo: " .. text,
+            },
         })
     end
 

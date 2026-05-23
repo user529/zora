@@ -55,6 +55,19 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.EnvMap) Config
         return error.OutOfMemory;
     errdefer allocator.free(db_path);
 
+    // Optional: SCHEMA_FILE
+    const schema_file = allocator.dupeZ(u8, env.get("SCHEMA_FILE") orelse "schema/botapi.json") catch
+        return error.OutOfMemory;
+    errdefer allocator.free(schema_file);
+
+    // Optional: API_VALIDATION
+    const api_validation = try parseValidationMode(env);
+
+    // Optional: BOT_API_BASE (AD-8 — first-class setting)
+    const api_base = allocator.dupe(u8, env.get("BOT_API_BASE") orelse "https://api.telegram.org") catch
+        return error.OutOfMemory;
+    errdefer allocator.free(api_base);
+
     // Optional: WORKER_COUNT (default: cpu_count, minimum 2)
     const worker_count = try parseUint(u8, env, "WORKER_COUNT", defaultWorkerCount());
 
@@ -64,15 +77,22 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.EnvMap) Config
     // Optional: DISPATCHER_THREADS
     const dispatcher_threads = try parseUint(u8, env, "DISPATCHER_THREADS", 2);
 
+    // Optional: MULTIPART_MAX_FILE (50 MB — Telegram bot upload limit)
+    const multipart_max_file = try parseUint(usize, env, "MULTIPART_MAX_FILE", 52428800);
+
     return Config{
-        .bot_token = bot_token,
-        .webhook_secret = webhook_secret,
-        .listen_addr = listen_addr,
-        .rules_file = rules_file,
-        .db_path = db_path,
-        .worker_count = worker_count,
-        .queue_capacity = queue_capacity,
+        .bot_token          = bot_token,
+        .webhook_secret     = webhook_secret,
+        .listen_addr        = listen_addr,
+        .rules_file         = rules_file,
+        .db_path            = db_path,
+        .worker_count       = worker_count,
+        .queue_capacity     = queue_capacity,
         .dispatcher_threads = dispatcher_threads,
+        .schema_file        = schema_file,
+        .api_validation     = api_validation,
+        .api_base           = api_base,
+        .multipart_max_file = multipart_max_file,
     };
 }
 
@@ -82,6 +102,8 @@ pub fn deinit(config: Config, allocator: std.mem.Allocator) void {
     allocator.free(config.webhook_secret);
     allocator.free(config.rules_file);
     allocator.free(config.db_path);
+    allocator.free(config.schema_file);
+    allocator.free(config.api_base);
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +125,17 @@ fn parseUint(comptime T: type, env: std.process.EnvMap, key: []const u8, default
     const raw = env.get(key) orelse return default;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     return std.fmt.parseInt(T, trimmed, 10) catch return error.InvalidConfig;
+}
+
+/// Parse `API_VALIDATION` into a ValidationMode. Absent → `.warn`.
+/// An unrecognised value → error.InvalidConfig.
+fn parseValidationMode(env: std.process.EnvMap) ConfigError!types.ValidationMode {
+    const raw = env.get("API_VALIDATION") orelse return .warn;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "off")) return .off;
+    if (std.mem.eql(u8, trimmed, "warn")) return .warn;
+    if (std.mem.eql(u8, trimmed, "strict")) return .strict;
+    return error.InvalidConfig;
 }
 
 /// Returns cpu_count, clamped to [2, maxInt(u32)].
@@ -328,4 +361,98 @@ test "AC-3.4: WORKER_COUNT=1 is accepted (minimum boundary)" {
     defer deinit(cfg, testing.allocator);
 
     try testing.expectEqual(@as(u32, 1), cfg.worker_count);
+}
+
+test "AC-14.10: BOT_API_BASE absent → default; present → used" {
+    var env_default = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+    });
+    defer env_default.deinit();
+    const cfg_default = try loadFromMap(testing.allocator, env_default);
+    defer deinit(cfg_default, testing.allocator);
+    try testing.expectEqualStrings("https://api.telegram.org", cfg_default.api_base);
+
+    var env_set = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+        .{ "BOT_API_BASE", "http://127.0.0.1:9000" },
+    });
+    defer env_set.deinit();
+    const cfg_set = try loadFromMap(testing.allocator, env_set);
+    defer deinit(cfg_set, testing.allocator);
+    try testing.expectEqualStrings("http://127.0.0.1:9000", cfg_set.api_base);
+}
+
+test "AC-14.11: API_VALIDATION parsed; default warn; invalid → InvalidConfig" {
+    var env_default = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+    });
+    defer env_default.deinit();
+    const cfg_default = try loadFromMap(testing.allocator, env_default);
+    defer deinit(cfg_default, testing.allocator);
+    try testing.expectEqual(types.ValidationMode.warn, cfg_default.api_validation);
+
+    inline for (.{ "off", "warn", "strict" }) |mode_str| {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            .{ "API_VALIDATION", mode_str },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(
+            @field(types.ValidationMode, mode_str),
+            cfg.api_validation,
+        );
+    }
+
+    var env_bad = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+        .{ "API_VALIDATION", "loud" },
+    });
+    defer env_bad.deinit();
+    try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env_bad));
+}
+
+test "AC-14: SCHEMA_FILE absent → default; present → used" {
+    var env_default = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+    });
+    defer env_default.deinit();
+    const cfg_default = try loadFromMap(testing.allocator, env_default);
+    defer deinit(cfg_default, testing.allocator);
+    try testing.expectEqualStrings("schema/botapi.json", cfg_default.schema_file);
+
+    var env_set = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+        .{ "SCHEMA_FILE", "/etc/zora/api.json" },
+    });
+    defer env_set.deinit();
+    const cfg_set = try loadFromMap(testing.allocator, env_set);
+    defer deinit(cfg_set, testing.allocator);
+    try testing.expectEqualStrings("/etc/zora/api.json", cfg_set.schema_file);
+}
+
+test "AC-15.x: MULTIPART_MAX_FILE parses correctly" {
+    var env = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN",           "tok" },
+        .{ "WEBHOOK_SECRET",      "sec" },
+        .{ "MULTIPART_MAX_FILE",  "10485760" },
+    });
+    defer env.deinit();
+
+    const cfg = try loadFromMap(testing.allocator, env);
+    defer deinit(cfg, testing.allocator);
+    try testing.expectEqual(@as(usize, 10485760), cfg.multipart_max_file);
+}
+
+test "AC-15.x: MULTIPART_MAX_FILE defaults to 52428800" {
+    var env = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN",      "tok" },
+        .{ "WEBHOOK_SECRET", "sec" },
+    });
+    defer env.deinit();
+
+    const cfg = try loadFromMap(testing.allocator, env);
+    defer deinit(cfg, testing.allocator);
+    try testing.expectEqual(@as(usize, 52428800), cfg.multipart_max_file);
 }

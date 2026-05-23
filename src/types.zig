@@ -1,4 +1,4 @@
-/// types.zig — shared structs: Update, Action, Config
+/// types.zig — shared structs: ApiCall, WorkItem, Config
 ///
 /// This file imports only the standard library and the ziglua external
 /// dependency (not project files), keeping it free of circular imports.
@@ -6,215 +6,159 @@ const std = @import("std");
 const ziglua = @import("ziglua");
 
 // ---------------------------------------------------------------------------
-// Telegram Update tree
+// ApiCall — generic outgoing Telegram API call (ADR-0001 §AD-1)
+//
+// The payload is a tagged union: `.json` for plain API calls (verbatim JSON
+// body), `.multipart` for calls that upload files (slice of MultipartPart).
+// Both `method` and all payload fields are heap-allocated; `freeApiCall`
+// releases them.  The dispatcher takes ownership at push time and frees after
+// the HTTP call completes.
 // ---------------------------------------------------------------------------
 
-pub const User = struct {
-    id: i64,
-    is_bot: bool,
-    first_name: []const u8,
-    last_name: ?[]const u8 = null,
-    username: ?[]const u8 = null,
+pub const MultipartPart = struct {
+    name:     []const u8,  // form field name — owned
+    content:  []const u8,  // bytes           — owned
+    filename: ?[]const u8, // non-null for file parts — owned
 };
 
-pub const Chat = struct {
-    id: i64,
-    /// "private", "group", "supergroup", "channel"
-    type: []const u8,
-    title: ?[]const u8 = null,
-    username: ?[]const u8 = null,
-};
-
-pub const Message = struct {
-    message_id: i64,
-    from: ?User = null,
-    chat: Chat,
-    date: i64,
-    text: ?[]const u8 = null,
-};
-
-pub const CallbackQuery = struct {
-    id: []const u8,
-    from: User,
-    message: ?Message = null,
-    data: ?[]const u8 = null,
-};
-
-pub const Update = struct {
-    update_id: i64,
-    message: ?Message = null,
-    callback_query: ?CallbackQuery = null,
-
-    /// Returns the user id to use for queue routing.
-    /// Prefers message sender; falls back to callback_query sender.
-    pub fn effectiveUserId(self: Update) ?i64 {
-        if (self.message) |msg| {
-            if (msg.from) |from| return from.id;
-        }
-        if (self.callback_query) |cq| return cq.from.id;
-        return null;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Actions produced by Lua on_message()
-// ---------------------------------------------------------------------------
-
-pub const ActionTag = enum {
-    send_message,
-    send_message_ex,
-    answer_callback,
-    delete_message,
-};
-
-pub const Action = union(ActionTag) {
-    send_message: struct {
-        chat_id: i64,
-        text: []const u8,
-    },
-    send_message_ex: struct {
-        chat_id: i64,
-        text: []const u8,
-        /// JSON string of extra Telegram API options (parse_mode, reply_markup, …)
-        opts: []const u8,
-    },
-    answer_callback: struct {
-        callback_query_id: []const u8,
-        text: ?[]const u8,
-    },
-    delete_message: struct {
-        chat_id: i64,
-        message_id: i64,
+pub const ApiCall = struct {
+    method:  []const u8,
+    payload: union(enum) {
+        json:      []const u8,      // verbatim JSON body — owned
+        multipart: []MultipartPart, // slice of parts     — owned
     },
 };
 
-// ---------------------------------------------------------------------------
-//  Free the string payloads owned by a single Action
-// ---------------------------------------------------------------------------
-/// Free all heap-allocated strings inside `action`.
-/// Does NOT free the Action value itself (it is stack/queue allocated).
-pub fn freeActionPayload(action: Action, allocator: std.mem.Allocator) void {
-    switch (action) {
-        .send_message    => |a| allocator.free(a.text),
-        .send_message_ex => |a| { allocator.free(a.text); allocator.free(a.opts); },
-        .answer_callback => |a| {
-            allocator.free(a.callback_query_id);
-            if (a.text) |t| allocator.free(t);
+pub fn freeApiCall(call: ApiCall, allocator: std.mem.Allocator) void {
+    allocator.free(call.method);
+    switch (call.payload) {
+        .json      => |b| allocator.free(b),
+        .multipart => |parts| {
+            for (parts) |p| {
+                allocator.free(p.name);
+                allocator.free(p.content);
+                if (p.filename) |f| allocator.free(f);
+            }
+            allocator.free(parts);
         },
-        .delete_message => {},
     }
 }
 
-pub fn freeActions(actions: []Action, allocator: std.mem.Allocator) void {
-    for (actions) |action| freeActionPayload(action, allocator);
-    allocator.free(actions);
+pub fn freeApiCalls(calls: []ApiCall, allocator: std.mem.Allocator) void {
+    for (calls) |c| freeApiCall(c, allocator);
+    allocator.free(calls);
 }
+
+// ---------------------------------------------------------------------------
+// WorkItem — one inbound webhook update queued for a worker (ADR-0001 §AD-2)
+//
+// The server no longer parses the webhook body into a typed Update tree.
+// It forwards the raw JSON `body` verbatim plus a `user_id` it point-extracts
+// for queue routing.  `body` is heap-allocated; the worker frees it after
+// `callOnMessage` returns.
+// ---------------------------------------------------------------------------
+
+pub const WorkItem = struct {
+    body: []const u8, // owned: raw webhook JSON, freed by the worker
+    user_id: ?i64,    // routing key; null when no sender could be extracted
+};
+
 // ---------------------------------------------------------------------------
 // Configuration (populated by config.zig from env vars)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ValidationMode — outgoing-call schema validation policy (ADR-0001 §AD-5)
+//
+//   off    — no validation
+//   warn   — validate; log a warning on failure, send the call anyway
+//   strict — validate; drop the call on failure (it is never dispatched)
+// ---------------------------------------------------------------------------
+
+pub const ValidationMode = enum { off, warn, strict };
+
 pub const Config = struct {
-    bot_token: []const u8,
-    webhook_secret: []const u8,
-    listen_addr: std.net.Address,
-    rules_file: [:0]const u8,
-    db_path: [:0]const u8,
-    worker_count: u8,
-    queue_capacity: u16,
+    bot_token:          []const u8,
+    webhook_secret:     []const u8,
+    listen_addr:        std.net.Address,
+    rules_file:         [:0]const u8,
+    db_path:            [:0]const u8,
+    worker_count:       u8,
+    queue_capacity:     u16,
     dispatcher_threads: u8,
+    schema_file:        [:0]const u8,
+    api_validation:     ValidationMode,
+    api_base:           []const u8,
+    multipart_max_file: usize,
 };
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-test "AC-1.1: Update instantiates with all optional fields null" {
-    const u = Update{
-        .update_id = 1,
+// AC-1.1 (typed Update/Message/CallbackQuery instantiation + effectiveUserId)
+// and AC-1.2 (Action tagged-union) retired in sub-step 13c — the typed Update
+// tree and Action union are removed.  Inbound routing is now AC-13.6
+// (server-side extractUserId); outbound calls are AC-13.11.
+
+// ---------------------------------------------------------------------------
+// AC-13.1 — ApiCall lifecycle (no leaks under testing.allocator)
+// ---------------------------------------------------------------------------
+
+test "AC-13.1: freeApiCall releases method and body" {
+    const call = ApiCall{
+        .method  = try std.testing.allocator.dupe(u8, "sendDice"),
+        .payload = .{ .json = try std.testing.allocator.dupe(u8, "{\"chat_id\":1}") },
     };
-    try std.testing.expectEqual(@as(?Message, null), u.message);
-    try std.testing.expectEqual(@as(?CallbackQuery, null), u.callback_query);
+    freeApiCall(call, std.testing.allocator);
 }
 
-test "AC-1.1: Message instantiates with all optional fields null" {
-    const m = Message{
-        .message_id = 42,
-        .chat = .{ .id = 1, .type = "private" },
-        .date = 0,
+test "AC-13.1: freeApiCalls releases a slice of ApiCalls" {
+    var calls = try std.testing.allocator.alloc(ApiCall, 3);
+    calls[0] = .{
+        .method  = try std.testing.allocator.dupe(u8, "sendMessage"),
+        .payload = .{ .json = try std.testing.allocator.dupe(u8, "{}") },
     };
-    try std.testing.expectEqual(@as(?User, null), m.from);
-    try std.testing.expectEqual(@as(?[]const u8, null), m.text);
-}
-
-test "AC-1.1: CallbackQuery instantiates with all optional fields null" {
-    const cq = CallbackQuery{
-        .id = "cq1",
-        .from = .{ .id = 99, .is_bot = false, .first_name = "Bob" },
+    calls[1] = .{
+        .method  = try std.testing.allocator.dupe(u8, "editMessageText"),
+        .payload = .{ .json = try std.testing.allocator.dupe(u8, "{\"chat_id\":1,\"message_id\":2,\"text\":\"x\"}") },
     };
-    try std.testing.expectEqual(@as(?Message, null), cq.message);
-    try std.testing.expectEqual(@as(?[]const u8, null), cq.data);
-}
-
-test "AC-1.2: Action switch is exhaustive over all four tags" {
-    const actions = [_]Action{
-        .{ .send_message = .{ .chat_id = 1, .text = "hi" } },
-        .{ .send_message_ex = .{ .chat_id = 1, .text = "hi", .opts = "{}" } },
-        .{ .answer_callback = .{ .callback_query_id = "id", .text = null } },
-        .{ .delete_message = .{ .chat_id = 1, .message_id = 5 } },
+    calls[2] = .{
+        .method  = try std.testing.allocator.dupe(u8, "deleteMessage"),
+        .payload = .{ .json = try std.testing.allocator.dupe(u8, "{\"chat_id\":1,\"message_id\":2}") },
     };
-
-    for (actions) |a| {
-        // No else branch — must cover all four tags.
-        const tag: ActionTag = switch (a) {
-            .send_message => .send_message,
-            .send_message_ex => .send_message_ex,
-            .answer_callback => .answer_callback,
-            .delete_message => .delete_message,
-        };
-        _ = tag;
-    }
+    freeApiCalls(calls, std.testing.allocator);
 }
 
-test "AC-1.2: Action tagged union payload access" {
-    const a = Action{ .send_message = .{ .chat_id = 7, .text = "hello" } };
-    try std.testing.expectEqual(@as(i64, 7), a.send_message.chat_id);
-    try std.testing.expectEqualStrings("hello", a.send_message.text);
-}
+// ---------------------------------------------------------------------------
+// AC-15.5 — freeApiCall handles multipart payload (no leaks)
+// ---------------------------------------------------------------------------
 
-
-test "AC-1.1: Update.effectiveUserId from message" {
-    const u = Update{
-        .update_id = 1,
-        .message = .{
-            .message_id = 1,
-            .from = .{ .id = 42, .is_bot = false, .first_name = "Alice" },
-            .chat = .{ .id = 100, .type = "private" },
-            .date = 0,
-        },
+test "AC-15.5: freeApiCall on multipart ApiCall releases all parts" {
+    const alloc = std.testing.allocator;
+    var parts = try alloc.alloc(MultipartPart, 2);
+    parts[0] = .{
+        .name     = try alloc.dupe(u8, "caption"),
+        .content  = try alloc.dupe(u8, "hello"),
+        .filename = null,
     };
-    try std.testing.expectEqual(@as(?i64, 42), u.effectiveUserId());
-}
-
-test "AC-1.1: Update.effectiveUserId from callback_query when no message" {
-    const u = Update{
-        .update_id = 2,
-        .callback_query = .{
-            .id = "abc",
-            .from = .{ .id = 99, .is_bot = false, .first_name = "Bob" },
-        },
+    parts[1] = .{
+        .name     = try alloc.dupe(u8, "photo"),
+        .content  = try alloc.dupe(u8, "\xff\xd8\xff"),
+        .filename = try alloc.dupe(u8, "pic.jpg"),
     };
-    try std.testing.expectEqual(@as(?i64, 99), u.effectiveUserId());
+    const call = ApiCall{
+        .method  = try alloc.dupe(u8, "sendPhoto"),
+        .payload = .{ .multipart = parts },
+    };
+    freeApiCall(call, alloc);
 }
 
-test "AC-1.1: Update.effectiveUserId null when no sender" {
-    const u = Update{ .update_id = 3 };
-    try std.testing.expectEqual(@as(?i64, null), u.effectiveUserId());
-}
-
-test "AC-1.5: types.zig has no project-file imports" {
-    // Structural check: the only imports in this file are std and ziglua.
-    // Enforced by code review — this test documents the invariant.
-    // If a project import were added, the circular-import build error
-    // would catch it before this test runs.
-    try std.testing.expect(true);
+test "AC-15.5: freeApiCall on json ApiCall releases body" {
+    const alloc = std.testing.allocator;
+    const call = ApiCall{
+        .method  = try alloc.dupe(u8, "sendMessage"),
+        .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1}") },
+    };
+    freeApiCall(call, alloc);
 }

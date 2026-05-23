@@ -6,13 +6,14 @@
 ///
 /// Main loop (pseudo-code from CLAUDE.md):
 ///   loop:
-///     update = queue.tryPop()  -- check stop flag between polls
+///     item = queue.tryPop()  -- WorkItem{ body, user_id }; check stop flag between polls
 ///     if global_reload_version > local_reload_version:
 ///         lua_engine.loadFile(rules_path)
 ///         local_reload_version = global_reload_version
-///     actions = lua_engine.callOnMessage(update) -> []Action
+///     actions = lua_engine.callOnMessage(item.body) -> []ApiCall
 ///     for action in actions: dispatcher_queue.push(action)
 ///     free actions slice (string payloads now owned by dispatcher)
+///     free item.body
 ///
 /// Routing helper:
 ///   hashUserId(user_id, worker_count) → worker index
@@ -24,6 +25,7 @@ const queue_mod = @import("queue.zig");
 const lua_engine = @import("lua_engine.zig");
 const lua_api = @import("lua_api.zig");
 const state_store = @import("state_store.zig");
+const schema_store = @import("schema_store.zig");
 
 const log = std.log.scoped(.worker);
 
@@ -38,12 +40,13 @@ pub const WorkerArgs = struct {
     /// Used for Update→JSON conversion, action string allocation, and Lua
     /// engine internals.  Must be thread-safe (e.g., a GPA).
     allocator: std.mem.Allocator,
-    /// Input queue: server pushes Parsed(Update) values, worker pops and deinits them.
-    queue: *queue_mod.Queue(std.json.Parsed(types.Update)),
-    /// Output queue: worker pushes Action values, dispatcher pops them.
-    /// String payloads inside each Action are allocated from `allocator`;
-    /// the dispatcher is responsible for freeing them after sending.
-    dispatcher_queue: *queue_mod.Queue(types.Action),
+    /// Input queue: server pushes WorkItem values (raw body + routing user_id).
+    /// The worker frees WorkItem.body after callOnMessage returns.
+    queue: *queue_mod.Queue(types.WorkItem),
+    /// Output queue: worker pushes ApiCall values, dispatcher pops them.
+    /// The `method` and `body` strings inside each ApiCall are allocated from
+    /// `allocator`; the dispatcher is responsible for freeing them after sending.
+    dispatcher_queue: *queue_mod.Queue(types.ApiCall),
     /// Per-worker SQLite connection (WAL mode allows concurrent readers).
     db: *state_store.StateStore,
     /// Set to true to request graceful shutdown.  Worker exits the loop
@@ -54,6 +57,13 @@ pub const WorkerArgs = struct {
     /// on_message call.  Production code passes &reload.reload_version;
     /// tests inject a local counter for isolation.
     reload_ver: *std.atomic.Value(u64),
+    /// Hot-reloadable API schema for outgoing-call validation.
+    /// Defaults to null — no schema, no validation (used by tests).
+    schema: ?*schema_store.SchemaSlot = null,
+    /// Validation policy.  `.off` (default) disables validation.
+    validation: types.ValidationMode = .off,
+    /// Maximum file size in bytes for multipart upload (from config.multipart_max_file).
+    multipart_max_file: usize = 52428800,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,8 +82,9 @@ pub fn workerThread(args: WorkerArgs) void {
 
     // Build the ApiCtx that bot.* Lua functions use.
     var api_ctx = lua_api.ApiCtx{
-        .db        = args.db,
-        .allocator = args.allocator,
+        .db             = args.db,
+        .allocator      = args.allocator,
+        .max_file_bytes = args.multipart_max_file,
     };
 
     // Initialise Lua state.
@@ -89,21 +100,20 @@ pub fn workerThread(args: WorkerArgs) void {
         log.warn("worker {d}: initial rules load failed — no rules loaded", .{args.id});
     };
 
+    // Schema validation policy for outgoing calls (Phase 14).
+    engine.setValidation(args.schema, args.validation);
+
     // Track which reload generation this worker has applied.
     var local_ver: u64 = args.reload_ver.load(.acquire);
 
     // Main loop.
     while (!args.stop.load(.acquire)) {
         // Non-blocking pop so we can honour the stop flag promptly.
-        // const maybe_parsed = args.queue.tryPop();
-        const maybe_parsed = args.queue.popTimeout(10*std.time.ns_per_ms);
-        if (maybe_parsed == null) {
-            // std.Thread.sleep(1 * std.time.ns_per_ms);
-            continue;
-        }
-        const parsed = maybe_parsed.?;
-        defer parsed.deinit();
-        const update = parsed.value;
+        const maybe_item = args.queue.popTimeout(10 * std.time.ns_per_ms);
+        if (maybe_item == null) continue;
+        const item = maybe_item.?;
+        // The WorkItem owns its raw body; free it once on_message has run.
+        defer args.allocator.free(item.body);
 
         // ── Hot-reload check ───────────────────────────────────────────────
         const global_ver = args.reload_ver.load(.acquire);
@@ -116,18 +126,18 @@ pub fn workerThread(args: WorkerArgs) void {
         }
 
         // ── Call on_message ────────────────────────────────────────────────
-        const actions = engine.callOnMessage(args.allocator, update) catch |err| {
+        const actions = engine.callOnMessage(args.allocator, item.body) catch |err| {
             log.err("worker {d}: callOnMessage OOM: {s}", .{ args.id, @errorName(err) });
             continue;
         };
 
         // ── Forward to dispatcher ──────────────────────────────────────────
-        // String payloads inside each Action are transferred to the dispatcher.
-        // Only the wrapper slice is freed here.
+        // The method/body strings inside each ApiCall are transferred to the
+        // dispatcher.  Only the wrapper slice is freed here.
         for (actions) |action| {
             args.dispatcher_queue.push(action) catch {
                 log.warn("worker {d}: dispatcher queue full, dropping action", .{args.id});
-                types.freeActionPayload(action, args.allocator);
+                types.freeApiCall(action, args.allocator);
             };
         }
         args.allocator.free(actions);
@@ -165,27 +175,26 @@ fn waitQueue(q: anytype, n: usize, timeout_ms: u64) bool {
     return true;
 }
 
-/// Test helper: pop an Action from the queue and free its string payloads
+/// Test helper: pop an ApiCall from the queue and free its string payloads
 /// using the provided allocator after the caller is done with it.
-/// Returns the Action for inspection.
-fn popAction(q: *Queue(types.Action)) types.Action {
+/// Returns the ApiCall for inspection.
+fn popAction(q: *Queue(types.ApiCall)) types.ApiCall {
     return q.pop();
 }
 
 // ── Shared test setup ────────────────────────────────────────────────────────
 
-/// Wrap a bare Update in a Parsed(Update) for tests (no string allocations).
-fn testUpdate(allocator: std.mem.Allocator, update: types.Update) !std.json.Parsed(types.Update) {
-    const arena = try allocator.create(std.heap.ArenaAllocator);
-    arena.* = std.heap.ArenaAllocator.init(allocator);
-    return .{ .arena = arena, .value = update };
+/// Build a WorkItem from a JSON body string for tests.
+/// `body` is heap-duplicated; the worker frees it after callOnMessage.
+fn testWorkItem(allocator: std.mem.Allocator, body: []const u8) !types.WorkItem {
+    return .{ .body = try allocator.dupe(u8, body), .user_id = null };
 }
 
 const TestCtx = struct {
     tmp: testing.TmpDir,
     db: state_store.StateStore,
-    input_q: Queue(std.json.Parsed(types.Update)),
-    output_q: Queue(types.Action),
+    input_q: Queue(types.WorkItem),
+    output_q: Queue(types.ApiCall),
     stop: std.atomic.Value(bool),
     reload_ver: std.atomic.Value(u64),
     path_buf: [std.fs.max_path_bytes + 1]u8,
@@ -211,10 +220,10 @@ const TestCtx = struct {
         self.db = try state_store.StateStore.open(allocator, ":memory:");
         errdefer self.db.close();
 
-        self.input_q  = try Queue(std.json.Parsed(types.Update)).init(allocator, 64);
+        self.input_q  = try Queue(types.WorkItem).init(allocator, 64);
         errdefer self.input_q.deinit(allocator);
 
-        self.output_q = try Queue(types.Action).init(allocator, 256);
+        self.output_q = try Queue(types.ApiCall).init(allocator, 256);
         errdefer self.output_q.deinit(allocator);
 
         self.stop       = std.atomic.Value(bool).init(false);
@@ -239,6 +248,10 @@ const TestCtx = struct {
     fn deinit(self: *TestCtx, t: std.Thread) void {
         self.stop.store(true, .release);
         t.join();
+        // Drain anything the worker didn't consume before stop, freeing
+        // owned payloads so the test runs leak-clean under testing.allocator.
+        while (self.input_q.popTimeout(0)) |item| self.allocator.free(item.body);
+        while (self.output_q.popTimeout(0)) |call| types.freeApiCall(call, self.allocator);
         self.output_q.deinit(self.allocator);
         self.input_q.deinit(self.allocator);
         self.db.close();
@@ -248,10 +261,15 @@ const TestCtx = struct {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+// luaTableToJson key order is unspecified — assert ApiCall bodies by substring.
+fn bodyHas(body: []const u8, needle: []const u8) bool {
+    return std.mem.indexOf(u8, body, needle) != null;
+}
+
 test "AC-8.1: single update → dispatcher receives expected action" {
     var ctx = try TestCtx.init(testing.allocator,
         \\function on_message(u)
-        \\  return { {action="send_message", chat_id=42, text="hello"} }
+        \\  return { { method="sendMessage", params={ chat_id=42, text="hello" } } }
         \\end
     );
     const t = try ctx.spawnWorker();
@@ -260,22 +278,22 @@ test "AC-8.1: single update → dispatcher receives expected action" {
     // Give worker time to start and load rules.
     std.Thread.sleep(30 * std.time.ns_per_ms);
 
-    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 1 }));
+    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
 
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
     const action = popAction(&ctx.output_q);
-    defer types.freeActionPayload(action, testing.allocator);
+    defer types.freeApiCall(action, testing.allocator);
 
-    try testing.expectEqual(types.ActionTag.send_message, std.meta.activeTag(action));
-    try testing.expectEqual(@as(i64, 42), action.send_message.chat_id);
-    try testing.expectEqualStrings("hello", action.send_message.text);
+    try testing.expectEqualStrings("sendMessage", action.method);
+    try testing.expect(bodyHas(action.payload.json, "\"chat_id\":42"));
+    try testing.expect(bodyHas(action.payload.json, "\"text\":\"hello\""));
 }
 
 test "AC-8.2: reload_version incremented → worker reloads before on_message" {
     var ctx = try TestCtx.init(testing.allocator,
         \\function on_message(u)
-        \\  return { {action="send_message", chat_id=1, text="v1"} }
+        \\  return { { method="sendMessage", params={ chat_id=1, text="v1" } } }
         \\end
     );
     const t = try ctx.spawnWorker();
@@ -290,7 +308,7 @@ test "AC-8.2: reload_version incremented → worker reloads before on_message" {
         defer f.close();
         try f.writeAll(
             \\function on_message(u)
-            \\  return { {action="send_message", chat_id=1, text="v2"} }
+            \\  return { { method="sendMessage", params={ chat_id=1, text="v2" } } }
             \\end
         );
     }
@@ -298,20 +316,20 @@ test "AC-8.2: reload_version incremented → worker reloads before on_message" {
     // Signal reload via the isolated per-test counter (TD-2 fix).
     _ = ctx.reload_ver.fetchAdd(1, .release);
 
-    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 2 }));
+    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":2}"));
 
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
     const action = popAction(&ctx.output_q);
-    defer types.freeActionPayload(action, testing.allocator);
+    defer types.freeApiCall(action, testing.allocator);
 
-    try testing.expectEqualStrings("v2", action.send_message.text);
+    try testing.expect(bodyHas(action.payload.json, "\"text\":\"v2\""));
 }
 
 test "AC-8.3: update that triggers reload is still processed (not dropped)" {
     var ctx = try TestCtx.init(testing.allocator,
         \\function on_message(u)
-        \\  return { {action="send_message", chat_id=99, text="ok"} }
+        \\  return { { method="sendMessage", params={ chat_id=99, text="ok" } } }
         \\end
     );
     const t = try ctx.spawnWorker();
@@ -323,14 +341,14 @@ test "AC-8.3: update that triggers reload is still processed (not dropped)" {
     _ = ctx.reload_ver.fetchAdd(1, .release);
 
     // Push the update — it should be processed after the reload, not dropped.
-    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 3 }));
+    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":3}"));
 
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
     const action = popAction(&ctx.output_q);
-    defer types.freeActionPayload(action, testing.allocator);
+    defer types.freeApiCall(action, testing.allocator);
 
-    try testing.expectEqualStrings("ok", action.send_message.text);
+    try testing.expect(bodyHas(action.payload.json, "\"text\":\"ok\""));
 }
 
 test "AC-8.4: Lua error on first update → worker continues; second update succeeds" {
@@ -341,7 +359,7 @@ test "AC-8.4: Lua error on first update → worker continues; second update succ
         \\  if call_count == 1 then
         \\    error("intentional error")
         \\  end
-        \\  return { {action="send_message", chat_id=1, text="second"} }
+        \\  return { { method="sendMessage", params={ chat_id=1, text="second" } } }
         \\end
     );
     const t = try ctx.spawnWorker();
@@ -350,15 +368,15 @@ test "AC-8.4: Lua error on first update → worker continues; second update succ
     std.Thread.sleep(30 * std.time.ns_per_ms);
 
     // First update → Lua error, empty slice returned, nothing pushed.
-    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 4 }));
+    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":4}"));
     // Second update → succeeds.
-    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 5 }));
+    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":5}"));
 
     try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
     const action = popAction(&ctx.output_q);
-    defer types.freeActionPayload(action, testing.allocator);
-    try testing.expectEqualStrings("second", action.send_message.text);
+    defer types.freeApiCall(action, testing.allocator);
+    try testing.expect(bodyHas(action.payload.json, "\"text\":\"second\""));
 
     // Confirm no second action appeared (first update produced nothing).
     try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
@@ -377,7 +395,7 @@ test "AC-8.5: worker thread alive (not exited) after 200ms with empty queue" {
     // independent), but we verify the thread is still alive via a liveness probe:
     // push an update and check the dispatcher gets a response (which requires
     // the worker to still be running).
-    try ctx.input_q.push(try testUpdate(testing.allocator, types.Update{ .update_id = 6 }));
+    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":6}"));
 
     // on_message returns {}, so no actions expected — but the worker must
     // still be alive to pop and process the update.
@@ -387,6 +405,86 @@ test "AC-8.5: worker thread alive (not exited) after 200ms with empty queue" {
         std.Thread.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expectEqual(@as(usize, 0), ctx.input_q.len());
+}
+
+test "AC-14: worker in strict mode drops calls that fail schema validation" {
+    const SCHEMA =
+        \\{"methods":{"sendMessage":{"fields":[
+        \\  {"name":"chat_id","types":["Integer","String"],"required":true},
+        \\  {"name":"text","types":["String"],"required":true}
+        \\]}},"types":{}}
+    ;
+    var slot = schema_store.SchemaSlot.init(testing.allocator);
+    slot.install(try schema_store.SchemaStore.fromSlice(testing.allocator, SCHEMA));
+
+    var ctx = try TestCtx.init(testing.allocator,
+        // returns sendMessage with only chat_id — missing required `text`
+        \\function on_message(u)
+        \\  return { { method="sendMessage", params={ chat_id=1 } } }
+        \\end
+    );
+    const args = WorkerArgs{
+        .id               = 0,
+        .rules_path       = ctx.rules_path,
+        .allocator        = testing.allocator,
+        .queue            = &ctx.input_q,
+        .dispatcher_queue = &ctx.output_q,
+        .db               = &ctx.db,
+        .stop             = &ctx.stop,
+        .reload_ver       = &ctx.reload_ver,
+        .schema           = &slot,
+        .validation       = .strict,
+    };
+    const t = try std.Thread.spawn(.{}, workerThread, .{args});
+    // Cleanup order: join worker first, then free slot.
+    defer { ctx.deinit(t); slot.deinit(); }
+
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // strict mode: missing required `text` → call dropped, dispatcher queue stays empty
+    try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
+}
+
+test "AC-14: worker in warn mode keeps calls that fail schema validation" {
+    const SCHEMA =
+        \\{"methods":{"sendMessage":{"fields":[
+        \\  {"name":"chat_id","types":["Integer","String"],"required":true},
+        \\  {"name":"text","types":["String"],"required":true}
+        \\]}},"types":{}}
+    ;
+    var slot = schema_store.SchemaSlot.init(testing.allocator);
+    slot.install(try schema_store.SchemaStore.fromSlice(testing.allocator, SCHEMA));
+
+    var ctx = try TestCtx.init(testing.allocator,
+        \\function on_message(u)
+        \\  return { { method="sendMessage", params={ chat_id=1 } } }
+        \\end
+    );
+    const args = WorkerArgs{
+        .id               = 0,
+        .rules_path       = ctx.rules_path,
+        .allocator        = testing.allocator,
+        .queue            = &ctx.input_q,
+        .dispatcher_queue = &ctx.output_q,
+        .db               = &ctx.db,
+        .stop             = &ctx.stop,
+        .reload_ver       = &ctx.reload_ver,
+        .schema           = &slot,
+        .validation       = .warn,
+    };
+    const t = try std.Thread.spawn(.{}, workerThread, .{args});
+    defer { ctx.deinit(t); slot.deinit(); }
+
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
+    try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
+
+    // warn mode: invalid call is kept (logged but forwarded)
+    const action = popAction(&ctx.output_q);
+    defer types.freeApiCall(action, testing.allocator);
+    try testing.expectEqualStrings("sendMessage", action.method);
 }
 
 test "AC-8.6: hashUserId is deterministic — 10k ids × 8 workers always same index" {

@@ -1,23 +1,21 @@
 // dispatcher.zig — outbound HTTP thread pool → Telegram API
 //
-// ACTION STRING-PAYLOAD OWNERSHIP CONTRACT (see TECH_DEBT.md TD-4)
+// APICALL STRING-PAYLOAD OWNERSHIP CONTRACT (see TECH_DEBT.md TD-4)
 // ----------------------------------------------------------------
-// worker.zig transfers ownership of all heap-allocated strings inside each
-// Action to this dispatcher.  The dispatcher MUST free every string payload
-// after the action has been sent (successfully or not).  Use the helper
+// worker.zig transfers ownership of both heap-allocated strings inside each
+// ApiCall (`method` and `body`) to this dispatcher.  The dispatcher MUST free
+// them after the call has been sent (successfully or not).  Use the helper
 // pattern below for every dequeue:
 //
-//   const action = dispatcher_queue.pop();
-//   defer freeActionPayload(action, allocator);
-//   // ... send action ...
+//   const call = dispatcher_queue.pop();
+//   defer types.freeApiCall(call, allocator);
+//   // ... send call ...
 //
-// freeActionPayload must mirror lua_engine.LuaEngine.freeActions field-by-field:
-//   send_message    → free text
-//   send_message_ex → free text, free opts
-//   answer_callback → free callback_query_id, free text (if non-null)
-//   delete_message  → nothing to free
+// Failure to call types.freeApiCall leaks memory on every dispatched call.
 //
-// Failure to call freeActionPayload leaks memory on every dispatched action.
+// The dispatcher is API-agnostic (ADR-0001 §AD-1): it POSTs `body` verbatim
+// to /bot<token>/<method> with Content-Type: application/json.  It does not
+// know — or need to know — which Telegram method it is calling.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -31,7 +29,7 @@ const log = std.log.scoped(.dispatcher);
 
 pub const DispatcherArgs = struct {
     id: u8,
-    queue: *queue_mod.Queue(types.Action),
+    queue: *queue_mod.Queue(types.ApiCall),
     bot_token: []const u8,
     /// Base URL for the Telegram Bot API.
     /// Production: "https://api.telegram.org"
@@ -60,18 +58,14 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
     defer args.allocator.free(url_prefix);
 
     while (!args.stop.load(.acquire)) {
-        // const maybe_action = args.queue.tryPop();
-        const maybe_action = args.queue.popTimeout(10 * std.time.ns_per_ms);
-        if (maybe_action == null) {
-            // std.Thread.sleep(1 * std.time.ns_per_ms);
-            continue;
-        }
-        const action = maybe_action.?;
+        const maybe_call = args.queue.popTimeout(10 * std.time.ns_per_ms);
+        if (maybe_call == null) continue;
+        const call = maybe_call.?;
         // Always free string payloads, whether send succeeds or not.
-        defer types.freeActionPayload(action, args.allocator);
+        defer types.freeApiCall(call, args.allocator);
 
-        sendWithRetry(&client, action, url_prefix, args.allocator) catch |err| {
-            log.warn("dispatcher {d}: dropped action after retry failure: {s}", .{ args.id, @errorName(err) });
+        sendWithRetry(&client, call, url_prefix, args.allocator) catch |err| {
+            log.warn("dispatcher {d}: dropped call after retry failure: {s}", .{ args.id, @errorName(err) });
         };
     }
     log.info("dispatcher {d}: stopped", .{args.id});
@@ -83,11 +77,11 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
 
 fn sendWithRetry(
     client: *std.http.Client,
-    action: types.Action,
+    call: types.ApiCall,
     url_prefix: []const u8,
     allocator: std.mem.Allocator,
 ) !void {
-    if (send(client, action, url_prefix, allocator)) {
+    if (send(client, call, url_prefix, allocator)) {
         return;
     } else |err| {
         log.warn("send failed ({s}), retrying in 1s", .{@errorName(err)});
@@ -97,103 +91,138 @@ fn sendWithRetry(
         // broken and would cause a second WriteFailed/ReadFailed.
         client.deinit();
         client.* = std.http.Client{ .allocator = allocator };
-        try send(client, action, url_prefix, allocator);
+        try send(client, call, url_prefix, allocator);
     }
 }
 
 // ---------------------------------------------------------------------------
 // Private: single HTTP POST to the Telegram Bot API
+//
+// Generic by construction (ADR-0001 §AD-1): payload is switched on the
+// ApiCall.payload union — JSON body POSTed verbatim, or multipart built
+// from parts.  No per-method branching.
 // ---------------------------------------------------------------------------
 
 fn send(
-    client: *std.http.Client,
-    action: types.Action,
+    client:     *std.http.Client,
+    call:       types.ApiCall,
     url_prefix: []const u8,
-    allocator: std.mem.Allocator,
+    allocator:  std.mem.Allocator,
 ) !void {
-    const method_path = actionMethod(action);
+    const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ url_prefix, call.method });
+    defer allocator.free(url);
 
-    const body = try buildBody(action, allocator);
-    defer allocator.free(body);
-
-    var buf: [256]u8 = undefined;
-    const url = std.fmt.bufPrint(&buf, "{s}{s}", .{ url_prefix, method_path }) catch unreachable;
-
-    log.debug("→ {s}  {s}", .{ method_path, body });
-
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
-        .payload = body,
-        .keep_alive = true,
-        .extra_headers = &.{
-            .{ .name = "Content-Type", .value = "application/json" },
+    switch (call.payload) {
+        .json => |body| {
+            log.debug("→ {s} (json) {s}", .{ call.method, body });
+            const result = try client.fetch(.{
+                .location      = .{ .url = url },
+                .payload       = body,
+                .keep_alive    = true,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "application/json" },
+                },
+            });
+            if (result.status.class() != .success) {
+                log.warn("Telegram API returned HTTP {d} for {s}",
+                    .{ @intFromEnum(result.status), call.method });
+                return error.TelegramApiError;
+            }
+            log.debug("← {d} {s}", .{ @intFromEnum(result.status), call.method });
         },
-    });
+        .multipart => |parts| {
+            const mb = try buildMultipartBody(parts, allocator);
+            defer allocator.free(mb.bytes);
+            log.debug("→ {s} (multipart, {d} parts)", .{ call.method, parts.len });
+            const ct = try std.fmt.allocPrint(allocator,
+                "multipart/form-data; boundary={s}", .{mb.boundary[0..mb.blen]});
+            defer allocator.free(ct);
+            const result = try client.fetch(.{
+                .location      = .{ .url = url },
+                .payload       = mb.bytes,
+                .keep_alive    = true,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = ct },
+                },
+            });
+            if (result.status.class() != .success) {
+                log.warn("Telegram API returned HTTP {d} for {s}",
+                    .{ @intFromEnum(result.status), call.method });
+                return error.TelegramApiError;
+            }
+            log.debug("← {d} {s}", .{ @intFromEnum(result.status), call.method });
+        },
+    }
+}
 
-    if (result.status.class() != .success) {
-        log.warn("Telegram API returned HTTP {d} for {s}", .{
-            @intFromEnum(result.status), method_path,
-        });
-        return error.TelegramApiError;
+// ---------------------------------------------------------------------------
+// Private: multipart body building (Phase 15)
+// ---------------------------------------------------------------------------
+
+const MultipartBody = struct {
+    bytes:    []u8,
+    boundary: [34]u8, // "zB" + 32 hex chars
+    blen:     usize,
+};
+
+/// Reject any string that would break a quoted Content-Disposition value.
+fn validateHeaderValue(s: []const u8) !void {
+    for (s) |c| {
+        if (c == '\r' or c == '\n' or c == '"') return error.InvalidHeaderValue;
+    }
+}
+
+fn buildMultipartBody(
+    parts:     []types.MultipartPart,
+    allocator: std.mem.Allocator,
+) !MultipartBody {
+    var mb: MultipartBody = undefined;
+    var raw: [16]u8 = undefined;
+    std.crypto.random.bytes(&raw);
+    var hex: [32]u8 = undefined;
+    for (raw, 0..) |byte, i| {
+        const digits = "0123456789abcdef";
+        hex[i * 2]     = digits[byte >> 4];
+        hex[i * 2 + 1] = digits[byte & 0xf];
+    }
+    const b_slice = std.fmt.bufPrint(&mb.boundary, "zB{s}", .{hex}) catch unreachable;
+    mb.blen = b_slice.len;
+    const boundary = mb.boundary[0..mb.blen];
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    for (parts) |p| {
+        try validateHeaderValue(p.name);
+        try buf.appendSlice(allocator, "--");
+        try buf.appendSlice(allocator, boundary);
+        try buf.appendSlice(allocator, "\r\n");
+
+        if (p.filename) |fname| {
+            try validateHeaderValue(fname);
+            const hdr = try std.fmt.allocPrint(allocator,
+                "Content-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: application/octet-stream\r\n",
+                .{ p.name, fname },
+            );
+            defer allocator.free(hdr);
+            try buf.appendSlice(allocator, hdr);
+        } else {
+            const hdr = try std.fmt.allocPrint(allocator,
+                "Content-Disposition: form-data; name=\"{s}\"\r\n", .{p.name});
+            defer allocator.free(hdr);
+            try buf.appendSlice(allocator, hdr);
+        }
+        try buf.appendSlice(allocator, "\r\n");
+        try buf.appendSlice(allocator, p.content);
+        try buf.appendSlice(allocator, "\r\n");
     }
 
-    log.debug("← {d} {s}", .{ @intFromEnum(result.status), method_path });
-}
+    try buf.appendSlice(allocator, "--");
+    try buf.appendSlice(allocator, boundary);
+    try buf.appendSlice(allocator, "--\r\n");
 
-// ---------------------------------------------------------------------------
-// Private: action → Telegram Bot API method name
-// ---------------------------------------------------------------------------
-
-fn actionMethod(action: types.Action) [:0]const u8 {
-    return switch (action) {
-        .send_message, .send_message_ex => "sendMessage",
-        .answer_callback => "answerCallbackQuery",
-        .delete_message => "deleteMessage",
-    };
-}
-
-// ---------------------------------------------------------------------------
-// Private: action → JSON request body
-// ---------------------------------------------------------------------------
-
-pub fn buildBody(action: types.Action, allocator: std.mem.Allocator) ![]u8 {
-    return switch (action) {
-        .send_message => |a| std.json.Stringify.valueAlloc(allocator, .{
-            .chat_id = a.chat_id,
-            .text = a.text,
-        }, .{}),
-
-        .send_message_ex => |a| blk: {
-            var aw: std.io.Writer.Allocating = .init(allocator);
-            defer aw.deinit();
-            try aw.writer.print("{{\"chat_id\":{d},\"text\":", .{a.chat_id});
-            try std.json.Stringify.value(a.text, .{}, &aw.writer);
-            if (!std.mem.eql(u8, a.opts, "{}")) {
-                try aw.writer.writeByte(',');
-                try aw.writer.writeAll(a.opts[1 .. a.opts.len - 1]); // strip outer { }
-            }
-            try aw.writer.writeByte('}');
-            break :blk try aw.toOwnedSlice();
-        },
-
-        .answer_callback => |a| blk: {
-            if (a.text) |text| {
-                break :blk std.json.Stringify.valueAlloc(allocator, .{
-                    .callback_query_id = a.callback_query_id,
-                    .text = text,
-                }, .{});
-            } else {
-                break :blk std.json.Stringify.valueAlloc(allocator, .{
-                    .callback_query_id = a.callback_query_id,
-                }, .{});
-            }
-        },
-
-        .delete_message => |a| std.json.Stringify.valueAlloc(allocator, .{
-            .chat_id = a.chat_id,
-            .message_id = a.message_id,
-        }, .{}),
-    };
+    mb.bytes = try buf.toOwnedSlice(allocator);
+    return mb;
 }
 
 // ---------------------------------------------------------------------------
@@ -202,92 +231,11 @@ pub fn buildBody(action: types.Action, allocator: std.mem.Allocator) ![]u8 {
 
 const testing = std.testing;
 
-// ── Unit tests: buildBody ────────────────────────────────────────────────────
-
-test "AC-9.1: send_message body contains chat_id and text" {
-    const action = types.Action{ .send_message = .{
-        .chat_id = 123,
-        .text = "hello",
-    } };
-    const body = try buildBody(action, testing.allocator);
-    defer testing.allocator.free(body);
-
-    try testing.expectEqualStrings("{\"chat_id\":123,\"text\":\"hello\"}", body);
-}
-
-test "AC-9.2: send_message_ex merges opts fields into body" {
-    const action = types.Action{ .send_message_ex = .{
-        .chat_id = 7,
-        .text = "bold",
-        .opts = try testing.allocator.dupe(u8, "{\"parse_mode\":\"HTML\"}"),
-    } };
-    defer testing.allocator.free(action.send_message_ex.opts);
-
-    const body = try buildBody(action, testing.allocator);
-    defer testing.allocator.free(body);
-
-    try testing.expectEqualStrings(
-        "{\"chat_id\":7,\"text\":\"bold\",\"parse_mode\":\"HTML\"}",
-        body,
-    );
-}
-
-test "AC-9.2: send_message_ex with empty opts == send_message body" {
-    const action = types.Action{ .send_message_ex = .{
-        .chat_id = 1,
-        .text = "plain",
-        .opts = try testing.allocator.dupe(u8, "{}"),
-    } };
-    defer testing.allocator.free(action.send_message_ex.opts);
-
-    const body = try buildBody(action, testing.allocator);
-    defer testing.allocator.free(body);
-
-    try testing.expectEqualStrings("{\"chat_id\":1,\"text\":\"plain\"}", body);
-}
-
-test "AC-9.3: answer_callback body with text" {
-    const action = types.Action{ .answer_callback = .{
-        .callback_query_id = "cq42",
-        .text = "done",
-    } };
-    const body = try buildBody(action, testing.allocator);
-    defer testing.allocator.free(body);
-
-    try testing.expectEqualStrings(
-        "{\"callback_query_id\":\"cq42\",\"text\":\"done\"}",
-        body,
-    );
-}
-
-test "AC-9.3: answer_callback body without text" {
-    const action = types.Action{ .answer_callback = .{
-        .callback_query_id = "cq99",
-        .text = null,
-    } };
-    const body = try buildBody(action, testing.allocator);
-    defer testing.allocator.free(body);
-
-    try testing.expectEqualStrings("{\"callback_query_id\":\"cq99\"}", body);
-}
-
-test "AC-9.4: delete_message body contains chat_id and message_id" {
-    const action = types.Action{ .delete_message = .{
-        .chat_id = 55,
-        .message_id = 1001,
-    } };
-    const body = try buildBody(action, testing.allocator);
-    defer testing.allocator.free(body);
-
-    try testing.expectEqualStrings("{\"chat_id\":55,\"message_id\":1001}", body);
-}
-
-test "AC-9.1: actionMethod returns correct paths" {
-    try testing.expectEqualStrings("sendMessage", actionMethod(.{ .send_message = .{ .chat_id = 0, .text = "" } }));
-    try testing.expectEqualStrings("sendMessage", actionMethod(.{ .send_message_ex = .{ .chat_id = 0, .text = "", .opts = "{}" } }));
-    try testing.expectEqualStrings("answerCallbackQuery", actionMethod(.{ .answer_callback = .{ .callback_query_id = "", .text = null } }));
-    try testing.expectEqualStrings("deleteMessage", actionMethod(.{ .delete_message = .{ .chat_id = 0, .message_id = 0 } }));
-}
+// Sub-step 13a (ADR-0001): the per-method `buildBody` / `actionMethod`
+// unit tests are retired — the dispatcher no longer builds bodies or maps
+// method names.  Body construction moved to lua_engine's actionToApiCall
+// adapter (tested there: AC-6.2, AC-6.4).  Wire-level coverage is the
+// MockServer integration tests below (AC-13.2, AC-13.3, AC-13.4).
 
 // ── Mock HTTP server ─────────────────────────────────────────────────────────
 
@@ -304,13 +252,15 @@ pub const MockServer = struct {
     allocator: std.mem.Allocator,
 
     const MockRequest = struct {
-        path: []const u8,
-        body: []const u8,
-        allocator: std.mem.Allocator,
+        path:         []const u8,
+        body:         []const u8,
+        content_type: []const u8,
+        allocator:    std.mem.Allocator,
 
         fn deinit(self: *MockRequest) void {
             self.allocator.free(self.path);
             self.allocator.free(self.body);
+            self.allocator.free(self.content_type);
         }
     };
 
@@ -448,8 +398,9 @@ fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?Mock
     const path = try allocator.dupe(u8, raw_path);
     errdefer allocator.free(path);
 
-    // Parse Content-Length.
+    // Parse Content-Length and Content-Type.
     var content_length: usize = 0;
+    var content_type_raw: []const u8 = "";
     var lines = std.mem.splitSequence(u8, header_section[rl_end + 2 ..], "\r\n");
     while (lines.next()) |line| {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
@@ -457,9 +408,13 @@ fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?Mock
         const value = std.mem.trim(u8, line[colon + 1 ..], " ");
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             content_length = std.fmt.parseInt(usize, value, 10) catch 0;
-            break;
+        } else if (std.ascii.eqlIgnoreCase(name, "content-type")) {
+            content_type_raw = value;
         }
     }
+    // Dupe content_type before the body-reading loop may reallocate buf.
+    const content_type = try allocator.dupe(u8, content_type_raw);
+    errdefer allocator.free(content_type);
 
     // Ensure we have the full body.
     const body_start = he + 4;
@@ -478,9 +433,10 @@ fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?Mock
     errdefer allocator.free(body);
 
     return MockServer.MockRequest{
-        .path = path,
-        .body = body,
-        .allocator = allocator,
+        .path         = path,
+        .body         = body,
+        .content_type = content_type,
+        .allocator    = allocator,
     };
 }
 
@@ -491,7 +447,7 @@ fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?Mock
 // invalidate the pointers passed to the spawned thread.
 const TestDispatcher = struct {
     stop: std.atomic.Value(bool),
-    queue: queue_mod.Queue(types.Action),
+    queue: queue_mod.Queue(types.ApiCall),
     thread: std.Thread,
     allocator: std.mem.Allocator,
 
@@ -504,7 +460,7 @@ const TestDispatcher = struct {
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         self.stop = std.atomic.Value(bool).init(false);
-        self.queue = try queue_mod.Queue(types.Action).init(allocator, 256);
+        self.queue = try queue_mod.Queue(types.ApiCall).init(allocator, 256);
         errdefer self.queue.deinit(allocator);
         const args = DispatcherArgs{
             .id = 0,
@@ -526,61 +482,41 @@ const TestDispatcher = struct {
     }
 };
 
-// ── Mock server integration tests ────────────────────────────────────────────
+// ── Mock server integration tests (ADR-0001 sub-step 13a) ───────────────────
 
-test "AC-9.1: send_message POSTs to /bot{token}/sendMessage with JSON body" {
-    const mock = try MockServer.init(testing.allocator);
-    defer mock.deinit();
-
-    var url_buf: [64]u8 = undefined;
-    const api_base = mock.baseUrl(&url_buf);
-
-    const d = try TestDispatcher.init(testing.allocator, "TESTTOKEN", api_base);
-    defer d.deinit();
-
-    try d.queue.push(.{ .send_message = .{
-        .chat_id = 42,
-        .text = try testing.allocator.dupe(u8, "hello"),
-    } });
-
-    try testing.expect(mock.waitForN(1, 2000));
-
-    var req = mock.received.pop();
-    defer req.deinit();
-
-    try testing.expectEqualStrings("/botTESTTOKEN/sendMessage", req.path);
-    try testing.expectEqualStrings("{\"chat_id\":42,\"text\":\"hello\"}", req.body);
+/// Push a JSON ApiCall with heap-duplicated method+body.  The dispatcher takes
+/// ownership and frees both after sending (ApiCall ownership contract).
+fn pushCall(q: *queue_mod.Queue(types.ApiCall), method: []const u8, body: []const u8) !void {
+    try q.push(.{
+        .method  = try testing.allocator.dupe(u8, method),
+        .payload = .{ .json = try testing.allocator.dupe(u8, body) },
+    });
 }
 
-test "AC-9.2: send_message_ex merges opts in the sent body" {
+test "AC-13.2: ApiCall POSTs to /bot{token}/{method} with verbatim JSON body" {
     const mock = try MockServer.init(testing.allocator);
     defer mock.deinit();
 
     var url_buf: [64]u8 = undefined;
-    const api_base = mock.baseUrl(&url_buf);
-
-    const d = try TestDispatcher.init(testing.allocator, "TOK", api_base);
+    const d = try TestDispatcher.init(testing.allocator, "TESTTOKEN", mock.baseUrl(&url_buf));
     defer d.deinit();
 
-    try d.queue.push(.{ .send_message_ex = .{
-        .chat_id = 1,
-        .text = try testing.allocator.dupe(u8, "hi"),
-        .opts = try testing.allocator.dupe(u8, "{\"parse_mode\":\"HTML\"}"),
-    } });
+    try pushCall(&d.queue, "editMessageText", "{\"chat_id\":1,\"message_id\":2,\"text\":\"edited\"}");
 
     try testing.expect(mock.waitForN(1, 2000));
-
     var req = mock.received.pop();
     defer req.deinit();
 
-    try testing.expectEqualStrings("/botTOK/sendMessage", req.path);
+    try testing.expectEqualStrings("/botTESTTOKEN/editMessageText", req.path);
     try testing.expectEqualStrings(
-        "{\"chat_id\":1,\"text\":\"hi\",\"parse_mode\":\"HTML\"}",
+        "{\"chat_id\":1,\"message_id\":2,\"text\":\"edited\"}",
         req.body,
     );
 }
 
-test "AC-9.3: answer_callback POSTs to answerCallbackQuery" {
+test "AC-13.3: a method the dispatcher never names (sendDice) round-trips end-to-end" {
+    // Proof of API-agnosticism (ADR-0001 §AD-1): no code path special-cases
+    // "sendDice" — it reaches the wire purely because ApiCall.method is opaque.
     const mock = try MockServer.init(testing.allocator);
     defer mock.deinit();
 
@@ -588,44 +524,17 @@ test "AC-9.3: answer_callback POSTs to answerCallbackQuery" {
     const d = try TestDispatcher.init(testing.allocator, "TOK", mock.baseUrl(&url_buf));
     defer d.deinit();
 
-    try d.queue.push(.{ .answer_callback = .{
-        .callback_query_id = try testing.allocator.dupe(u8, "cq1"),
-        .text = try testing.allocator.dupe(u8, "done"),
-    } });
+    try pushCall(&d.queue, "sendDice", "{\"chat_id\":7}");
 
     try testing.expect(mock.waitForN(1, 2000));
     var req = mock.received.pop();
     defer req.deinit();
 
-    try testing.expectEqualStrings("/botTOK/answerCallbackQuery", req.path);
-    try testing.expectEqualStrings(
-        "{\"callback_query_id\":\"cq1\",\"text\":\"done\"}",
-        req.body,
-    );
+    try testing.expectEqualStrings("/botTOK/sendDice", req.path);
+    try testing.expectEqualStrings("{\"chat_id\":7}", req.body);
 }
 
-test "AC-9.4: delete_message POSTs to deleteMessage" {
-    const mock = try MockServer.init(testing.allocator);
-    defer mock.deinit();
-
-    var url_buf: [64]u8 = undefined;
-    const d = try TestDispatcher.init(testing.allocator, "TOK", mock.baseUrl(&url_buf));
-    defer d.deinit();
-
-    try d.queue.push(.{ .delete_message = .{
-        .chat_id = 99,
-        .message_id = 777,
-    } });
-
-    try testing.expect(mock.waitForN(1, 2000));
-    var req = mock.received.pop();
-    defer req.deinit();
-
-    try testing.expectEqualStrings("/botTOK/deleteMessage", req.path);
-    try testing.expectEqualStrings("{\"chat_id\":99,\"message_id\":777}", req.body);
-}
-
-test "AC-9.5: dispatcher retries once after server closes connection; exactly 2 attempts" {
+test "AC-13.4: dispatcher retries once after server closes connection; exactly 2 attempts" {
     // First connection: accept but immediately close without a response.
     // Second connection: answer normally.
     // The dispatcher must have retried exactly once.
@@ -671,10 +580,7 @@ test "AC-9.5: dispatcher retries once after server closes connection; exactly 2 
     const d = try TestDispatcher.init(testing.allocator, "TOK", api_base);
     defer d.deinit();
 
-    try d.queue.push(.{ .send_message = .{
-        .chat_id = 1,
-        .text = try testing.allocator.dupe(u8, "retry test"),
-    } });
+    try pushCall(&d.queue, "sendMessage", "{\"chat_id\":1,\"text\":\"retry test\"}");
 
     srv_thread.join();
 
@@ -682,7 +588,7 @@ test "AC-9.5: dispatcher retries once after server closes connection; exactly 2 
     try testing.expectEqual(@as(u32, 2), attempt_count.load(.acquire));
 }
 
-test "AC-9.6: both attempts fail — action discarded, no third attempt, no crash" {
+test "AC-13.4: both attempts fail — call discarded, no third attempt, no crash" {
     const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(.{ .reuse_address = true });
 
@@ -715,10 +621,7 @@ test "AC-9.6: both attempts fail — action discarded, no third attempt, no cras
     const d = try TestDispatcher.init(testing.allocator, "TOK", api_base);
     defer d.deinit();
 
-    try d.queue.push(.{ .send_message = .{
-        .chat_id = 2,
-        .text = try testing.allocator.dupe(u8, "both-fail"),
-    } });
+    try pushCall(&d.queue, "sendMessage", "{\"chat_id\":2,\"text\":\"both-fail\"}");
 
     srv_thread.join();
     server.deinit(); // safe to call after thread exits
@@ -727,88 +630,232 @@ test "AC-9.6: both attempts fail — action discarded, no third attempt, no cras
     try testing.expectEqual(@as(u32, 2), attempt_count.load(.acquire));
 }
 
-test "AC-9.7: 100 actions dispatched — all 100 received by mock server" {
-    const mock = try MockServer.init(testing.allocator);
-    defer mock.deinit();
+// Sub-step 13a: the former AC-9.7 (100-call concurrency) and AC-9.8 (dispatch
+// order) tests are retired.  Queue-level concurrency and FIFO ordering are
+// covered by queue.zig's AC-4.x; wire-level dispatch is covered by AC-13.2/3.
 
-    var url_buf: [64]u8 = undefined;
+// ── Multipart boundary splitter (test-only helper) ───────────────────────────
 
-    // Use 4 dispatcher threads to exercise the shared queue concurrently.
-    var stop = std.atomic.Value(bool).init(false);
-    var queue = try queue_mod.Queue(types.Action).init(testing.allocator, 256);
-    defer queue.deinit(testing.allocator);
+/// Minimal boundary-split: given multipart body bytes and a boundary string,
+/// populate `parts` with slices of each part's raw content (headers + body).
+/// Returns the number of parts found (at most parts.len).
+fn splitMultipart(body: []const u8, boundary: []const u8, parts: [][]const u8) usize {
+    const delim = std.fmt.allocPrint(testing.allocator, "--{s}", .{boundary}) catch return 0;
+    defer testing.allocator.free(delim);
 
-    var threads: [4]std.Thread = undefined;
-    for (&threads, 0..) |*t, i| {
-        t.* = try std.Thread.spawn(.{}, dispatcherThread, .{DispatcherArgs{
-            .id = @intCast(i),
-            .queue = &queue,
-            .bot_token = "TOK",
-            .api_base = mock.baseUrl(&url_buf),
-            .allocator = testing.allocator,
-            .stop = &stop,
-        }});
+    var found: usize = 0;
+    var pos: usize = 0;
+    while (pos < body.len and found < parts.len) {
+        const start = std.mem.indexOf(u8, body[pos..], delim) orelse break;
+        const abs_start = pos + start;
+        const after_delim = abs_start + delim.len;
+        if (after_delim >= body.len) break;
+        if (body[after_delim] == '-') break; // closing --boundary--
+
+        // Skip the \r\n immediately after the delimiter line
+        const content_start = after_delim + 2;
+        const next = std.mem.indexOf(u8, body[content_start..], delim) orelse {
+            pos = after_delim;
+            continue;
+        };
+        // Trim trailing \r\n before the next delimiter
+        const part_end = content_start + next -| 2;
+        parts[found] = body[content_start..part_end];
+        found += 1;
+        pos = content_start + next;
     }
-    defer {
-        stop.store(true, .release);
-        for (threads) |t| t.join();
-    }
-
-    for (0..100) |i| {
-        try queue.push(.{ .send_message = .{
-            .chat_id = @intCast(i),
-            .text = try testing.allocator.dupe(u8, "bulk"),
-        } });
-    }
-
-    try testing.expect(mock.waitForN(100, 10_000));
-    try testing.expectEqual(@as(usize, 100), mock.received.len());
-
-    // Drain to free memory.
-    while (mock.received.popTimeout(0)) |req| {
-        var r = req;
-        r.deinit();
-    }
+    return found;
 }
 
-test "AC-9.8: actions from one on_message call dispatched in original order" {
-    // A single dispatcher thread preserves queue order within its own
-    // dequeue sequence.  We push N actions from one goroutine and verify
-    // they arrive in the same order.
-    const mock = try MockServer.init(testing.allocator);
+// AC-15.1 — multipart ApiCall reaches mock server with correct Content-Type and parts
+test "AC-15.1: multipart ApiCall sends multipart/form-data with file part" {
+    const alloc = testing.allocator;
+    const mock = try MockServer.init(alloc);
     defer mock.deinit();
 
     var url_buf: [64]u8 = undefined;
-    const d = try TestDispatcher.init(testing.allocator, "TOK", mock.baseUrl(&url_buf));
+    const d = try TestDispatcher.init(alloc, "test-tok", mock.baseUrl(&url_buf));
     defer d.deinit();
 
-    const N = 10;
-    for (0..N) |i| {
-        try d.queue.push(.{ .send_message = .{
-            .chat_id = @intCast(i),
-            .text = try testing.allocator.dupe(u8, "ordered"),
-        } });
-    }
+    var parts = try alloc.alloc(types.MultipartPart, 1);
+    parts[0] = .{
+        .name     = try alloc.dupe(u8, "photo"),
+        .content  = try alloc.dupe(u8, "\xff\xd8\xff"),
+        .filename = try alloc.dupe(u8, "img.jpg"),
+    };
+    try d.queue.push(.{
+        .method  = try alloc.dupe(u8, "sendPhoto"),
+        .payload = .{ .multipart = parts },
+    });
 
-    try testing.expect(mock.waitForN(N, 5000));
+    try testing.expect(mock.waitForN(1, 2000));
+    var req = mock.received.pop();
+    defer req.deinit();
 
-    for (0..N) |i| {
-        var req = mock.received.pop();
-        defer req.deinit();
-        // The body's chat_id must match the push order.
-        const expected_body = try std.fmt.allocPrint(
-            testing.allocator,
-            "{{\"chat_id\":{d},\"text\":\"ordered\"}}",
-            .{i},
-        );
-        defer testing.allocator.free(expected_body);
-        try testing.expectEqualStrings(expected_body, req.body);
+    try testing.expectEqualStrings("/bottest-tok/sendPhoto", req.path);
+    try testing.expect(std.mem.startsWith(u8, req.content_type,
+        "multipart/form-data; boundary="));
+
+    const boundary = req.content_type["multipart/form-data; boundary=".len..];
+    var raw_parts: [8][]const u8 = undefined;
+    const n = splitMultipart(req.body, boundary, &raw_parts);
+    try testing.expect(n >= 1);
+
+    var found_file = false;
+    for (raw_parts[0..n]) |part| {
+        if (std.mem.indexOf(u8, part, "img.jpg") != null) {
+            try testing.expect(std.mem.indexOf(u8, part, "\xff\xd8\xff") != null);
+            found_file = true;
+        }
     }
+    try testing.expect(found_file);
+}
+
+// AC-15.2 — string-only params → JSON (regression: no multipart regression)
+test "AC-15.2: json ApiCall still sends application/json" {
+    const alloc = testing.allocator;
+    const mock = try MockServer.init(alloc);
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const d = try TestDispatcher.init(alloc, "test-tok", mock.baseUrl(&url_buf));
+    defer d.deinit();
+
+    try d.queue.push(.{
+        .method  = try alloc.dupe(u8, "sendMessage"),
+        .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1,\"text\":\"hi\"}") },
+    });
+
+    try testing.expect(mock.waitForN(1, 2000));
+    var req = mock.received.pop();
+    defer req.deinit();
+
+    try testing.expectEqualStrings("application/json", req.content_type);
+    try testing.expectEqualStrings("{\"chat_id\":1,\"text\":\"hi\"}", req.body);
+}
+
+// AC-15.4 — mixed scalar + file → multipart with both parts on the wire
+test "AC-15.4: mixed multipart ApiCall contains both text and file parts" {
+    const alloc = testing.allocator;
+    const mock = try MockServer.init(alloc);
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const d = try TestDispatcher.init(alloc, "test-tok", mock.baseUrl(&url_buf));
+    defer d.deinit();
+
+    var parts = try alloc.alloc(types.MultipartPart, 2);
+    parts[0] = .{
+        .name     = try alloc.dupe(u8, "caption"),
+        .content  = try alloc.dupe(u8, "My caption"),
+        .filename = null,
+    };
+    parts[1] = .{
+        .name     = try alloc.dupe(u8, "photo"),
+        .content  = try alloc.dupe(u8, "\xff\xd8\xff"),
+        .filename = try alloc.dupe(u8, "pic.jpg"),
+    };
+    try d.queue.push(.{
+        .method  = try alloc.dupe(u8, "sendPhoto"),
+        .payload = .{ .multipart = parts },
+    });
+
+    try testing.expect(mock.waitForN(1, 2000));
+    var req = mock.received.pop();
+    defer req.deinit();
+
+    const boundary = req.content_type["multipart/form-data; boundary=".len..];
+    var raw_parts: [8][]const u8 = undefined;
+    const n = splitMultipart(req.body, boundary, &raw_parts);
+    try testing.expect(n >= 2);
+
+    var found_caption = false;
+    var found_file = false;
+    for (raw_parts[0..n]) |part| {
+        if (std.mem.indexOf(u8, part, "caption") != null and
+            std.mem.indexOf(u8, part, "My caption") != null)
+        {
+            found_caption = true;
+        }
+        if (std.mem.indexOf(u8, part, "pic.jpg") != null) {
+            found_file = true;
+        }
+    }
+    try testing.expect(found_caption);
+    try testing.expect(found_file);
+}
+
+// AC-24 — header injection: CRLF or quote in name/filename → error.InvalidHeaderValue
+test "AC-24: buildMultipartBody rejects CRLF in field name" {
+    const alloc = testing.allocator;
+    var parts = try alloc.alloc(types.MultipartPart, 1);
+    parts[0] = .{
+        .name     = try alloc.dupe(u8, "photo\r\nX-Injected: evil"),
+        .content  = try alloc.dupe(u8, "bytes"),
+        .filename = try alloc.dupe(u8, "img.jpg"),
+    };
+    const call = types.ApiCall{
+        .method  = try alloc.dupe(u8, "sendPhoto"),
+        .payload = .{ .multipart = parts },
+    };
+    defer types.freeApiCall(call, alloc);
+
+    const mock = try MockServer.init(alloc);
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const d = try TestDispatcher.init(alloc, "test-tok", mock.baseUrl(&url_buf));
+    defer d.deinit();
+
+    // The dispatcher logs + discards calls with invalid headers; it must not
+    // forward the malformed multipart body.
+    try d.queue.push(.{
+        .method  = try alloc.dupe(u8, "sendPhoto"),
+        .payload = .{ .multipart = blk: {
+            var ps = try alloc.alloc(types.MultipartPart, 1);
+            ps[0] = .{
+                .name     = try alloc.dupe(u8, "bad\r\nfield"),
+                .content  = try alloc.dupe(u8, "x"),
+                .filename = null,
+            };
+            break :blk ps;
+        }},
+    });
+
+    // No request should reach the mock within 200 ms.
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 0), mock.received.len());
+}
+
+test "AC-24: buildMultipartBody rejects CRLF in filename" {
+    const alloc = testing.allocator;
+    const mock = try MockServer.init(alloc);
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const d = try TestDispatcher.init(alloc, "test-tok", mock.baseUrl(&url_buf));
+    defer d.deinit();
+
+    try d.queue.push(.{
+        .method  = try alloc.dupe(u8, "sendPhoto"),
+        .payload = .{ .multipart = blk: {
+            var ps = try alloc.alloc(types.MultipartPart, 1);
+            ps[0] = .{
+                .name     = try alloc.dupe(u8, "photo"),
+                .content  = try alloc.dupe(u8, "\xff\xd8\xff"),
+                .filename = try alloc.dupe(u8, "img.jpg\r\nContent-Type: text/html"),
+            };
+            break :blk ps;
+        }},
+    });
+
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 0), mock.received.len());
 }
 
 // ── Live integration test ─────────────────────────────────────────────────────
 
-test "AC-9.live: send real Telegram message via dispatcher" {
+test "AC-13.live: send real Telegram message via dispatcher" {
     const token = std.posix.getenv("TELEGRAM_BOT_TOKEN") orelse return error.SkipZigTest;
     const chat_id_str = std.posix.getenv("TELEGRAM_CHAT_ID") orelse return error.SkipZigTest;
     const chat_id = try std.fmt.parseInt(i64, chat_id_str, 10);
@@ -816,11 +863,13 @@ test "AC-9.live: send real Telegram message via dispatcher" {
     const d = try TestDispatcher.init(testing.allocator, token, "https://api.telegram.org");
     defer d.deinit();
 
-    const msg = "zora dispatcher live — Phase 9 wired up. Actions reach Telegram.";
-    try d.queue.push(.{ .send_message = .{
-        .chat_id = chat_id,
-        .text = try testing.allocator.dupe(u8, msg),
-    } });
+    const body = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"chat_id\":{d},\"text\":\"zora dispatcher live — Phase 13a wired up.\"}}",
+        .{chat_id},
+    );
+    defer testing.allocator.free(body);
+    try pushCall(&d.queue, "sendMessage", body);
 
     // Give the dispatcher enough time to send and confirm.
     std.Thread.sleep(4 * std.time.ns_per_s);

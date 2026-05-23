@@ -4,14 +4,15 @@
 ///   - One accept thread (poll-based, honours stop flag with 10ms timeout)
 ///   - One detached thread per connection
 ///   - Validates method, path, and X-Telegram-Bot-Api-Secret-Token header
-///   - Parses body as JSON into types.Update, routes by hashUserId % len(queues)
+///   - Point-extracts user_id from the raw JSON body (no full parse —
+///     ADR-0001 §AD-2), routes by hashUserId % len(queues)
 ///   - Responds 200 OK immediately; the worker thread does the Lua processing
 ///
 /// Memory ownership:
-///   std.json.parseFromSlice allocates Update strings in an arena.  The full
-///   Parsed(Update) value (arena pointer + value) is pushed into the worker
-///   queue.  The worker calls parsed.deinit() after processing, which frees the
-///   arena and all strings it owns.
+///   The raw webhook body is duplicated into a heap-allocated WorkItem and
+///   pushed to a worker queue.  The worker frees WorkItem.body after
+///   callOnMessage returns.  No arena is leaked — this replaces the pre-ADR
+///   Parsed(Update) model where each enqueued Update leaked its arena.
 
 const std    = @import("std");
 const types  = @import("types.zig");
@@ -33,14 +34,14 @@ pub const ServerArgs = struct {
     webhook_secret: []const u8,
     /// Slice of worker input queues.  Server routes updates by
     /// hashUserId(user_id, queues.len).  Must remain valid for the Server lifetime.
-    queues:         []*q_mod.Queue(std.json.Parsed(types.Update)),
+    queues:         []*q_mod.Queue(types.WorkItem),
     allocator:      std.mem.Allocator,
 };
 
 pub const Server = struct {
     allocator:      std.mem.Allocator,
     webhook_secret: []const u8,
-    queues:         []*q_mod.Queue(std.json.Parsed(types.Update)),
+    queues:         []*q_mod.Queue(types.WorkItem),
     listener:       std.net.Server,
     stop:           std.atomic.Value(bool),
     thread:         std.Thread,
@@ -206,28 +207,144 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
         return;
     };
 
-    // ── JSON parse ───────────────────────────────────────────────────────────
-    // Parsed(Update) is pushed into the worker queue; the worker calls
-    // parsed.deinit() after processing, freeing the arena and all string data.
-    const parsed = std.json.parseFromSlice(types.Update, srv.allocator, body, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always, // force string copies into Parsed arena — body may be freed before worker runs
-    }) catch {
+    // ── Point-extract the routing user_id (no full parse — ADR-0001 §AD-2) ───
+    // A syntactically malformed body is rejected here; a well-formed body with
+    // no identifiable sender routes to worker 0 (user_id 0).
+    const user_id = extractUserId(la, body) catch {
         log.warn("rejected request: malformed JSON body", .{});
         try sendStatus(stream, "400 Bad Request");
         return;
     };
 
-    // ── Route to worker queue ─────────────────────────────────────────────────
-    const user_id = parsed.value.effectiveUserId() orelse parsed.value.update_id;
-    const idx     = worker.hashUserId(user_id, @intCast(srv.queues.len));
-    srv.queues[idx].push(parsed) catch {
+    // ── Forward the raw body verbatim to a worker ────────────────────────────
+    // The WorkItem owns its body; the worker frees it after callOnMessage.
+    const owned_body = srv.allocator.dupe(u8, body) catch {
+        log.warn("rejected request: out of memory copying body", .{});
+        try sendStatus(stream, "500 Internal Server Error");
+        return;
+    };
+    const item = types.WorkItem{ .body = owned_body, .user_id = user_id };
+    const idx  = worker.hashUserId(user_id orelse 0, @intCast(srv.queues.len));
+    srv.queues[idx].push(item) catch {
         log.warn("queue {d} full — update dropped", .{idx});
-        parsed.deinit();
+        srv.allocator.free(owned_body);
     };
 
     // ── Respond 200 immediately ───────────────────────────────────────────────
     try sendStatus(stream, "200 OK");
+}
+
+// ---------------------------------------------------------------------------
+// user_id extraction (ADR-0001 §AD-2)
+//
+// The worker-routing key is point-extracted from the raw webhook JSON with a
+// streaming scanner — never a full parse.  We navigate to `message.from.id`
+// (preferred) or `callback_query.from.id` and stop as soon as an id is found;
+// trailing bytes are not scanned.  Telegram lists `message` before
+// `callback_query` in the Update object, so first-match equals the old
+// `effectiveUserId` precedence.
+//
+// Returns error.InvalidJson when the body is not syntactically valid JSON up
+// to the point an id is found (a fully malformed body is always rejected).
+// A well-formed body with no `from.id` yields null.
+// ---------------------------------------------------------------------------
+
+const ExtractError = error{InvalidJson};
+
+fn extractUserId(allocator: std.mem.Allocator, body: []const u8) ExtractError!?i64 {
+    var scanner = std.json.Scanner.initCompleteInput(allocator, body);
+    defer scanner.deinit();
+
+    if ((scanner.next() catch return error.InvalidJson) != .object_begin)
+        return error.InvalidJson;
+
+    while (true) {
+        const tok = scanner.nextAlloc(allocator, .alloc_if_needed) catch return error.InvalidJson;
+        const key = switch (tok) {
+            .object_end => return null,
+            .string => |s| s,
+            .allocated_string => |s| s,
+            else => return error.InvalidJson, // an object key must be a string
+        };
+        const wanted = std.mem.eql(u8, key, "message") or
+            std.mem.eql(u8, key, "callback_query");
+        if (tok == .allocated_string) allocator.free(tok.allocated_string);
+
+        if (wanted) {
+            if (try scanFromId(allocator, &scanner)) |id| return id;
+        } else {
+            scanner.skipValue() catch return error.InvalidJson;
+        }
+    }
+}
+
+/// Scanner positioned just after a `message`/`callback_query` key.  When the
+/// value is an object holding `from.id`, returns that id (the scanner may be
+/// left mid-document — the caller stops).  Otherwise consumes the whole value
+/// cleanly and returns null.
+fn scanFromId(allocator: std.mem.Allocator, scanner: *std.json.Scanner) ExtractError!?i64 {
+    if ((scanner.peekNextTokenType() catch return error.InvalidJson) != .object_begin) {
+        scanner.skipValue() catch return error.InvalidJson;
+        return null;
+    }
+    _ = scanner.next() catch return error.InvalidJson; // consume object_begin
+
+    while (true) {
+        const tok = scanner.nextAlloc(allocator, .alloc_if_needed) catch return error.InvalidJson;
+        const key = switch (tok) {
+            .object_end => return null,
+            .string => |s| s,
+            .allocated_string => |s| s,
+            else => return error.InvalidJson,
+        };
+        const is_from = std.mem.eql(u8, key, "from");
+        if (tok == .allocated_string) allocator.free(tok.allocated_string);
+
+        if (is_from) {
+            if (try scanIdField(allocator, scanner)) |id| return id;
+            // `from` carried no usable id — keep consuming the enclosing object.
+        } else {
+            scanner.skipValue() catch return error.InvalidJson;
+        }
+    }
+}
+
+/// Scanner positioned just after a `from` key.  Returns an integer `id` value
+/// if present; otherwise consumes the value cleanly and returns null.
+fn scanIdField(allocator: std.mem.Allocator, scanner: *std.json.Scanner) ExtractError!?i64 {
+    if ((scanner.peekNextTokenType() catch return error.InvalidJson) != .object_begin) {
+        scanner.skipValue() catch return error.InvalidJson;
+        return null;
+    }
+    _ = scanner.next() catch return error.InvalidJson; // consume object_begin
+
+    while (true) {
+        const tok = scanner.nextAlloc(allocator, .alloc_if_needed) catch return error.InvalidJson;
+        const key = switch (tok) {
+            .object_end => return null,
+            .string => |s| s,
+            .allocated_string => |s| s,
+            else => return error.InvalidJson,
+        };
+        const is_id = std.mem.eql(u8, key, "id");
+        if (tok == .allocated_string) allocator.free(tok.allocated_string);
+
+        if (is_id and (scanner.peekNextTokenType() catch return error.InvalidJson) == .number) {
+            const num = scanner.nextAlloc(allocator, .alloc_if_needed) catch return error.InvalidJson;
+            const slice = switch (num) {
+                .number => |s| s,
+                .allocated_number => |s| s,
+                else => return error.InvalidJson, // peek guaranteed a number
+            };
+            const parsed = std.fmt.parseInt(i64, slice, 10) catch null;
+            if (num == .allocated_number) allocator.free(num.allocated_number);
+            // A good integer id wins immediately (early exit).  A non-integer
+            // id (float / overflow) falls through: keep consuming the object.
+            if (parsed) |id| return id;
+        } else {
+            scanner.skipValue() catch return error.InvalidJson;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -249,13 +366,14 @@ const VALID_UPDATE =
 // ---------------------------------------------------------------------------
 
 /// Heap-allocated test fixture: N worker queues + a running Server.
-/// Queues use std.testing.allocator; server internal operations use
-/// std.heap.page_allocator (prototype memory; Update strings are not freed).
+/// Everything — queue buffers and server internals — uses std.testing.allocator.
+/// WorkItem ownership is clean (no leaked arenas), so the leak detector runs
+/// over the whole server path; deinit drains any unconsumed WorkItem bodies.
 const TestSetup = struct {
     const MAX_Q = 8;
 
-    q_store: [MAX_Q]Queue(types.Update),
-    q_ptrs:  [MAX_Q]*Queue(types.Update),
+    q_store: [MAX_Q]Queue(types.WorkItem),
+    q_ptrs:  [MAX_Q]*Queue(types.WorkItem),
     q_count: usize,
     srv:     *Server,
 
@@ -265,7 +383,7 @@ const TestSetup = struct {
         errdefer testing.allocator.destroy(self);
         self.q_count = n;
         for (0..n) |i| {
-            self.q_store[i] = try Queue(types.Update).init(testing.allocator, 512);
+            self.q_store[i] = try Queue(types.WorkItem).init(testing.allocator, 512);
             self.q_ptrs[i]  = &self.q_store[i];
         }
         const bind_addr = try std.net.Address.parseIp4("127.0.0.1", 0);
@@ -273,14 +391,18 @@ const TestSetup = struct {
             .listen_addr    = bind_addr,
             .webhook_secret = secret,
             .queues         = self.q_ptrs[0..n],
-            .allocator      = std.heap.page_allocator,
+            .allocator      = testing.allocator,
         });
         return self;
     }
 
     fn deinit(self: *TestSetup) void {
         self.srv.deinit();
-        for (0..self.q_count) |i| self.q_store[i].deinit(testing.allocator);
+        for (0..self.q_count) |i| {
+            // Free WorkItem bodies enqueued but never consumed (no worker here).
+            while (self.q_store[i].popTimeout(0)) |item| testing.allocator.free(item.body);
+            self.q_store[i].deinit(testing.allocator);
+        }
         testing.allocator.destroy(self);
     }
 
@@ -499,4 +621,108 @@ test "AC-10.10: body > 1 MB → 413, server does not allocate unbounded memory" 
     const status = try httpOversizeBody(ts.serverAddr(), TEST_SECRET);
     try testing.expect(status == 413 or status == 400);
     try testing.expectEqual(@as(usize, 0), ts.queueLen(0));
+}
+
+// ---------------------------------------------------------------------------
+// Sub-step 13b — raw body forwarding + point-extracted user_id (ADR-0001 §AD-2)
+//
+// AC-13.8 (oversize / malformed-JSON rejection) is regression-protected by the
+// existing AC-10.6 and AC-10.10 above — no separate test.
+// ---------------------------------------------------------------------------
+
+test "AC-13.5: server forwards the raw webhook body verbatim to the worker" {
+    const ts = try TestSetup.init(1, TEST_SECRET);
+    defer ts.deinit();
+
+    const status = try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, VALID_UPDATE);
+    try testing.expectEqual(@as(u16, 200), status);
+    try testing.expectEqual(@as(usize, 1), ts.queueLen(0));
+
+    const item = ts.q_store[0].pop();
+    defer testing.allocator.free(item.body);
+    // The body the worker sees is byte-identical to what the client posted.
+    try testing.expectEqualStrings(VALID_UPDATE, item.body);
+    try testing.expectEqual(@as(?i64, 100), item.user_id);
+}
+
+test "AC-13.6: extractUserId — message / callback_query / edge cases" {
+    const A = testing.allocator;
+
+    // message.from.id
+    try testing.expectEqual(@as(?i64, 100), try extractUserId(A, VALID_UPDATE));
+    // callback_query.from.id, no message
+    try testing.expectEqual(@as(?i64, 55), try extractUserId(A,
+        \\{"update_id":2,"callback_query":{"id":"c","from":{"id":55,"is_bot":false,"first_name":"X"}}}
+    ));
+    // both present → message wins (message precedes callback_query)
+    try testing.expectEqual(@as(?i64, 7), try extractUserId(A,
+        \\{"message":{"from":{"id":7}},"callback_query":{"from":{"id":9}}}
+    ));
+    // channel post: message present, no `from`
+    try testing.expectEqual(@as(?i64, null), try extractUserId(A,
+        \\{"update_id":3,"message":{"message_id":1,"chat":{"id":-100,"type":"channel"}}}
+    ));
+    // no message, no callback_query
+    try testing.expectEqual(@as(?i64, null), try extractUserId(A, "{\"update_id\":4}"));
+    // empty object
+    try testing.expectEqual(@as(?i64, null), try extractUserId(A, "{}"));
+    // message present, `from` without `id`
+    try testing.expectEqual(@as(?i64, null), try extractUserId(A,
+        \\{"message":{"from":{"first_name":"NoId"}}}
+    ));
+    // message is JSON null
+    try testing.expectEqual(@as(?i64, null), try extractUserId(A, "{\"message\":null}"));
+    // negative id
+    try testing.expectEqual(@as(?i64, -42), try extractUserId(A,
+        \\{"message":{"from":{"id":-42}}}
+    ));
+    // id is a string, not an integer → no routing id
+    try testing.expectEqual(@as(?i64, null), try extractUserId(A,
+        \\{"message":{"from":{"id":"123"}}}
+    ));
+    // unrelated keys + nested objects before message are skipped
+    try testing.expectEqual(@as(?i64, 88), try extractUserId(A,
+        \\{"update_id":9,"x":{"y":{"z":1}},"message":{"chat":{"id":5},"from":{"id":88}}}
+    ));
+    // fully malformed JSON → error
+    try testing.expectError(error.InvalidJson, extractUserId(A, "{not json}"));
+    // empty body → error
+    try testing.expectError(error.InvalidJson, extractUserId(A, ""));
+    // top-level array (not an object) → error
+    try testing.expectError(error.InvalidJson, extractUserId(A, "[1,2,3]"));
+}
+
+test "AC-13.7: extractUserId early-exits once the routing id is found" {
+    // The id is reachable; the bytes after it are invalid JSON.  A full scan
+    // would raise error.InvalidJson — returning the id proves the scan stopped
+    // as soon as `message.from.id` was captured.
+    const body = "{\"message\":{\"from\":{\"id\":777,\"junk\":NOTVALID}}}";
+    try testing.expectEqual(@as(?i64, 777), try extractUserId(testing.allocator, body));
+}
+
+test "AC-13.9: server→worker WorkItem handoff leaks nothing under testing.allocator" {
+    // The server allocates one WorkItem.body per accepted update.  Draining the
+    // queues exactly as a worker does (take item, free body) must leave the
+    // testing.allocator balanced — proving the server↔worker ownership contract
+    // and that the pre-ADR Parsed(Update) arena leak is gone.
+    const ts = try TestSetup.init(2, TEST_SECRET);
+    defer ts.deinit();
+
+    for (0..20) |i| {
+        var buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf,
+            \\{{"update_id":{d},"message":{{"from":{{"id":{d}}}}}}}
+        , .{ i + 1, i + 1 });
+        try testing.expectEqual(@as(u16, 200),
+            try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, body));
+    }
+
+    var drained: usize = 0;
+    for (0..ts.q_count) |qi| {
+        while (ts.q_store[qi].popTimeout(0)) |item| {
+            testing.allocator.free(item.body);
+            drained += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 20), drained);
 }

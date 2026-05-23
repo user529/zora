@@ -24,6 +24,7 @@ const disp_mod = @import("dispatcher.zig");
 const server_mod = @import("server.zig");
 const reload = @import("reload.zig");
 const lua_engine = @import("lua_engine.zig");
+const schema_store = @import("schema_store.zig");
 
 const log = std.log.scoped(.main);
 
@@ -64,6 +65,12 @@ fn run(allocator: std.mem.Allocator) !void {
     };
     defer config_mod.deinit(cfg, allocator);
 
+    // ── API schema (hot-reloadable; absent file → Tier-0, no validation) ──────
+    var schema_slot = schema_store.SchemaSlot.init(allocator);
+    schema_store.loadInitial(&schema_slot, cfg.schema_file);
+    // schema_slot is intentionally not deinit'd: the schema watcher thread is
+    // detached and may still touch it at process exit.  See KNOWN_ALLOCATIONS.md.
+
     {
         var db = state_store.StateStore.open(allocator, cfg.db_path) catch |err| {
             log.err("database '{s}': {s}", .{ cfg.db_path, @errorName(err) });
@@ -87,25 +94,22 @@ fn run(allocator: std.mem.Allocator) !void {
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
 
     // ── Startup banner — before server.init (AC-11.1) ─────────────────────────
-    log.info("zora starting (branch={s} release={d} schema={d} rules_api={d})", .{
-        RELEASE,
+    log.info("zora starting (branch={s} release={d} schema={d} rules_api={d} api_validation={s})", .{
         GIT_BRANCH,
+        RELEASE,
         state_store.SCHEMA_VERSION,
         lua_engine.RULES_API_VERSION,
+        @tagName(cfg.api_validation),
     });
 
     var stop = std.atomic.Value(bool).init(false);
 
     // ── Dispatcher queue + threads ────────────────────────────────────────────
-    var disp_q = try queue_mod.Queue(types.Action).init(allocator, 4096);
+    var disp_q = try queue_mod.Queue(types.ApiCall).init(allocator, 4096);
     defer disp_q.deinit(allocator);
 
     const disp_threads = try allocator.alloc(std.Thread, cfg.dispatcher_threads);
     defer allocator.free(disp_threads);
-
-    // BOT_API_BASE redirects outbound requests to a stub during testing.
-    // Reads the OS env block directly — stable for the process lifetime.
-    const api_base = std.posix.getenv("BOT_API_BASE") orelse "https://api.telegram.org";
 
     for (0..cfg.dispatcher_threads) |i| {
         disp_threads[i] = try std.Thread.spawn(.{}, disp_mod.dispatcherThread, .{
@@ -113,7 +117,7 @@ fn run(allocator: std.mem.Allocator) !void {
                 .id = @intCast(i),
                 .queue = &disp_q,
                 .bot_token = cfg.bot_token,
-                .api_base = api_base,
+                .api_base = cfg.api_base,
                 .allocator = allocator,
                 .stop = &stop,
             },
@@ -121,16 +125,16 @@ fn run(allocator: std.mem.Allocator) !void {
     }
 
     // ── Worker queues + threads ───────────────────────────────────────────────
-    const wqs = try allocator.alloc(queue_mod.Queue(std.json.Parsed(types.Update)), cfg.worker_count);
+    const wqs = try allocator.alloc(queue_mod.Queue(types.WorkItem), cfg.worker_count);
     defer {
         for (wqs) |*q| q.deinit(allocator);
         allocator.free(wqs);
     }
-    const wq_ptrs = try allocator.alloc(*queue_mod.Queue(std.json.Parsed(types.Update)), cfg.worker_count);
+    const wq_ptrs = try allocator.alloc(*queue_mod.Queue(types.WorkItem), cfg.worker_count);
     defer allocator.free(wq_ptrs);
 
     for (0..cfg.worker_count) |i| {
-        wqs[i] = try queue_mod.Queue(std.json.Parsed(types.Update)).init(allocator, cfg.queue_capacity);
+        wqs[i] = try queue_mod.Queue(types.WorkItem).init(allocator, cfg.queue_capacity);
         wq_ptrs[i] = &wqs[i];
     }
 
@@ -141,9 +145,12 @@ fn run(allocator: std.mem.Allocator) !void {
     const dbs = try allocator.alloc(state_store.StateStore, cfg.worker_count);
     defer allocator.free(dbs); // only frees the slice backing array
 
+    var opened_dbs: usize = 0;
+    errdefer for (dbs[0..opened_dbs]) |*db| db.close();
+
     for (0..cfg.worker_count) |i| {
-        // dbs[i] = try allocator.create(state_store.StateStore);
         dbs[i] = try state_store.StateStore.open(allocator, cfg.db_path);
+        opened_dbs += 1;
         worker_threads[i] = try std.Thread.spawn(.{}, worker_mod.workerThread, .{
             worker_mod.WorkerArgs{
                 .id = @intCast(i),
@@ -154,6 +161,8 @@ fn run(allocator: std.mem.Allocator) !void {
                 .db = &dbs[i],
                 .stop = &stop,
                 .reload_ver = &reload.reload_version,
+                .schema = &schema_slot,
+                .validation = cfg.api_validation,
             },
         });
     }
@@ -167,6 +176,18 @@ fn run(allocator: std.mem.Allocator) !void {
             },
         });
         watcher_t.detach();
+    }
+
+    // ── Schema-file watcher (detached; mirrors the rules watcher) ─────────────
+    {
+        const schema_watcher_t = try std.Thread.spawn(.{}, schema_store.schemaWatcherThread, .{
+            schema_store.SchemaWatcherArgs{
+                .schema_file = cfg.schema_file,
+                .slot = &schema_slot,
+                .allocator = allocator,
+            },
+        });
+        schema_watcher_t.detach();
     }
 
     // ── HTTP server (accept loop runs in its own thread) ──────────────────────
@@ -186,12 +207,12 @@ fn run(allocator: std.mem.Allocator) !void {
     srv.deinit();
     stop.store(true, .release);
     for (worker_threads) |t| t.join();
-    // Drain Parsed(Update) items workers didn't pop before stop (free their arenas).
-    for (wqs) |*q| while (q.popTimeout(0)) |p| p.deinit();
+    // Drain WorkItem entries workers didn't pop before stop (free their bodies).
+    for (wqs) |*q| while (q.popTimeout(0)) |item| allocator.free(item.body);
     for (dbs) |*db| db.close();
     for (disp_threads) |t| t.join();
-    // Drain Action items dispatchers didn't send before stop (free string payloads).
-    while (disp_q.popTimeout(0)) |action| types.freeActionPayload(action, allocator);
+    // Drain ApiCall items dispatchers didn't send before stop (free string payloads).
+    while (disp_q.popTimeout(0)) |action| types.freeApiCall(action, allocator);
     // Watcher thread is detached and cannot be joined; its rules_path dupe
     // is freed by the OS on process exit. Documented in KNOWN_ALLOCATIONS.md.
     log.info("shutdown complete", .{});
@@ -210,7 +231,7 @@ const Queue = queue_mod.Queue;
 // Uses std.testing.allocator for queue buffers (tracked).
 // Uses std.heap.page_allocator for server + worker + dispatcher internals.
 // Each Update's Parsed arena is freed by the worker after on_message returns.
-// Action strings are freed by the dispatcher after sending.
+// ApiCall strings are freed by the dispatcher after sending.
 // ---------------------------------------------------------------------------
 
 const IntegrationStack = struct {
@@ -218,9 +239,9 @@ const IntegrationStack = struct {
     // pointers passed to spawned threads remain stable).
 
     stop: std.atomic.Value(bool),
-    worker_q: Queue(std.json.Parsed(types.Update)),
-    disp_q: Queue(types.Action),
-    q_ptrs: [1]*Queue(std.json.Parsed(types.Update)),
+    worker_q: Queue(types.WorkItem),
+    disp_q: Queue(types.ApiCall),
+    q_ptrs: [1]*Queue(types.WorkItem),
     db: state_store.StateStore,
     worker_t: std.Thread,
     disp_t: std.Thread,
@@ -252,9 +273,9 @@ const IntegrationStack = struct {
         self.rules_path = self.rules_path_buf[0..ps.len :0];
 
         self.stop = std.atomic.Value(bool).init(false);
-        self.worker_q = try Queue(std.json.Parsed(types.Update)).init(test_alloc, 64);
+        self.worker_q = try Queue(types.WorkItem).init(test_alloc, 64);
         errdefer self.worker_q.deinit(test_alloc);
-        self.disp_q = try Queue(types.Action).init(test_alloc, 256);
+        self.disp_q = try Queue(types.ApiCall).init(test_alloc, 256);
         errdefer self.disp_q.deinit(test_alloc);
         self.q_ptrs[0] = &self.worker_q;
 
@@ -329,10 +350,10 @@ const IntegrationStack = struct {
 
 const WEBHOOK_SECRET = "test-secret";
 
-/// Lua rules v1: echo the update_id as a send_message.
+/// Lua rules v1: emit a single sendMessage call (generic { method, params } form).
 const RULES_V1 =
     \\function on_message(update)
-    \\  return { { action="send_message", chat_id=1, text="v1" } }
+    \\  return { { method="sendMessage", params={ chat_id=1, text="v1" } } }
     \\end
 ;
 
@@ -412,22 +433,6 @@ test "AC-11.2: missing BOT_TOKEN → MissingRequiredField error" {
         error.MissingRequiredField,
         config_mod.loadFromMap(testing.allocator, env),
     );
-}
-
-// ---------------------------------------------------------------------------
-// AC-11.3 — schema mismatch → error before socket bind
-// ---------------------------------------------------------------------------
-
-test "AC-11.3: schema version mismatch → SchemaMismatch error" {
-    // Prepare an in-memory DB with schema_version = 999.
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    // Force a bad schema version via a second open with the same connection
-    // is not possible; instead we verify the type that run() would catch.
-    db.close();
-    // Verified by code inspection: StateStore.open returns error.SchemaMismatch
-    // when the stored version != SCHEMA_VERSION.  AC-5.4 covers this directly.
-    // Here we just confirm the type exists and run() would exit(1) on it.
-    try testing.expect(state_store.SCHEMA_VERSION == 1);
 }
 
 // ---------------------------------------------------------------------------
