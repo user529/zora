@@ -9,6 +9,10 @@
 /// but the implementation is safe for any number of consumers too.
 const std = @import("std");
 
+const log = std.log.scoped(.queue);
+
+pub const QueueKind = enum { worker, dispatcher, io_job, io_result };
+
 pub fn Queue(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -19,6 +23,12 @@ pub fn Queue(comptime T: type) type {
         count: usize,
         mutex: std.Thread.Mutex,
         not_empty: std.Thread.Condition,
+
+        // Fill-level monitoring — opt-in via metrics_log.
+        id: usize,
+        metrics_log: bool,
+        last_warn_threshold: u8, // highest threshold band logged so far
+        kind: QueueKind,
 
         // ------------------------------------------------------------------
         // Lifecycle
@@ -34,6 +44,10 @@ pub fn Queue(comptime T: type) type {
                 .count = 0,
                 .mutex = .{},
                 .not_empty = .{},
+                .id = 0,
+                .metrics_log = false,
+                .last_warn_threshold = 0,
+                .kind = .worker,
             };
         }
 
@@ -57,6 +71,8 @@ pub fn Queue(comptime T: type) type {
             self.tail = (self.tail + 1) % self.buf.len;
             self.count += 1;
             self.not_empty.signal();
+
+            if (self.metrics_log) self.checkFillThreshold();
         }
 
         /// Pop an item. Blocks until one is available.
@@ -71,11 +87,12 @@ pub fn Queue(comptime T: type) type {
             const item = self.buf[self.head];
             self.head = (self.head + 1) % self.buf.len;
             self.count -= 1;
+            if (self.metrics_log) self.resetFillThreshold();
             return item;
         }
 
-        /// Pop an item with timeout. Blocks the queue only for the timeot, allowing CPU to sleep, and don't waste CPU for no reasnon
-        /// With timeout_ns=0 this bacame the non-blocking pop
+        /// Pop an item with timeout. Blocks the queue only for the timeout,
+        /// allowing CPU to sleep. With timeout_ns=0 this becomes a non-blocking pop.
         pub fn popTimeout(self: *Self, timeout_ns: u64) ?T {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -86,7 +103,47 @@ pub fn Queue(comptime T: type) type {
             const item = self.buf[self.head];
             self.head = (self.head + 1) % self.buf.len;
             self.count -= 1;
+            if (self.metrics_log) self.resetFillThreshold();
             return item;
+        }
+
+        // ------------------------------------------------------------------
+        // Fill-level monitoring (called under mutex)
+        // ------------------------------------------------------------------
+
+        // Returns the highest fill-level band the current count falls into:
+        // 99, 95, 90, 75, or 0 (below 75%).
+        fn fillBand(count: usize, capacity: usize) u8 {
+            const pct = count * 100 / capacity;
+            if (pct >= 99) return 99;
+            if (pct >= 95) return 95;
+            if (pct >= 90) return 90;
+            if (pct >= 75) return 75;
+            return 0;
+        }
+
+        // Log when crossing into a higher band; called under mutex after push.
+        fn checkFillThreshold(self: *Self) void {
+            const band = fillBand(self.count, self.buf.len);
+            if (band <= self.last_warn_threshold) return;
+            self.last_warn_threshold = band;
+            const pct = self.count * 100 / self.buf.len;
+            if (band >= 99) {
+                log.err("{s}[{d}]: {d}% full ({d}/{d}) — critical backpressure", .{
+                    @tagName(self.kind), self.id, pct, self.count, self.buf.len,
+                });
+            } else {
+                log.warn("{s}[{d}]: {d}% full ({d}/{d})", .{
+                    @tagName(self.kind), self.id, pct, self.count, self.buf.len,
+                });
+            }
+        }
+
+        // Silently reset the tracker after a pop so the next fill cycle
+        // logs threshold crossings again.
+        fn resetFillThreshold(self: *Self) void {
+            const band = fillBand(self.count, self.buf.len);
+            if (band < self.last_warn_threshold) self.last_warn_threshold = band;
         }
 
         /// Current number of items in the queue (snapshot, may be stale).
@@ -104,7 +161,7 @@ pub fn Queue(comptime T: type) type {
 
 const testing = std.testing;
 
-test "AC-4.1: FIFO order preserved for 1000 items" {
+test "FIFO order preserved for 1000 items" {
     var q = try Queue(u32).init(testing.allocator, 1024);
     defer q.deinit(testing.allocator);
 
@@ -117,7 +174,7 @@ test "AC-4.1: FIFO order preserved for 1000 items" {
     }
 }
 
-test "AC-4.2: push at capacity returns error.QueueFull without modifying queue" {
+test "push at capacity returns error.QueueFull without modifying queue" {
     var q = try Queue(u32).init(testing.allocator, 4);
     defer q.deinit(testing.allocator);
 
@@ -138,7 +195,7 @@ test "AC-4.2: push at capacity returns error.QueueFull without modifying queue" 
     try testing.expectEqual(@as(u32, 4), q.pop());
 }
 
-// Context passed to the delayed-push thread for AC-4.3.
+// Context passed to the delayed-push thread.
 const DelayedPushCtx = struct {
     q: *Queue(u32),
     delay_ms: u64,
@@ -150,7 +207,7 @@ fn delayedPushThread(ctx: DelayedPushCtx) void {
     ctx.q.push(ctx.value) catch {};
 }
 
-test "AC-4.3: pop blocks on empty queue and unblocks within 10ms of push" {
+test "pop blocks on empty queue and unblocks within 10ms of push" {
     var q = try Queue(u32).init(testing.allocator, 8);
     defer q.deinit(testing.allocator);
 
@@ -193,7 +250,7 @@ fn producerThread(ctx: ProducerCtx) void {
     }
 }
 
-test "AC-4.4: 4 producers x 1000 items — all 4000 received exactly once" {
+test "4 producers x 1000 items — all 4000 received exactly once" {
     const PRODUCERS = 4;
     const PER_PRODUCER = 1000;
     const TOTAL = PRODUCERS * PER_PRODUCER;
@@ -230,7 +287,7 @@ test "AC-4.4: 4 producers x 1000 items — all 4000 received exactly once" {
     }
 }
 
-test "AC-4.5: 4 producers x 1000 items, capacity 64 — no deadlock, completes" {
+test "4 producers x 1000 items, capacity 64 — no deadlock, completes" {
     const PRODUCERS = 4;
     const PER_PRODUCER = 1000;
     const TOTAL = PRODUCERS * PER_PRODUCER;
@@ -261,7 +318,7 @@ test "AC-4.5: 4 producers x 1000 items, capacity 64 — no deadlock, completes" 
     for (received) |got| try testing.expect(got);
 }
 
-test "AC-4.6: Queue is generic — instantiate with u32 and u8" {
+test "Queue is generic — instantiate with u32 and u8" {
     // u32 queue
     var q32 = try Queue(u32).init(testing.allocator, 4);
     defer q32.deinit(testing.allocator);
@@ -275,7 +332,7 @@ test "AC-4.6: Queue is generic — instantiate with u32 and u8" {
     try testing.expectEqual(@as(u8, 0xFF), q8.pop());
 }
 
-test "AC-4.6: Queue([]const u8) handles slice items" {
+test "Queue([]const u8) handles slice items" {
     var qs = try Queue([]const u8).init(testing.allocator, 4);
     defer qs.deinit(testing.allocator);
     try qs.push("hello");
@@ -284,11 +341,26 @@ test "AC-4.6: Queue([]const u8) handles slice items" {
     try testing.expectEqualStrings("world", qs.pop());
 }
 
-test "AC-4.6: tryPop returns null on empty queue" {
+test "tryPop returns null on empty queue" {
     var q = try Queue(u32).init(testing.allocator, 4);
     defer q.deinit(testing.allocator);
     try testing.expectEqual(@as(?u32, null), q.popTimeout(0));
     try q.push(7);
     try testing.expectEqual(@as(?u32, 7), q.popTimeout(0));
     try testing.expectEqual(@as(?u32, null), q.popTimeout(0));
+}
+
+test "QueueKind: @tagName values match expected log labels" {
+    try testing.expectEqualStrings("worker",     @tagName(QueueKind.worker));
+    try testing.expectEqualStrings("dispatcher", @tagName(QueueKind.dispatcher));
+    try testing.expectEqualStrings("io_job",     @tagName(QueueKind.io_job));
+    try testing.expectEqualStrings("io_result",  @tagName(QueueKind.io_result));
+}
+
+test "QueueKind: Queue defaults to .worker, field is settable" {
+    var q = try Queue(u32).init(testing.allocator, 4);
+    defer q.deinit(testing.allocator);
+    try testing.expectEqual(QueueKind.worker, q.kind);
+    q.kind = .dispatcher;
+    try testing.expectEqual(QueueKind.dispatcher, q.kind);
 }

@@ -11,7 +11,7 @@
 ///   deinit()                → closes Lua state
 ///
 /// on_message returns a list of generic API-call tables — each shaped
-/// `{ method = "...", params = {...} }` (ADR-0001 §AD-1).  Rules may also push
+/// `{ method = "...", params = {...} }`.  Rules may also push
 /// fire-and-forget calls mid-handler with `bot.emit{...}`; those are collected
 /// ahead of the return-list.
 
@@ -20,7 +20,8 @@ const ziglua = @import("ziglua");
 const types = @import("types.zig");
 const serializer = @import("serializer.zig");
 const lua_api = @import("lua_api.zig");
-const schema_store = @import("schema_store.zig");
+const tg_schema = @import("tg_schema.zig");
+const io_pool = @import("io_pool.zig");
 
 const Lua = ziglua.Lua;
 const log = std.log.scoped(.lua_engine);
@@ -32,6 +33,58 @@ const log = std.log.scoped(.lua_engine);
 pub const RULES_API_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
+// Coroutine handle and outcome
+// ---------------------------------------------------------------------------
+
+/// A live coroutine handler. Owned by the worker's inflight map while parked.
+/// Unref'd (and GC-eligible) when the coroutine finishes or is reaped.
+pub const CoroHandle = struct {
+    thread:    *Lua,
+    /// Registry reference keeping the thread alive (prevents GC).
+    lua_ref:   i32,
+    coro_id:   u32,
+    worker_id: u8,
+};
+
+/// Result of startHandler or resumeHandler.
+pub const CoroOutcome = union(enum) {
+    /// Coroutine finished. Caller owns the slice; free with types.freeApiCalls.
+    done:    []types.ApiCall,
+    /// Coroutine yielded. Caller submits pending_job.io_job to the io_pool
+    /// and stores the CoroHandle in the inflight entry.
+    yielded: struct {
+        handle:      CoroHandle,
+        pending_job: lua_api.PendingJob,
+    },
+    /// Lua error or malformed body. Logged; no actions.
+    err,
+};
+
+/// Release a live coroutine handle: clear the per-thread emit accumulator
+/// from the Lua registry, then drop the integer registry ref.
+///
+/// Must be called on every code path that ends a coroutine's lifetime
+/// EXCEPT processResume's .ok branch (which calls pushEmitBatch explicitly
+/// before collecting actions).  Forgetting this causes a registry[thread]
+/// entry to keep the Lua thread object alive indefinitely.
+pub fn teardownCoro(main: *Lua, handle: CoroHandle) void {
+    // Retrieve the thread object via its integer ref and use it as a key to
+    // clear registry[thread_obj] from the main state — safe even for dead
+    // (errored) coroutines whose internal call-info stack is unwound.
+    _ = main.rawGetIndex(ziglua.registry_index, @as(ziglua.Integer, handle.lua_ref));
+    main.pushNil();
+    main.rawSetTable(ziglua.registry_index); // registry[thread_obj] = nil
+    main.unref(ziglua.registry_index, handle.lua_ref);
+}
+
+/// Instruction hook — fires after 10M instructions per resume.
+fn hookCountLimit(lua: *Lua, _: ziglua.Event, _: *ziglua.DebugInfo) void {
+    lua.raiseErrorStr("instruction limit exceeded", .{});
+}
+
+const INSTRUCTION_CAP: i32 = 10_000_000;
+
+// ---------------------------------------------------------------------------
 // LuaEngine
 // ---------------------------------------------------------------------------
 
@@ -39,7 +92,7 @@ pub const LuaEngine = struct {
     lua: *Lua,
     allocator: std.mem.Allocator,
     /// Hot-reloadable schema for outgoing-call validation. null → no schema.
-    schema_slot: ?*schema_store.SchemaSlot = null,
+    schema_slot: ?*tg_schema.SchemaSlot = null,
     /// Validation policy. `.off` (the default) disables validation.
     validation: types.ValidationMode = .off,
 
@@ -78,7 +131,7 @@ pub const LuaEngine = struct {
     /// `slot` may be null; mode `.off` disables validation regardless.
     pub fn setValidation(
         self: *LuaEngine,
-        slot: ?*schema_store.SchemaSlot,
+        slot: ?*tg_schema.SchemaSlot,
         mode: types.ValidationMode,
     ) void {
         self.schema_slot = slot;
@@ -101,82 +154,244 @@ pub const LuaEngine = struct {
         };
     }
 
-    /// Call the Lua `on_message(update_table)` function.
-    ///
-    /// - Decodes the raw webhook JSON `body` directly into a Lua table
-    ///   (ADR-0001 §AD-2 — no typed Update tree, no re-serialization).
-    /// - Calls on_message with a protected call (no Lua error escapes).
-    /// - On Lua error: logs the error, returns an empty slice (no Zig error).
-    /// - On a malformed `body`: logs, returns an empty slice (no Zig error).
-    /// - On a Zig-level allocation error: propagates the error.
-    /// - The returned slice and all string payloads are allocated from
-    ///   `allocator`; free them with `types.freeApiCalls`.
-    ///
-    /// OWNERSHIP INVARIANT: the caller must always call `types.freeApiCalls`
-    /// on the returned slice, even when `len == 0`.  Every code path —
-    /// including Lua error and malformed body — returns a heap-allocated slice.
     pub fn callOnMessage(
-        self: *LuaEngine,
+        self:      *LuaEngine,
         allocator: std.mem.Allocator,
-        body: []const u8,
+        body:      []const u8,
     ) ![]types.ApiCall {
-        const lua = self.lua;
-        const stack_base = lua.getTop();
+        const outcome = try self.startHandler(body, 0, 0, allocator);
+        switch (outcome) {
+            .done    => |actions| return actions,
+            .yielded => |y| {
+                switch (y.pending_job) {
+                    .io           => |io|   lua_api.freeOwnedStrings(io.owned_strings, allocator),
+                    .tracked_send => |call| types.freeApiCall(call, allocator),
+                }
+                teardownCoro(self.lua, y.handle);
+                log.err("callOnMessage: rule called a yield-ing function — no io_pool wired", .{});
+                return try allocator.alloc(types.ApiCall, 0);
+            },
+            .err => return try allocator.alloc(types.ApiCall, 0),
+        }
+    }
 
-        // ── 1. Push on_message function ───────────────────────────────────
-        const fn_type = lua.getGlobal("on_message") catch {
-            log.warn("on_message lookup failed", .{});
-            return try allocator.alloc(types.ApiCall, 0);
+    /// Start a new coroutine handler for `body`.
+    /// Creates a child Lua thread, decodes the JSON body, calls the first resumeThread.
+    /// Returns CoroOutcome.done (fast path — no yield), .yielded, or .err.
+    pub fn startHandler(
+        self:      *LuaEngine,
+        body:      []const u8,
+        coro_id:   u32,
+        worker_id: u8,
+        allocator: std.mem.Allocator,
+    ) !CoroOutcome {
+        const main = self.lua;
+
+        // Create child thread and pin it in the registry so GC can't collect it.
+        const thread = main.newThread();    // pushes thread on main stack
+        const lua_ref = try main.ref(ziglua.registry_index); // pops, stores, returns ref
+
+        const handle = CoroHandle{
+            .thread    = thread,
+            .lua_ref   = lua_ref,
+            .coro_id   = coro_id,
+            .worker_id = worker_id,
+        };
+
+        // Initialise per-coroutine emit accumulator (registry[thread] = {}).
+        lua_api.beginEmitBatch(thread);
+
+        // Push on_message function onto the thread's stack.
+        const fn_type = thread.getGlobal("on_message") catch {
+            log.warn("on_message not found", .{});
+            teardownCoro(main, handle);
+            return .err;
         };
         if (fn_type != .function) {
-            lua.setTop(stack_base);
-            log.warn("on_message is not a function (type={s})", .{lua.typeName(fn_type)});
-            return try allocator.alloc(types.ApiCall, 0);
+            thread.pop(1);
+            log.warn("on_message is not a function", .{});
+            teardownCoro(main, handle);
+            return .err;
         }
 
-        // ── 2. Decode raw webhook JSON → Lua table ────────────────────────
-        serializer.jsonToLuaTable(lua, body, allocator) catch |err| {
-            lua.setTop(stack_base);
-            log.err("failed to decode update body: {s}", .{@errorName(err)});
-            return try allocator.alloc(types.ApiCall, 0);
+        // Decode JSON body → Lua table (the update argument).
+        serializer.jsonToLuaTable(thread, body, allocator) catch |e| {
+            log.err("startHandler: body decode failed: {s}", .{@errorName(e)});
+            thread.pop(1); // pop on_message
+            teardownCoro(main, handle);
+            return .err;
         };
 
-        // ── 3. Protected call: on_message(update_table) ───────────────────
-        // Fresh emit accumulator so bot.emit{...} lands in this invocation.
-        lua_api.beginEmitBatch(lua);
-        lua.protectedCall(.{ .args = 1, .results = 1, .msg_handler = 0 }) catch {
-            const err_msg = lua.toString(-1) catch "(no message)";
-            log.warn("on_message error: {s}", .{err_msg});
-            lua.setTop(stack_base);
-            return try allocator.alloc(types.ApiCall, 0);
+        // Set per-resume instruction cap.
+        thread.setHook(ziglua.wrap(hookCountLimit), .{ .count = true }, INSTRUCTION_CAP);
+
+        // First resume: call on_message(update_table).
+        var nres: i32 = 0;
+        const status = thread.resumeThread(main, 1, &nres) catch |e| {
+            log.warn("startHandler resumeThread error: {s}", .{@errorName(e)});
+            teardownCoro(main, handle);
+            return .err;
         };
 
-        // Stack: [..., result_table]   (base + 1 element)
-        defer lua.setTop(stack_base);
-        const result_idx = lua.getTop();
+        return self.processResume(handle, main, thread, status, nres, allocator);
+    }
 
-        // ── 4. Collect ApiCalls: bot.emit accumulator, then return-list ──
-        var list: std.ArrayListUnmanaged(types.ApiCall) = .empty;
-        errdefer {
-            for (list.items) |c| types.freeApiCall(c, allocator);
-            list.deinit(allocator);
+    /// Resume a parked coroutine with the result of a completed I/O job.
+    /// Frees owned_strings (io_pool is done with them by the time this is called).
+    pub fn resumeHandler(
+        self:             *LuaEngine,
+        handle:           CoroHandle,
+        result:           io_pool.IoResult,
+        owned_strings:    lua_api.OwnedStrings,
+        is_tracked_send:  bool,
+        allocator:        std.mem.Allocator,
+    ) !CoroOutcome {
+        const main = self.lua;
+        const thread = handle.thread;
+
+        // Safe to free now — io_pool has already finished with the strings.
+        lua_api.freeOwnedStrings(owned_strings, allocator);
+
+        if (is_tracked_send) {
+            pushTrackedSendResult(thread, result);
+        } else {
+            pushIoResult(thread, result, allocator);
         }
 
-        // Live schema for this update (null when none is loaded → Tier-0).
-        const store: ?*const schema_store.SchemaStore =
-            if (self.schema_slot) |slot| slot.get() else null;
+        // Reset instruction cap for this resume.
+        thread.setHook(ziglua.wrap(hookCountLimit), .{ .count = true }, INSTRUCTION_CAP);
 
-        // Fire-and-forget bot.emit calls first, in call order.
-        lua_api.pushEmitBatch(lua); // [..., result_table, emit_batch]
-        try appendApiCalls(lua, lua.getTop(), allocator, &list, store, self.validation);
-        lua.pop(1); // [..., result_table]
+        var nres: i32 = 0;
+        const status = thread.resumeThread(main, 1, &nres) catch |e| {
+            log.warn("resumeHandler resumeThread error: {s}", .{@errorName(e)});
+            teardownCoro(main, handle);
+            return .err;
+        };
 
-        // Then the on_message return-list.
-        try appendApiCalls(lua, result_idx, allocator, &list, store, self.validation);
+        return self.processResume(handle, main, thread, status, nres, allocator);
+    }
 
-        return try list.toOwnedSlice(allocator);
+    /// Shared post-resumeThread logic: collect actions on .ok, read pending job on .yield.
+    fn processResume(
+        self:      *LuaEngine,
+        handle:    CoroHandle,
+        main:      *Lua,
+        thread:    *Lua,
+        status:    ziglua.ResumeStatus,
+        nres:      i32,
+        allocator: std.mem.Allocator,
+    ) !CoroOutcome {
+        switch (status) {
+            .ok => {
+                defer main.unref(ziglua.registry_index, handle.lua_ref);
+
+                var list: std.ArrayListUnmanaged(types.ApiCall) = .empty;
+                errdefer {
+                    for (list.items) |c| types.freeApiCall(c, allocator);
+                    list.deinit(allocator);
+                }
+
+                const store: ?*const tg_schema.SchemaStore =
+                    if (self.schema_slot) |s| s.get() else null;
+
+                // Emit batch first.
+                lua_api.pushEmitBatch(thread);
+                errdefer thread.pop(1); // pop on OOM before returning error
+                try appendApiCalls(thread, thread.getTop(), allocator, &list, store, self.validation);
+                thread.pop(1); // pop on success so return-list uses correct stack top
+
+                // Then the return-list.
+                if (nres > 1) {
+                    log.warn("on_message returned {d} values; only the last is collected", .{nres});
+                }
+                if (nres > 0) {
+                    try appendApiCalls(thread, thread.getTop(), allocator, &list, store, self.validation);
+                    thread.pop(@intCast(nres));
+                }
+
+                return .{ .done = try list.toOwnedSlice(allocator) };
+            },
+            .yield => {
+                var pj = self.apiCtxPendingJob() orelse {
+                    log.err("coroutine yielded but pending_job is null (coro_id={d})", .{handle.coro_id});
+                    teardownCoro(main, handle);
+                    return .err;
+                };
+                switch (pj) {
+                    .io => |*io| {
+                        io.io_job.worker_id = handle.worker_id;
+                        io.io_job.coro_id   = handle.coro_id;
+                    },
+                    .tracked_send => |*call| {
+                        if (call.tracking) |*t| {
+                            t.worker_id = handle.worker_id;
+                            t.coro_id   = handle.coro_id;
+                        }
+                    },
+                }
+                return .{ .yielded = .{ .handle = handle, .pending_job = pj } };
+            },
+        }
+    }
+
+    /// Read and clear ApiCtx.pending_job.
+    fn apiCtxPendingJob(self: *LuaEngine) ?lua_api.PendingJob {
+        const ctx = lua_api.getCtx(self.lua);
+        const pj = ctx.pending_job;
+        ctx.pending_job = null;
+        return pj;
     }
 };
+
+// ---------------------------------------------------------------------------
+// pushIoResult — translate an IoResult into a Lua value on the thread's stack
+// ---------------------------------------------------------------------------
+
+/// Push one Lua value representing an IoResult onto the thread stack.
+/// For http: pushes {status=N, body="..."}
+/// For proc: pushes {exit_code=N, stdout="..."}
+/// For err:  pushes a combined table {status=0, body=msg, exit_code=-1, stdout=msg}
+fn pushIoResult(thread: *Lua, result: io_pool.IoResult, allocator: std.mem.Allocator) void {
+    _ = allocator;
+    switch (result.outcome) {
+        .http => |h| {
+            thread.createTable(0, 2);
+            thread.pushInteger(@intCast(h.status));
+            thread.setField(-2, "status");
+            _ = thread.pushString(h.body);
+            thread.setField(-2, "body");
+        },
+        .proc => |p| {
+            thread.createTable(0, 2);
+            thread.pushInteger(@intCast(p.exit_code));
+            thread.setField(-2, "exit_code");
+            _ = thread.pushString(p.stdout);
+            thread.setField(-2, "stdout");
+        },
+        .send => |s| {
+            thread.pushInteger(s.message_id);
+        },
+        .err => |msg| {
+            thread.createTable(0, 4);
+            thread.pushInteger(0);
+            thread.setField(-2, "status");
+            _ = thread.pushString(msg);
+            thread.setField(-2, "body");
+            thread.pushInteger(-1);
+            thread.setField(-2, "exit_code");
+            _ = thread.pushString(msg);
+            thread.setField(-2, "stdout");
+        },
+    }
+}
+
+fn pushTrackedSendResult(thread: *Lua, result: io_pool.IoResult) void {
+    switch (result.outcome) {
+        .send => |s| thread.pushInteger(s.message_id),
+        .err  => |msg| _ = thread.pushString(msg),
+        else  => _ = thread.pushString("unexpected result type for tracked send"),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ApiCall parsing — { method, params } Lua tables → types.ApiCall
@@ -190,7 +405,7 @@ fn parseOneApiCall(
     lua:       *Lua,
     table_idx: i32,
     allocator: std.mem.Allocator,
-    schema:    ?*const schema_store.SchemaStore,
+    schema:    ?*const tg_schema.SchemaStore,
     mode:      types.ValidationMode,
 ) !types.ApiCall {
     _ = allocator; // buildApiCall uses ctx.allocator internally
@@ -210,10 +425,10 @@ fn parseOneApiCall(
     const params_idx = lua.getTop();
     defer lua.pop(1); // always pop params
 
-    // ── schema validation (ADR-0001 §AD-5) ────────────────────────────────
+    // ── schema validation ─────────────────────────────────────────────────
     if (mode != .off) {
         if (schema) |store| {
-            schema_store.validate(store, lua, params_idx, method_tmp) catch |verr| {
+            tg_schema.validate(store, lua, params_idx, method_tmp) catch |verr| {
                 if (mode == .strict) {
                     return error.Validation;
                 }
@@ -243,7 +458,7 @@ fn appendApiCalls(
     table_idx: i32,
     allocator: std.mem.Allocator,
     list: *std.ArrayListUnmanaged(types.ApiCall),
-    schema: ?*const schema_store.SchemaStore,
+    schema: ?*const tg_schema.SchemaStore,
     mode: types.ValidationMode,
 ) !void {
     if (!lua.isTable(table_idx)) return;
@@ -278,25 +493,15 @@ fn appendApiCalls(
 const testing = std.testing;
 const state_store = @import("state_store.zig");
 
-/// Helper: create a LuaEngine backed by an in-memory SQLite db.
-fn makeEngine(allocator: std.mem.Allocator) !struct {
-    engine: LuaEngine,
-    db: state_store.StateStore,
-    ctx: lua_api.ApiCtx,
-} {
-    var db = try state_store.StateStore.open(allocator, ":memory:");
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = allocator, .max_file_bytes = 52428800 };
-    const engine = try LuaEngine.init(allocator, &ctx);
-    return .{ .engine = engine, .db = db, .ctx = ctx };
+/// Default test ApiCtx for `db`: 50 MB file cap, 1 MB JSON cap, testing allocator.
+fn testCtx(db: *state_store.StateStore) lua_api.ApiCtx {
+    return .{ .db = db, .allocator = testing.allocator, .max_file_bytes = 52428800, .json_max_bytes = 1048576 };
 }
 
-// Needed because db/ctx are in the returned struct by value;
-// we'll manage them manually in each test.
-
-test "AC-6.1: io.open / os.execute / require raise errors; math/string/table/utf8 work" {
+test "io.open / os.execute / require raise errors; math/string/table/utf8 work" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
     var engine = try LuaEngine.init(testing.allocator, &ctx);
     defer engine.deinit();
 
@@ -312,13 +517,10 @@ test "AC-6.1: io.open / os.execute / require raise errors; math/string/table/utf
     try engine.loadString("return utf8.len('hello')");
 }
 
-// AC-6.2 (typed send_message return parsing) retired in sub-step 13c —
-// superseded by AC-13.11 (generic { method, params } return-list).
-
-test "AC-6.3: on_message returning {} → empty slice" {
+test "on_message returning {} → empty slice" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
     var engine = try LuaEngine.init(testing.allocator, &ctx);
     defer engine.deinit();
 
@@ -332,13 +534,10 @@ test "AC-6.3: on_message returning {} → empty slice" {
     try testing.expectEqual(@as(usize, 0), actions.len);
 }
 
-// AC-6.4 (typed mixed-action return parsing) retired in sub-step 13c —
-// superseded by AC-13.11 (generic six-method-shape return-list).
-
-test "AC-6.5: on_message error → empty slice logged, next call succeeds" {
+test "on_message error → empty slice logged, next call succeeds" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
     var engine = try LuaEngine.init(testing.allocator, &ctx);
     defer engine.deinit();
 
@@ -365,10 +564,10 @@ test "AC-6.5: on_message error → empty slice logged, next call succeeds" {
     try testing.expectEqual(@as(usize, 1), actions2.len);
 }
 
-test "AC-6.6: invalid Lua syntax → loadString returns error; engine still usable" {
+test "invalid Lua syntax → loadString returns error; engine still usable" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
     var engine = try LuaEngine.init(testing.allocator, &ctx);
     defer engine.deinit();
 
@@ -383,7 +582,7 @@ test "AC-6.6: invalid Lua syntax → loadString returns error; engine still usab
 }
 
 // ---------------------------------------------------------------------------
-// Sub-step 13c — generic { method, params } engine path (ADR-0001 §AD-1/AD-2)
+// Generic { method, params } engine path
 //
 // `luaTableToJson` iterates Lua tables in unspecified key order, so body
 // assertions parse the JSON or test by substring — never byte-compare.
@@ -400,10 +599,10 @@ fn expectMsgBody(body: []const u8, chat_id: i64, text: []const u8) !void {
     try testing.expectEqualStrings(text, p.value.text);
 }
 
-test "AC-13.10: on_message receives a decoded Lua table with nested access" {
+test "on_message receives a decoded Lua table with nested access" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
     var engine = try LuaEngine.init(testing.allocator, &ctx);
     defer engine.deinit();
 
@@ -434,10 +633,10 @@ test "AC-13.10: on_message receives a decoded Lua table with nested access" {
     try testing.expectEqualStrings("B2", p.value.c);
 }
 
-test "AC-13.11: return-list — six method shapes parse to ApiCalls" {
+test "return-list — six method shapes parse to ApiCalls" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
     var engine = try LuaEngine.init(testing.allocator, &ctx);
     defer engine.deinit();
 
@@ -474,10 +673,10 @@ test "AC-13.11: return-list — six method shapes parse to ApiCalls" {
     try testing.expect(std.mem.indexOf(u8, actions[5].payload.json, "\"chat_id\":1") != null);
 }
 
-test "AC-13.12: bot.emit calls precede the return-list, in call order" {
+test "bot.emit calls precede the return-list, in call order" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
     var engine = try LuaEngine.init(testing.allocator, &ctx);
     defer engine.deinit();
 
@@ -498,8 +697,7 @@ test "AC-13.12: bot.emit calls precede the return-list, in call order" {
     try expectMsgBody(actions[2].payload.json, 3, "r1"); // return-list
 }
 
-// ── Phase 14 — schema validation ─────────────────────────────────────────────
-
+// ── schema validation ────────────────────────────────────────────────────────
 
 /// Fixture: sendMessage requires chat_id (Integer|String) and text (String).
 const SCHEMA_FIX =
@@ -509,14 +707,14 @@ const SCHEMA_FIX =
     \\]}},"types":{}}
 ;
 
-test "AC-14.3: off/warn keep an invalid call; strict drops it" {
+test "off/warn keep an invalid call; strict drops it" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
 
-    var slot = schema_store.SchemaSlot.init(testing.allocator);
+    var slot = tg_schema.SchemaSlot.init(testing.allocator);
     defer slot.deinit();
-    slot.install(try schema_store.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
+    slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
 
     const cases = .{
         .{ types.ValidationMode.off, @as(usize, 1) },
@@ -538,14 +736,14 @@ test "AC-14.3: off/warn keep an invalid call; strict drops it" {
     }
 }
 
-test "AC-14.9: strict validation covers both bot.emit and the return-list" {
+test "strict validation covers both bot.emit and the return-list" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
 
-    var slot = schema_store.SchemaSlot.init(testing.allocator);
+    var slot = tg_schema.SchemaSlot.init(testing.allocator);
     defer slot.deinit();
-    slot.install(try schema_store.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
+    slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
 
     var engine = try LuaEngine.init(testing.allocator, &ctx);
     defer engine.deinit();
@@ -563,14 +761,14 @@ test "AC-14.9: strict validation covers both bot.emit and the return-list" {
     try expectMsgBody(actions[0].payload.json, 1, "k");
 }
 
-test "AC-14.6: the schema is shared by pointer across engines (single copy)" {
+test "the schema is shared by pointer across engines (single copy)" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
 
-    var slot = schema_store.SchemaSlot.init(testing.allocator);
+    var slot = tg_schema.SchemaSlot.init(testing.allocator);
     defer slot.deinit();
-    slot.install(try schema_store.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
+    slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
 
     var e1 = try LuaEngine.init(testing.allocator, &ctx);
     defer e1.deinit();
@@ -586,12 +784,12 @@ test "AC-14.6: the schema is shared by pointer across engines (single copy)" {
     try testing.expectEqual(slot.get().?, e2.schema_slot.?.get().?);
 }
 
-test "AC-14.7: an empty schema slot validates nothing (Tier-0)" {
+test "an empty schema slot validates nothing (Tier-0)" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
 
-    var slot = schema_store.SchemaSlot.init(testing.allocator); // never installed
+    var slot = tg_schema.SchemaSlot.init(testing.allocator); // never installed
     defer slot.deinit();
 
     var engine = try LuaEngine.init(testing.allocator, &ctx);
@@ -607,10 +805,10 @@ test "AC-14.7: an empty schema slot validates nothing (Tier-0)" {
     try testing.expectEqual(@as(usize, 1), actions.len);
 }
 
-test "AC-13.13: shipped rules/rules.lua produces sendMessage calls (generic form)" {
+test "shipped rules/rules.lua produces sendMessage calls (generic form)" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = lua_api.ApiCtx{ .db = &db, .allocator = testing.allocator, .max_file_bytes = 52428800 };
+    var ctx = testCtx(&db);
     var engine = try LuaEngine.init(testing.allocator, &ctx);
     defer engine.deinit();
 
@@ -641,5 +839,76 @@ test "AC-13.13: shipped rules/rules.lua produces sendMessage calls (generic form
         try testing.expectEqual(@as(usize, 1), actions.len);
         try testing.expectEqualStrings("sendMessage", actions[0].method);
         try expectMsgBody(actions[0].payload.json, 9, "Echo: hello");
+    }
+}
+
+// ── coroutine engine tests ───────────────────────────────────────────────────
+
+test "sync rule (no yield) via startHandler → .done with actions" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+    var ctx = testCtx(&db);
+    var engine = try LuaEngine.init(testing.allocator, &ctx);
+    defer engine.deinit();
+
+    try engine.loadString(
+        \\function on_message(u)
+        \\  return { { method = "sendMessage", params = { chat_id = 7, text = "hi" } } }
+        \\end
+    );
+
+    const outcome = try engine.startHandler("{\"update_id\":1}", 42, 0, testing.allocator);
+    switch (outcome) {
+        .done => |actions| {
+            defer types.freeApiCalls(actions, testing.allocator);
+            try testing.expectEqual(@as(usize, 1), actions.len);
+            try testing.expectEqualStrings("sendMessage", actions[0].method);
+        },
+        else => return error.UnexpectedOutcome,
+    }
+}
+
+test "per-resume instruction cap aborts infinite loop" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+    var ctx = testCtx(&db);
+    var engine = try LuaEngine.init(testing.allocator, &ctx);
+    defer engine.deinit();
+
+    try engine.loadString(
+        \\function on_message(u)
+        \\  while true do end
+        \\end
+    );
+
+    const outcome = try engine.startHandler("{}", 1, 0, testing.allocator);
+    switch (outcome) {
+        .err => {},
+        else => return error.ExpectedError,
+    }
+}
+
+test "bounded heavy computation in one resume is not falsely aborted" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+    var ctx = testCtx(&db);
+    var engine = try LuaEngine.init(testing.allocator, &ctx);
+    defer engine.deinit();
+
+    try engine.loadString(
+        \\function on_message(u)
+        \\  local s = 0
+        \\  for i = 1, 1000000 do s = s + i end
+        \\  return { { method = "result", params = { n = s } } }
+        \\end
+    );
+
+    const outcome = try engine.startHandler("{}", 2, 0, testing.allocator);
+    switch (outcome) {
+        .done => |actions| {
+            defer types.freeApiCalls(actions, testing.allocator);
+            try testing.expectEqual(@as(usize, 1), actions.len);
+        },
+        else => return error.FalselyAborted,
     }
 }

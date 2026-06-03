@@ -15,6 +15,35 @@ pub const SCHEMA_VERSION: u32 = 1;
 const PRAGMA_SQL: [:0]const u8 = @embedFile("pragma.sql");
 const SCHEMA_SQL: [:0]const u8 = @embedFile("schema.sql");
 
+/// The six hot-path CRUD statements, in cache slot order
+/// (get_user, set_user, get_chat, set_chat, get_global, set_global).
+const CACHED_SQL = [6][:0]const u8{
+    "SELECT data FROM user_state WHERE user_id = ?",
+    "INSERT OR REPLACE INTO user_state (user_id, data) VALUES (?, ?)",
+    "SELECT data FROM chat_state WHERE chat_id = ?",
+    "INSERT OR REPLACE INTO chat_state (chat_id, data) VALUES (?, ?)",
+    "SELECT value FROM global_state WHERE key = ?",
+    "INSERT OR REPLACE INTO global_state (key, value) VALUES (?, ?)",
+};
+
+/// Prepare all six cached statements into an array. On any prepare failure,
+/// finalize the already-prepared prefix (zero-leak) and return the error.
+fn prepareInto(db: *c.sqlite3, sqls: [6][:0]const u8) ![6]*c.sqlite3_stmt {
+    var out: [6]*c.sqlite3_stmt = undefined;
+    var prepared: usize = 0;
+    errdefer for (out[0..prepared]) |s| {
+        _ = c.sqlite3_finalize(s);
+    };
+    for (sqls, 0..) |sql, i| {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, sql.ptr, -1, &stmt, null) != c.SQLITE_OK)
+            return error.SqliteError;
+        out[i] = stmt.?;
+        prepared += 1;
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -22,6 +51,15 @@ const SCHEMA_SQL: [:0]const u8 = @embedFile("schema.sql");
 pub const StateStore = struct {
     db: *c.sqlite3,
     allocator: std.mem.Allocator,
+    // Cached hot-path CRUD statements: compiled once in open(), reused via
+    // sqlite3_reset, finalized in close(). Default `undefined`; always assigned
+    // by prepareStatements() before open() returns success.
+    stmt_get_user:   *c.sqlite3_stmt = undefined,
+    stmt_set_user:   *c.sqlite3_stmt = undefined,
+    stmt_get_chat:   *c.sqlite3_stmt = undefined,
+    stmt_set_chat:   *c.sqlite3_stmt = undefined,
+    stmt_get_global: *c.sqlite3_stmt = undefined,
+    stmt_set_global: *c.sqlite3_stmt = undefined,
 
     /// Open (or create) the database at `path`.
     /// For in-memory databases use path = ":memory:".
@@ -43,11 +81,47 @@ pub const StateStore = struct {
             _ = c.sqlite3_close(store.db);
             return err;
         };
+        store.prepareStatements() catch |err| {
+            // prepareInto already finalized any prepared prefix; the connection
+            // has no live statements, so sqlite3_close is clean here.
+            _ = c.sqlite3_close(store.db);
+            return err;
+        };
         return store;
     }
 
     pub fn close(self: *StateStore) void {
+        // Finalize cached statements before closing, or sqlite3_close returns
+        // SQLITE_BUSY and leaks the connection.
+        _ = c.sqlite3_finalize(self.stmt_get_user);
+        _ = c.sqlite3_finalize(self.stmt_set_user);
+        _ = c.sqlite3_finalize(self.stmt_get_chat);
+        _ = c.sqlite3_finalize(self.stmt_set_chat);
+        _ = c.sqlite3_finalize(self.stmt_get_global);
+        _ = c.sqlite3_finalize(self.stmt_set_global);
         _ = c.sqlite3_close(self.db);
+    }
+
+    pub fn beginImmediate(self: *StateStore) !void {
+        try sqliteOk(c.sqlite3_exec(self.db, "BEGIN IMMEDIATE", null, null, null));
+    }
+
+    pub fn commit(self: *StateStore) !void {
+        try sqliteOk(c.sqlite3_exec(self.db, "COMMIT", null, null, null));
+    }
+
+    pub fn rollback(self: *StateStore) void {
+        _ = c.sqlite3_exec(self.db, "ROLLBACK", null, null, null);
+    }
+
+    fn prepareStatements(self: *StateStore) !void {
+        const s = try prepareInto(self.db, CACHED_SQL);
+        self.stmt_get_user   = s[0];
+        self.stmt_set_user   = s[1];
+        self.stmt_get_chat   = s[2];
+        self.stmt_set_chat   = s[3];
+        self.stmt_get_global = s[4];
+        self.stmt_set_global = s[5];
     }
 
     // -----------------------------------------------------------------------
@@ -57,19 +131,12 @@ pub const StateStore = struct {
     /// Returns the stored JSON blob for `user_id`, or "{}" if not yet set.
     /// Caller owns the returned slice.
     pub fn getUserState(self: *StateStore, user_id: i64) ![]u8 {
-        return self.getStateById(
-            "SELECT data FROM user_state WHERE user_id = ?",
-            user_id,
-        );
+        return self.getStateById(self.stmt_get_user, user_id);
     }
 
     /// Upsert the JSON blob for `user_id`.
     pub fn setUserState(self: *StateStore, user_id: i64, data: []const u8) !void {
-        return self.setStateById(
-            "INSERT OR REPLACE INTO user_state (user_id, data) VALUES (?, ?)",
-            user_id,
-            data,
-        );
+        return self.setStateById(self.stmt_set_user, user_id, data);
     }
 
     // -----------------------------------------------------------------------
@@ -77,18 +144,11 @@ pub const StateStore = struct {
     // -----------------------------------------------------------------------
 
     pub fn getChatState(self: *StateStore, chat_id: i64) ![]u8 {
-        return self.getStateById(
-            "SELECT data FROM chat_state WHERE chat_id = ?",
-            chat_id,
-        );
+        return self.getStateById(self.stmt_get_chat, chat_id);
     }
 
     pub fn setChatState(self: *StateStore, chat_id: i64, data: []const u8) !void {
-        return self.setStateById(
-            "INSERT OR REPLACE INTO chat_state (chat_id, data) VALUES (?, ?)",
-            chat_id,
-            data,
-        );
+        return self.setStateById(self.stmt_set_chat, chat_id, data);
     }
 
     // -----------------------------------------------------------------------
@@ -98,8 +158,11 @@ pub const StateStore = struct {
     /// Returns the value for `key`, or null if absent.
     /// Caller owns the returned slice (free with the same allocator).
     pub fn getGlobal(self: *StateStore, key: []const u8) !?[]u8 {
-        const stmt = try self.prepare("SELECT value FROM global_state WHERE key = ?");
-        defer _ = c.sqlite3_finalize(stmt);
+        const stmt = self.stmt_get_global;
+        defer {
+            _ = c.sqlite3_reset(stmt);
+            _ = c.sqlite3_clear_bindings(stmt);
+        }
 
         try sqliteOk(c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null));
 
@@ -107,6 +170,7 @@ pub const StateStore = struct {
             c.SQLITE_ROW => blk: {
                 const text = c.sqlite3_column_text(stmt, 0);
                 const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+                // dupe BEFORE the deferred reset invalidates the column pointer
                 break :blk if (text != null)
                     try self.allocator.dupe(u8, text[0..len])
                 else
@@ -119,10 +183,11 @@ pub const StateStore = struct {
 
     /// Upsert a global key-value pair.
     pub fn setGlobal(self: *StateStore, key: []const u8, value: []const u8) !void {
-        const stmt = try self.prepare(
-            "INSERT OR REPLACE INTO global_state (key, value) VALUES (?, ?)",
-        );
-        defer _ = c.sqlite3_finalize(stmt);
+        const stmt = self.stmt_set_global;
+        defer {
+            _ = c.sqlite3_reset(stmt);
+            _ = c.sqlite3_clear_bindings(stmt);
+        }
 
         try sqliteOk(c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null));
         try sqliteOk(c.sqlite3_bind_text(stmt, 2, value.ptr, @intCast(value.len), null));
@@ -176,11 +241,13 @@ pub const StateStore = struct {
         return stmt.?;
     }
 
-    /// Generic SELECT-by-integer-id returning a JSON blob.
+    /// Run a cached SELECT-by-integer-id statement, returning a JSON blob.
     /// Returns "{}" when no row found (matching column DEFAULT).
-    fn getStateById(self: *StateStore, sql: [:0]const u8, id: i64) ![]u8 {
-        const stmt = try self.prepare(sql);
-        defer _ = c.sqlite3_finalize(stmt);
+    fn getStateById(self: *StateStore, stmt: *c.sqlite3_stmt, id: i64) ![]u8 {
+        defer {
+            _ = c.sqlite3_reset(stmt);
+            _ = c.sqlite3_clear_bindings(stmt);
+        }
 
         try sqliteOk(c.sqlite3_bind_int64(stmt, 1, id));
 
@@ -188,6 +255,7 @@ pub const StateStore = struct {
             c.SQLITE_ROW => blk: {
                 const text = c.sqlite3_column_text(stmt, 0);
                 const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+                // dupe BEFORE the deferred reset invalidates the column pointer
                 break :blk if (text != null)
                     try self.allocator.dupe(u8, text[0..len])
                 else
@@ -198,10 +266,13 @@ pub const StateStore = struct {
         };
     }
 
-    /// Generic INSERT OR REPLACE with (integer_id, text_data) parameters.
-    fn setStateById(self: *StateStore, sql: [:0]const u8, id: i64, data: []const u8) !void {
-        const stmt = try self.prepare(sql);
-        defer _ = c.sqlite3_finalize(stmt);
+    /// Run a cached INSERT OR REPLACE with (integer_id, text_data) parameters.
+    fn setStateById(self: *StateStore, stmt: *c.sqlite3_stmt, id: i64, data: []const u8) !void {
+        _ = self;
+        defer {
+            _ = c.sqlite3_reset(stmt);
+            _ = c.sqlite3_clear_bindings(stmt);
+        }
 
         try sqliteOk(c.sqlite3_bind_int64(stmt, 1, id));
         try sqliteOk(c.sqlite3_bind_text(stmt, 2, data.ptr, @intCast(data.len), null));
@@ -215,11 +286,6 @@ pub const StateStore = struct {
     inline fn sqliteDone(rc: c_int) !void {
         if (rc != c.SQLITE_DONE) return error.SqliteError;
     }
-    //
-    // try sqliteOk(c.sqlite3_bind_int64(stmt, 1, id));
-    // try sqliteOk(c.sqlite3_bind_text(stmt, 2, data.ptr, @intCast(data.len), null));
-    // try sqliteDone(c.sqlite3_step(stmt));
-    //
 };
 
 
@@ -234,7 +300,7 @@ fn openMem() !StateStore {
     return StateStore.open(testing.allocator, ":memory:");
 }
 
-test "AC-5.1: fresh in-memory DB creates all tables without error" {
+test "fresh in-memory DB creates all tables without error" {
     var store = try openMem();
     defer store.close();
 
@@ -252,7 +318,7 @@ test "AC-5.1: fresh in-memory DB creates all tables without error" {
     }
 }
 
-test "AC-5.2: after schema, meta contains schema_version = '1'" {
+test "after schema, meta contains schema_version = '1'" {
     var store = try openMem();
     defer store.close();
 
@@ -266,13 +332,13 @@ test "AC-5.2: after schema, meta contains schema_version = '1'" {
     try testing.expectEqualStrings("1", text[0..len]);
 }
 
-test "AC-5.3: opening a DB with matching schema_version succeeds" {
+test "opening a DB with matching schema_version succeeds" {
     // open() implicitly checks — if it returns Ok, version matches
     var store = try openMem();
     store.close();
 }
 
-test "AC-5.4: opening a DB with mismatched schema_version returns SchemaMismatch" {
+test "opening a DB with mismatched schema_version returns SchemaMismatch" {
     // Create a file-based DB and manually corrupt the schema_version.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -296,7 +362,7 @@ test "AC-5.4: opening a DB with mismatched schema_version returns SchemaMismatch
     try testing.expectError(error.SchemaMismatch, result);
 }
 
-test "AC-5.5: setUserState / getUserState round-trip" {
+test "setUserState / getUserState round-trip" {
     var store = try openMem();
     defer store.close();
 
@@ -308,7 +374,7 @@ test "AC-5.5: setUserState / getUserState round-trip" {
     try testing.expectEqualStrings(data, got);
 }
 
-test "AC-5.6: getUserState for unknown user_id returns '{}'" {
+test "getUserState for unknown user_id returns '{}'" {
     var store = try openMem();
     defer store.close();
 
@@ -318,7 +384,7 @@ test "AC-5.6: getUserState for unknown user_id returns '{}'" {
     try testing.expectEqualStrings("{}", got);
 }
 
-test "AC-5.7: setChatState / getChatState round-trip" {
+test "setChatState / getChatState round-trip" {
     var store = try openMem();
     defer store.close();
 
@@ -329,7 +395,7 @@ test "AC-5.7: setChatState / getChatState round-trip" {
     try testing.expectEqualStrings("{\"muted\":true}", got);
 }
 
-test "AC-5.7: getChatState for unknown chat_id returns '{}'" {
+test "getChatState for unknown chat_id returns '{}'" {
     var store = try openMem();
     defer store.close();
 
@@ -339,7 +405,7 @@ test "AC-5.7: getChatState for unknown chat_id returns '{}'" {
     try testing.expectEqualStrings("{}", got);
 }
 
-test "AC-5.8: setGlobal / getGlobal round-trip" {
+test "setGlobal / getGlobal round-trip" {
     var store = try openMem();
     defer store.close();
 
@@ -351,7 +417,7 @@ test "AC-5.8: setGlobal / getGlobal round-trip" {
     try testing.expectEqualStrings("99", got.?);
 }
 
-test "AC-5.8: getGlobal for missing key returns null" {
+test "getGlobal for missing key returns null" {
     var store = try openMem();
     defer store.close();
 
@@ -359,7 +425,7 @@ test "AC-5.8: getGlobal for missing key returns null" {
     try testing.expectEqual(@as(?[]u8, null), got);
 }
 
-test "AC-5.9: 3 connections on same file-based DB, concurrent reads, WAL confirmed" {
+test "3 connections on same file-based DB, concurrent reads, WAL confirmed" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -402,7 +468,7 @@ test "AC-5.9: 3 connections on same file-based DB, concurrent reads, WAL confirm
     try testing.expectEqualStrings("wal", jm_text[0..jm_len]);
 }
 
-test "AC-5.10: setUserState upserts — second write overwrites first" {
+test "setUserState upserts — second write overwrites first" {
     var store = try openMem();
     defer store.close();
 
@@ -415,7 +481,7 @@ test "AC-5.10: setUserState upserts — second write overwrites first" {
     try testing.expectEqualStrings("{\"v\":\"B\"}", got);
 }
 
-test "AC-5.10: setGlobal upserts — second write overwrites first" {
+test "setGlobal upserts — second write overwrites first" {
     var store = try openMem();
     defer store.close();
 
@@ -428,7 +494,157 @@ test "AC-5.10: setGlobal upserts — second write overwrites first" {
     try testing.expectEqualStrings("second", got.?);
 }
 
-test "AC-5.11: busy_timeout set — concurrent writers complete without BUSY error" {
+test "beginImmediate + commit persists write" {
+    var store = try openMem();
+    defer store.close();
+
+    try store.beginImmediate();
+    try store.setUserState(1, "{\"x\":42}");
+    try store.commit();
+
+    const data = try store.getUserState(1);
+    defer store.allocator.free(data);
+    try testing.expect(std.mem.indexOf(u8, data, "\"x\":42") != null);
+}
+
+test "beginImmediate + rollback reverts write" {
+    var store = try openMem();
+    defer store.close();
+
+    try store.setUserState(1, "{\"x\":0}");
+
+    try store.beginImmediate();
+    try store.setUserState(1, "{\"x\":99}");
+    store.rollback();
+
+    const data = try store.getUserState(1);
+    defer store.allocator.free(data);
+    try testing.expect(std.mem.indexOf(u8, data, "\"x\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"x\":99") == null);
+}
+
+/// Count live (un-finalized) prepared statements on a connection.
+fn countStmts(db: *c.sqlite3) usize {
+    var n: usize = 0;
+    var s: ?*c.sqlite3_stmt = c.sqlite3_next_stmt(db, null);
+    while (s != null) : (s = c.sqlite3_next_stmt(db, s)) n += 1;
+    return n;
+}
+
+test "AC-CACHE-4: open prepares exactly 6 cached statements; close() tears down cleanly" {
+    var store = try openMem();
+    // Exactly the six cached CRUD statements are live after open().
+    try testing.expectEqual(@as(usize, 6), countStmts(store.db));
+    // Exercise the real close() teardown (finalize all six, then sqlite3_close).
+    // A finalize omission in close() would leave the connection BUSY and leak it,
+    // which the surrounding test suite's `defer store.close()` usage would surface.
+    store.close();
+}
+
+test "AC-CACHE-4: finalizing the six cached statements lets sqlite3_close return OK" {
+    // White-box check mirroring close()'s teardown: finalizing exactly the six
+    // cached statements leaves no live statement, so sqlite3_close returns
+    // SQLITE_OK (it would return SQLITE_BUSY if any statement were still live).
+    // The store is torn down manually here, so no `defer store.close()`.
+    const store = try openMem();
+    _ = c.sqlite3_finalize(store.stmt_get_user);
+    _ = c.sqlite3_finalize(store.stmt_set_user);
+    _ = c.sqlite3_finalize(store.stmt_get_chat);
+    _ = c.sqlite3_finalize(store.stmt_set_chat);
+    _ = c.sqlite3_finalize(store.stmt_get_global);
+    _ = c.sqlite3_finalize(store.stmt_set_global);
+    try testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_close(store.db));
+}
+
+test "AC-CACHE-5: prepareInto finalizes the prepared prefix on a mid-sequence failure" {
+    var store = try openMem();
+    defer store.close();
+
+    // A batch whose last entry is invalid SQL: the first five prepare, the
+    // sixth fails, and the errdefer must finalize the five already prepared.
+    const bad = [_][:0]const u8{
+        "SELECT 1", "SELECT 1", "SELECT 1", "SELECT 1", "SELECT 1",
+        "SELECT bogus_col FROM no_such_table",
+    };
+    const before = countStmts(store.db); // 6 cached
+    try testing.expectError(error.SqliteError, prepareInto(store.db, bad));
+    // No leak: the 5 successful prepares were finalized, count is unchanged.
+    try testing.expectEqual(before, countStmts(store.db));
+}
+
+test "AC-CACHE-2: setGlobal/getGlobal reuse the cached statement (count stays 6)" {
+    var store = try openMem();
+    defer store.close();
+
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        var vbuf: [16]u8 = undefined;
+        const v = try std.fmt.bufPrint(&vbuf, "{d}", .{i});
+        try store.setGlobal("total", v);
+    }
+    const got = try store.getGlobal("total");
+    defer testing.allocator.free(got.?);
+    try testing.expectEqualStrings("999", got.?);
+
+    // No statement growth across 1000+ reuses: still exactly the 6 cached.
+    try testing.expectEqual(@as(usize, 6), countStmts(store.db));
+}
+
+test "AC-CACHE-3: user/chat statements reset cleanly across mixed access" {
+    var store = try openMem();
+    defer store.close();
+
+    // unknown id -> "{}"
+    const u_empty = try store.getUserState(1);
+    defer testing.allocator.free(u_empty);
+    try testing.expectEqualStrings("{}", u_empty);
+
+    // write user, write chat (different cached stmts), read both back
+    try store.setUserState(1, "{\"count\":1}");
+    try store.setChatState(2, "{\"room\":\"a\"}");
+
+    const user_state1 = try store.getUserState(1);
+    defer testing.allocator.free(user_state1);
+    try testing.expectEqualStrings("{\"count\":1}", user_state1);
+
+    const ch = try store.getChatState(2);
+    defer testing.allocator.free(ch);
+    try testing.expectEqualStrings("{\"room\":\"a\"}", ch);
+
+    // overwrite user, re-read -- no stale row/binding from prior reuse
+    try store.setUserState(1, "{\"count\":2}");
+    const user_state2 = try store.getUserState(1);
+    defer testing.allocator.free(user_state2);
+    try testing.expectEqualStrings("{\"count\":2}", user_state2);
+
+    // statements reused, not re-prepared: still the 6 cached
+    try testing.expectEqual(@as(usize, 6), countStmts(store.db));
+}
+
+test "AC-CACHE-3: global statement reset is clean across mixed read/write/miss" {
+    var store = try openMem();
+    defer store.close();
+
+    // miss -> null
+    try testing.expectEqual(@as(?[]u8, null), try store.getGlobal("k"));
+
+    // write then read same key
+    try store.setGlobal("k", "v1");
+    const a = try store.getGlobal("k");
+    defer testing.allocator.free(a.?);
+    try testing.expectEqualStrings("v1", a.?);
+
+    // overwrite then read -- no stale binding/row state leaks between reuses
+    try store.setGlobal("k", "v2");
+    const b = try store.getGlobal("k");
+    defer testing.allocator.free(b.?);
+    try testing.expectEqualStrings("v2", b.?);
+
+    // a different missing key still returns null after prior populated reads
+    try testing.expectEqual(@as(?[]u8, null), try store.getGlobal("absent"));
+}
+
+test "busy_timeout set — concurrent writers complete without BUSY error" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 

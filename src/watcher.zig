@@ -1,4 +1,10 @@
-/// reload.zig — hot-reload watcher for rules.lua
+/// watcher.zig — kernel-native file watcher (inotify / kqueue / poll).
+///
+/// Generic watch primitives (`WatchTarget`, `watchInotify`, `watchKqueue`,
+/// `watchPoll`) fire a caller-supplied callback on file change; tg_schema.zig
+/// reuses them to watch the API schema.  The rules-reload helpers on top
+/// (`reload_version`, `WatcherArgs`, `watcherThread`) bump a global counter so
+/// workers reload rules.lua.
 ///
 /// Public API:
 ///   reload_version          — global atomic u64, starts at 0.
@@ -62,7 +68,6 @@ pub const WatchTarget = struct {
 pub fn watcherThread(args: WatcherArgs) void {
     // Duplicate so the caller can free its copy any time after spawning.
     // The defer below never executes — the function loops forever.
-    // See KNOWN_ALLOCATIONS.md §1.
     const owned = args.allocator.dupe(u8, args.rules_path) catch {
         log.err("watcherThread: OOM duplicating rules path — watcher not started", .{});
         return;
@@ -303,17 +308,17 @@ const LUA_V0 = "-- rules v0";
 const LUA_V1 = "-- rules v1";
 const LUA_V2 = "-- rules v2";
 
-test "AC-7.1: reload_version starts at 0" {
-    // We verify the initial value of the global, not a local counter.
+test "reload_version starts at 0" {
+    // The test checks the initial value of the global, not a local counter.
     // Note: if other tests already incremented the global, this test can fail
-    // when run in isolation.  We test via the initial value stored in the type.
+    // when run in isolation.  The check uses the initial value stored in the type.
     const fresh = std.atomic.Value(u64).init(0);
     try testing.expectEqual(@as(u64, 0), fresh.load(.acquire));
     // The global is also 0 at program start (documented invariant).
     try testing.expect(reload_version.raw >= 0);
 }
 
-test "AC-7.7: std.atomic.Value(u64) provides .release/.acquire ordering" {
+test "std.atomic.Value(u64) provides .release/.acquire ordering" {
     var v = std.atomic.Value(u64).init(0);
     _ = v.fetchAdd(1, .release);
     try testing.expectEqual(@as(u64, 1), v.load(.acquire));
@@ -322,7 +327,7 @@ test "AC-7.7: std.atomic.Value(u64) provides .release/.acquire ordering" {
     try testing.expectEqual(@as(u64, 3), v.load(.acquire));
 }
 
-test "AC-7.5: watcherPoll detects file write within 1500ms" {
+test "watcherPoll detects file write within 1500ms" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -366,7 +371,7 @@ test "AC-7.5: watcherPoll detects file write within 1500ms" {
     try testing.expect(waitForCount(&counter, 1, 1400));
 }
 
-test "AC-7.2: (Linux) inotify detects CLOSE_WRITE within 1000ms" {
+test "(Linux) inotify detects CLOSE_WRITE within 1000ms" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
@@ -406,7 +411,7 @@ test "AC-7.2: (Linux) inotify detects CLOSE_WRITE within 1000ms" {
     try testing.expect(waitForCount(&counter, 1, 1000));
 }
 
-test "AC-7.3: (Linux) 3 writes 200ms apart → counter >= 3 within 2s of last write" {
+test "(Linux) 3 writes 200ms apart → counter >= 3 within 2s of last write" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
@@ -446,7 +451,7 @@ test "AC-7.3: (Linux) 3 writes 200ms apart → counter >= 3 within 2s of last wr
     try testing.expect(waitForCount(&counter, 3, 2000));
 }
 
-test "AC-7.4: (Linux) atomic rename (tmp → rules.lua) → counter incremented within 1000ms" {
+test "(Linux) atomic rename (tmp → rules.lua) → counter incremented within 1000ms" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
@@ -486,7 +491,7 @@ test "AC-7.4: (Linux) atomic rename (tmp → rules.lua) → counter incremented 
     try testing.expect(waitForCount(&counter, 1, 1000));
 }
 
-test "AC-7.6: (Linux) file deleted and recreated — watcher does not panic" {
+test "(Linux) file deleted and recreated — watcher does not panic" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
@@ -526,5 +531,5 @@ test "AC-7.6: (Linux) file deleted and recreated — watcher does not panic" {
         try f.writeAll(LUA_V1);
     }
     std.Thread.sleep(100 * std.time.ns_per_ms);
-    // Test passes if we reach here without panic.
+    // The test passes if execution reaches here without panic.
 }

@@ -28,6 +28,7 @@ pub const SerializeError = error{
 /// Error set for JSON → Lua direction.
 pub const DeserializeError = error{
     MaxDepthExceeded,
+    MaxSizeExceeded,
     InvalidJson,
     OutOfMemory,
 };
@@ -36,18 +37,24 @@ pub const DeserializeError = error{
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Serialize the Lua value at `index` to a JSON string.
+/// Serialize the Lua value at `index` to a JSON string (64 KiB cap).
 /// Caller owns the returned slice (free with the same allocator).
 pub fn luaTableToJson(lua: *Lua, index: i32, allocator: std.mem.Allocator) ![]u8 {
+    return luaTableToJsonCapped(lua, index, allocator, MAX_SIZE);
+}
+
+/// Like luaTableToJson but with a caller-supplied size cap.
+pub fn luaTableToJsonCapped(lua: *Lua, index: i32, allocator: std.mem.Allocator, max_size: usize) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const abs = lua.absIndex(index);
-    try serializeValue(lua, abs, allocator, &buf, 0);
+    try serializeValue(lua, abs, allocator, &buf, 0, max_size);
     return buf.toOwnedSlice(allocator);
 }
 
 /// Parse `json_str` and push one value onto the Lua stack.
 /// On error the stack is restored to its state before the call.
+/// No input-size limit — required for webhook body decoding up to 1 MB.
 pub fn jsonToLuaTable(lua: *Lua, json_str: []const u8, allocator: std.mem.Allocator) !void {
     const top_before = lua.getTop();
     errdefer lua.setTop(top_before);
@@ -63,6 +70,13 @@ pub fn jsonToLuaTable(lua: *Lua, json_str: []const u8, allocator: std.mem.Alloca
     try pushJsonValue(lua, parsed.value, 0);
 }
 
+/// Like jsonToLuaTable but checks input length against max_size first.
+/// Returns error.MaxSizeExceeded if json_str.len > max_size.
+pub fn jsonToLuaTableCapped(lua: *Lua, json_str: []const u8, allocator: std.mem.Allocator, max_size: usize) !void {
+    if (json_str.len > max_size) return error.MaxSizeExceeded;
+    return jsonToLuaTable(lua, json_str, allocator);
+}
+
 // ---------------------------------------------------------------------------
 // Lua → JSON (private)
 // ---------------------------------------------------------------------------
@@ -73,42 +87,43 @@ fn serializeValue(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     depth: u32,
+    max_size: usize,
 ) SerializeError!void {
     switch (lua.typeOf(index)) {
-        .nil, .none => try appendChecked(buf, allocator, "null"),
+        .nil, .none => try appendChecked(buf, allocator, "null", max_size),
 
-        .boolean => try appendChecked(buf, allocator, if (lua.toBoolean(index)) "true" else "false"),
+        .boolean => try appendChecked(buf, allocator, if (lua.toBoolean(index)) "true" else "false", max_size),
 
         .number => {
             if (lua.isInteger(index)) {
                 const n = try lua.toInteger(index);
-                try appendFmtChecked(buf, allocator, "{d}", .{n});
+                try appendFmtChecked(buf, allocator, "{d}", .{n}, max_size);
             } else {
                 const n = try lua.toNumber(index);
                 if (!std.math.isFinite(n)) {
                     // NaN / ±Inf are not valid JSON — emit null
-                    try appendChecked(buf, allocator, "null");
+                    try appendChecked(buf, allocator, "null", max_size);
                 } else {
-                    try appendFloat(buf, allocator, n);
+                    try appendFloat(buf, allocator, n, max_size);
                 }
             }
         },
 
         .string => {
             const s = try lua.toString(index);
-            try appendChecked(buf, allocator, "\"");
-            try serializeStringContent(buf, allocator, s);
-            try appendChecked(buf, allocator, "\"");
+            try appendChecked(buf, allocator, "\"", max_size);
+            try serializeStringContent(buf, allocator, s, max_size);
+            try appendChecked(buf, allocator, "\"", max_size);
         },
 
         .table => {
             if (depth >= MAX_DEPTH) return error.MaxDepthExceeded;
             const abs = lua.absIndex(index);
-            try serializeTable(lua, abs, allocator, buf, depth);
+            try serializeTable(lua, abs, allocator, buf, depth, max_size);
         },
 
         // functions, userdata, threads → null (safe default)
-        else => try appendChecked(buf, allocator, "null"),
+        else => try appendChecked(buf, allocator, "null", max_size),
     }
 }
 
@@ -118,20 +133,21 @@ fn serializeTable(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     depth: u32,
+    max_size: usize,
 ) SerializeError!void {
     if (tableIsArray(lua, abs_index)) {
-        try appendChecked(buf, allocator, "[");
+        try appendChecked(buf, allocator, "[", max_size);
         const n = lua.rawLen(abs_index);
         var i: ziglua.Integer = 1;
         while (i <= @as(ziglua.Integer, @intCast(n))) : (i += 1) {
-            if (i > 1) try appendChecked(buf, allocator, ",");
+            if (i > 1) try appendChecked(buf, allocator, ",", max_size);
             _ = lua.rawGetIndex(abs_index, i);
-            try serializeValue(lua, -1, allocator, buf, depth + 1);
+            try serializeValue(lua, -1, allocator, buf, depth + 1, max_size);
             lua.pop(1);
         }
-        try appendChecked(buf, allocator, "]");
+        try appendChecked(buf, allocator, "]", max_size);
     } else {
-        try appendChecked(buf, allocator, "{");
+        try appendChecked(buf, allocator, "{", max_size);
         var first = true;
         lua.pushNil();
         while (lua.next(abs_index)) {
@@ -139,28 +155,28 @@ fn serializeTable(
             const key_type = lua.typeOf(-2);
             switch (key_type) {
                 .string => {
-                    if (!first) try appendChecked(buf, allocator, ",");
+                    if (!first) try appendChecked(buf, allocator, ",", max_size);
                     first = false;
                     const k = try lua.toString(-2);
-                    try appendChecked(buf, allocator, "\"");
-                    try serializeStringContent(buf, allocator, k);
-                    try appendChecked(buf, allocator, "\":");
-                    try serializeValue(lua, -1, allocator, buf, depth + 1);
+                    try appendChecked(buf, allocator, "\"", max_size);
+                    try serializeStringContent(buf, allocator, k, max_size);
+                    try appendChecked(buf, allocator, "\":", max_size);
+                    try serializeValue(lua, -1, allocator, buf, depth + 1, max_size);
                 },
                 .number => {
-                    if (!first) try appendChecked(buf, allocator, ",");
+                    if (!first) try appendChecked(buf, allocator, ",", max_size);
                     first = false;
                     // Numeric key → quoted string representation in JSON
-                    try appendChecked(buf, allocator, "\"");
+                    try appendChecked(buf, allocator, "\"", max_size);
                     if (lua.isInteger(-2)) {
                         const k = try lua.toInteger(-2);
-                        try appendFmtChecked(buf, allocator, "{d}", .{k});
+                        try appendFmtChecked(buf, allocator, "{d}", .{k}, max_size);
                     } else {
                         const k = try lua.toNumber(-2);
-                        try appendFloat(buf, allocator, k);
+                        try appendFloat(buf, allocator, k, max_size);
                     }
-                    try appendChecked(buf, allocator, "\":");
-                    try serializeValue(lua, -1, allocator, buf, depth + 1);
+                    try appendChecked(buf, allocator, "\":", max_size);
+                    try serializeValue(lua, -1, allocator, buf, depth + 1, max_size);
                 },
                 else => {
                     // Boolean keys, table keys, etc. are not supported
@@ -170,7 +186,7 @@ fn serializeTable(
             }
             lua.pop(1); // pop value, keep key for next()
         }
-        try appendChecked(buf, allocator, "}");
+        try appendChecked(buf, allocator, "}", max_size);
     }
 }
 
@@ -201,13 +217,14 @@ fn tableIsArray(lua: *Lua, abs_index: i32) bool {
     return count == n;
 }
 
-/// Append `s` to buf, checking MAX_SIZE before writing.
+/// Append `s` to buf, checking `max_size` before writing.
 fn appendChecked(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
     s: []const u8,
+    max_size: usize,
 ) SerializeError!void {
-    if (buf.items.len + s.len > MAX_SIZE) return error.MaxSizeExceeded;
+    if (buf.items.len + s.len > max_size) return error.MaxSizeExceeded;
     try buf.appendSlice(allocator, s);
 }
 
@@ -217,11 +234,12 @@ fn appendFmtChecked(
     allocator: std.mem.Allocator,
     comptime fmt: []const u8,
     args: anytype,
+    max_size: usize,
 ) SerializeError!void {
     var tmp: [128]u8 = undefined;
     // 128 bytes is always enough for any integer or float representation.
     const s = std.fmt.bufPrint(&tmp, fmt, args) catch unreachable;
-    return appendChecked(buf, allocator, s);
+    return appendChecked(buf, allocator, s, max_size);
 }
 
 /// Serialize a float ensuring the output always contains a decimal indicator
@@ -230,15 +248,16 @@ fn appendFloat(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
     n: f64,
+    max_size: usize,
 ) SerializeError!void {
     var tmp: [128]u8 = undefined;
     // 128 bytes is always enough for any finite f64 decimal representation.
     const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
-    try appendChecked(buf, allocator, s);
+    try appendChecked(buf, allocator, s, max_size);
     // Ensure at least one decimal indicator so JSON parsers don't
     // re-parse it as an integer on the way back.
     const has_point = std.mem.indexOfAny(u8, s, ".eEnN") != null;
-    if (!has_point) try appendChecked(buf, allocator, ".0");
+    if (!has_point) try appendChecked(buf, allocator, ".0", max_size);
 }
 
 /// Write a JSON-escaped version of `s` into buf (without surrounding quotes).
@@ -246,10 +265,11 @@ fn serializeStringContent(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
     s: [:0]const u8,
+    max_size: usize,
 ) SerializeError!void {
     for (s) |byte| {
         // Reserve up to 6 bytes for \uXXXX escapes
-        if (buf.items.len + 6 > MAX_SIZE) return error.MaxSizeExceeded;
+        if (buf.items.len + 6 > max_size) return error.MaxSizeExceeded;
         switch (byte) {
             '"'  => try buf.appendSlice(allocator, "\\\""),
             '\\' => try buf.appendSlice(allocator, "\\\\"),
@@ -316,7 +336,7 @@ fn newLua(allocator: std.mem.Allocator) !*Lua {
     return try Lua.init(allocator);
 }
 
-test "AC-2.1: nil round-trips as JSON null" {
+test "nil round-trips as JSON null" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -334,7 +354,7 @@ test "AC-2.1: nil round-trips as JSON null" {
     try testing.expectEqual(@as(i32, 0), lua.getTop());
 }
 
-test "AC-2.1: boolean true round-trips" {
+test "boolean true round-trips" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -351,7 +371,7 @@ test "AC-2.1: boolean true round-trips" {
     try testing.expectEqual(@as(i32, 0), lua.getTop());
 }
 
-test "AC-2.1: boolean false round-trips" {
+test "boolean false round-trips" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -367,7 +387,7 @@ test "AC-2.1: boolean false round-trips" {
     lua.pop(1);
 }
 
-test "AC-2.1: integer round-trips" {
+test "integer round-trips" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -384,7 +404,7 @@ test "AC-2.1: integer round-trips" {
     lua.pop(1);
 }
 
-test "AC-2.1: float round-trips" {
+test "float round-trips" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -404,7 +424,7 @@ test "AC-2.1: float round-trips" {
     lua.pop(1);
 }
 
-test "AC-2.1: string round-trips" {
+test "string round-trips" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -421,7 +441,7 @@ test "AC-2.1: string round-trips" {
     lua.pop(1);
 }
 
-test "AC-2.1: string with special chars escapes correctly" {
+test "string with special chars escapes correctly" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -436,7 +456,7 @@ test "AC-2.1: string with special chars escapes correctly" {
     );
 }
 
-test "AC-2.2: array table (1..N integer keys) serializes to JSON array" {
+test "array table (1..N integer keys) serializes to JSON array" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -456,7 +476,7 @@ test "AC-2.2: array table (1..N integer keys) serializes to JSON array" {
     try testing.expectEqualStrings("[10,20,30]", json);
 }
 
-test "AC-2.2: JSON array round-trips back to Lua sequence" {
+test "JSON array round-trips back to Lua sequence" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -478,7 +498,7 @@ test "AC-2.2: JSON array round-trips back to Lua sequence" {
     lua.pop(1);
 }
 
-test "AC-2.3: object table (string keys) serializes to JSON object" {
+test "object table (string keys) serializes to JSON object" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -495,7 +515,7 @@ test "AC-2.3: object table (string keys) serializes to JSON object" {
     try testing.expectEqualStrings("{\"name\":\"bob\"}", json);
 }
 
-test "AC-2.3: non-consecutive integer keys → object, not array" {
+test "non-consecutive integer keys → object, not array" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -516,7 +536,7 @@ test "AC-2.3: non-consecutive integer keys → object, not array" {
     try testing.expect(json[0] == '{');
 }
 
-test "AC-2.4: nesting depth 8 succeeds" {
+test "nesting depth 8 succeeds" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -541,7 +561,7 @@ test "AC-2.4: nesting depth 8 succeeds" {
     try testing.expect(json[0] == '{');
 }
 
-test "AC-2.4: nesting depth 9 returns error.MaxDepthExceeded" {
+test "nesting depth 9 returns error.MaxDepthExceeded" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -564,7 +584,7 @@ test "AC-2.4: nesting depth 9 returns error.MaxDepthExceeded" {
     _ = top_before;
 }
 
-test "AC-2.4: JSON array 8 levels deep succeeds" {
+test "JSON array 8 levels deep succeeds" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
     // [[[[[[[[]]]]]]]]  — 8 opening brackets
@@ -573,7 +593,7 @@ test "AC-2.4: JSON array 8 levels deep succeeds" {
     lua.pop(1);
 }
 
-test "AC-2.4: JSON array 9 levels deep returns error.MaxDepthExceeded" {
+test "JSON array 9 levels deep returns error.MaxDepthExceeded" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
     // [[[[[[[[[]]]]]]]]]  — 9 opening brackets
@@ -583,7 +603,7 @@ test "AC-2.4: JSON array 9 levels deep returns error.MaxDepthExceeded" {
     try testing.expectEqual(top_before, lua.getTop());
 }
 
-test "AC-2.5: serializing table exceeding 64 KiB returns error.MaxSizeExceeded" {
+test "serializing table exceeding 64 KiB returns error.MaxSizeExceeded" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -602,7 +622,7 @@ test "AC-2.5: serializing table exceeding 64 KiB returns error.MaxSizeExceeded" 
     lua.pop(1);
 }
 
-test "AC-2.6: empty table serializes to {}" {
+test "empty table serializes to {}" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -614,7 +634,7 @@ test "AC-2.6: empty table serializes to {}" {
     try testing.expectEqualStrings("{}", json);
 }
 
-test "AC-2.7: JSON null deserializes to Lua nil" {
+test "JSON null deserializes to Lua nil" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -624,7 +644,7 @@ test "AC-2.7: JSON null deserializes to Lua nil" {
     try testing.expectEqual(@as(i32, 0), lua.getTop());
 }
 
-test "AC-2.8: large integer (2^53) round-trips without loss" {
+test "large integer (2^53) round-trips without loss" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -640,7 +660,7 @@ test "AC-2.8: large integer (2^53) round-trips without loss" {
     lua.pop(1);
 }
 
-test "AC-2.8: max Lua integer (2^63-1) round-trips without loss" {
+test "max Lua integer (2^63-1) round-trips without loss" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -656,7 +676,7 @@ test "AC-2.8: max Lua integer (2^63-1) round-trips without loss" {
     lua.pop(1);
 }
 
-test "AC-2.8: negative integer round-trips" {
+test "negative integer round-trips" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -671,7 +691,7 @@ test "AC-2.8: negative integer round-trips" {
     lua.pop(1);
 }
 
-test "AC-2.9: invalid JSON returns error.InvalidJson without stack mutation" {
+test "invalid JSON returns error.InvalidJson without stack mutation" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -681,7 +701,7 @@ test "AC-2.9: invalid JSON returns error.InvalidJson without stack mutation" {
     try testing.expectEqual(top_before, lua.getTop());
 }
 
-test "AC-2.9: truncated JSON returns error.InvalidJson" {
+test "truncated JSON returns error.InvalidJson" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -691,7 +711,7 @@ test "AC-2.9: truncated JSON returns error.InvalidJson" {
     try testing.expectEqual(top_before, lua.getTop());
 }
 
-test "AC-2.10: stack hygiene — luaTableToJson leaves stack unchanged" {
+test "stack hygiene — luaTableToJson leaves stack unchanged" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -717,7 +737,7 @@ test "AC-2.10: stack hygiene — luaTableToJson leaves stack unchanged" {
     lua.pop(3);
 }
 
-test "AC-2.10: stack hygiene — jsonToLuaTable pushes exactly one value on success" {
+test "stack hygiene — jsonToLuaTable pushes exactly one value on success" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -734,7 +754,7 @@ test "AC-2.10: stack hygiene — jsonToLuaTable pushes exactly one value on succ
     lua.pop(1);
 }
 
-test "AC-2.10: stack hygiene — jsonToLuaTable restores stack on error" {
+test "stack hygiene — jsonToLuaTable restores stack on error" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -748,7 +768,7 @@ test "AC-2.10: stack hygiene — jsonToLuaTable restores stack on error" {
     lua.pop(1);
 }
 
-test "AC-2.11: fuzz — mixed integer and string keys in object" {
+test "fuzz — mixed integer and string keys in object" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -769,7 +789,7 @@ test "AC-2.11: fuzz — mixed integer and string keys in object" {
     try testing.expect(json[0] == '{');
 }
 
-test "AC-2.11: fuzz — boolean key returns error.UnsupportedKeyType" {
+test "fuzz — boolean key returns error.UnsupportedKeyType" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -784,7 +804,7 @@ test "AC-2.11: fuzz — boolean key returns error.UnsupportedKeyType" {
     lua.pop(1);
 }
 
-test "AC-2.11: fuzz — JSON nested arrays at depth 9 return MaxDepthExceeded" {
+test "fuzz — JSON nested arrays at depth 9 return MaxDepthExceeded" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -794,7 +814,7 @@ test "AC-2.11: fuzz — JSON nested arrays at depth 9 return MaxDepthExceeded" {
     try testing.expectEqual(top_before, lua.getTop());
 }
 
-test "AC-2.11: fuzz — deeply nested object at depth 9 returns MaxDepthExceeded" {
+test "fuzz — deeply nested object at depth 9 returns MaxDepthExceeded" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -804,4 +824,92 @@ test "AC-2.11: fuzz — deeply nested object at depth 9 returns MaxDepthExceeded
     const result = jsonToLuaTable(lua, deep, testing.allocator);
     try testing.expectError(error.MaxDepthExceeded, result);
     try testing.expectEqual(top_before, lua.getTop());
+}
+
+// ---------------------------------------------------------------------------
+// luaTableToJsonCapped / jsonToLuaTableCapped
+// ---------------------------------------------------------------------------
+
+test "luaTableToJsonCapped enforces caller-supplied cap" {
+    var lua = try newLua(testing.allocator);
+    defer lua.deinit();
+
+    // A small cap of 10 bytes — "hello" serialises to 7 bytes, fits fine.
+    _ = lua.pushString("hello");
+    const json = try luaTableToJsonCapped(lua, -1, testing.allocator, 16);
+    defer testing.allocator.free(json);
+    lua.pop(1);
+    try testing.expectEqualStrings("\"hello\"", json);
+}
+
+test "luaTableToJsonCapped returns MaxSizeExceeded when over cap" {
+    var lua = try newLua(testing.allocator);
+    defer lua.deinit();
+
+    _ = lua.pushString("hello world");
+    const result = luaTableToJsonCapped(lua, -1, testing.allocator, 5);
+    try testing.expectError(error.MaxSizeExceeded, result);
+    lua.pop(1);
+}
+
+test "luaTableToJson still uses MAX_SIZE (64 KiB) — unchanged" {
+    var lua = try newLua(testing.allocator);
+    defer lua.deinit();
+
+    // A string that fits under 64 KiB is accepted.
+    _ = lua.pushString("ok");
+    const json = try luaTableToJson(lua, -1, testing.allocator);
+    defer testing.allocator.free(json);
+    lua.pop(1);
+    try testing.expectEqualStrings("\"ok\"", json);
+}
+
+test "jsonToLuaTableCapped rejects input over max_size" {
+    var lua = try newLua(testing.allocator);
+    defer lua.deinit();
+
+    const top_before = lua.getTop();
+    const result = jsonToLuaTableCapped(lua, "{\"ok\":true}", testing.allocator, 5);
+    try testing.expectError(error.MaxSizeExceeded, result);
+    try testing.expectEqual(top_before, lua.getTop());
+}
+
+test "jsonToLuaTableCapped accepts input within max_size" {
+    var lua = try newLua(testing.allocator);
+    defer lua.deinit();
+
+    try jsonToLuaTableCapped(lua, "42", testing.allocator, 100);
+    try testing.expect(lua.isInteger(-1));
+    try testing.expectEqual(@as(ziglua.Integer, 42), try lua.toInteger(-1));
+    lua.pop(1);
+}
+
+test "jsonToLuaTable unchanged — no limit on input size" {
+    var lua = try newLua(testing.allocator);
+    defer lua.deinit();
+
+    // Even a large JSON string should still be accepted by jsonToLuaTable.
+    try jsonToLuaTable(lua, "{\"n\":1}", testing.allocator);
+    try testing.expect(lua.isTable(-1));
+    lua.pop(1);
+}
+
+test "depth 9 table → luaTableToJsonCapped propagates MaxDepthExceeded" {
+    var lua = try newLua(testing.allocator);
+    defer lua.deinit();
+
+    lua.createTable(0, 0);
+    var level: u32 = 8;
+    while (level > 0) : (level -= 1) {
+        const inner = lua.getTop();
+        lua.createTable(0, 1);
+        _ = lua.pushString("inner");
+        lua.pushValue(inner);
+        lua.rawSetTable(-3);
+        lua.remove(inner);
+    }
+
+    const result = luaTableToJsonCapped(lua, -1, testing.allocator, 1024 * 1024);
+    try testing.expectError(error.MaxDepthExceeded, result);
+    lua.pop(1);
 }

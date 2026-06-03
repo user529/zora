@@ -4,15 +4,14 @@
 ///   - One accept thread (poll-based, honours stop flag with 10ms timeout)
 ///   - One detached thread per connection
 ///   - Validates method, path, and X-Telegram-Bot-Api-Secret-Token header
-///   - Point-extracts user_id from the raw JSON body (no full parse —
-///     ADR-0001 §AD-2), routes by hashUserId % len(queues)
+///   - Point-extracts user_id from the raw JSON body (no full parse),
+///     routes by hashUserId % len(queues)
 ///   - Responds 200 OK immediately; the worker thread does the Lua processing
 ///
 /// Memory ownership:
 ///   The raw webhook body is duplicated into a heap-allocated WorkItem and
 ///   pushed to a worker queue.  The worker frees WorkItem.body after
-///   callOnMessage returns.  No arena is leaked — this replaces the pre-ADR
-///   Parsed(Update) model where each enqueued Update leaked its arena.
+///   callOnMessage returns.  No arena is leaked.
 
 const std    = @import("std");
 const types  = @import("types.zig");
@@ -25,6 +24,15 @@ const log = std.log.scoped(.server);
 /// threshold are rejected with 413 before any body memory is allocated.
 pub const MAX_BODY_BYTES: usize = 1 * 1024 * 1024;
 
+/// Maximum number of concurrently open connection-handler threads.
+/// Connections beyond this limit are dropped at the accept level.
+pub const MAX_CONNECTIONS: u32 = 1024;
+
+/// Per-recv idle read timeout for accepted connections (SO_RCVTIMEO).
+/// Idle, not total: each blocking recv resets the window, so a body that keeps
+/// streaming is never cut regardless of size; only a stalled peer trips it.
+pub const DEFAULT_READ_IDLE_TIMEOUT_MS: u32 = 15_000;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -36,6 +44,11 @@ pub const ServerArgs = struct {
     /// hashUserId(user_id, queues.len).  Must remain valid for the Server lifetime.
     queues:         []*q_mod.Queue(types.WorkItem),
     allocator:      std.mem.Allocator,
+    /// Number of reusable connection-handler threads (std.Thread.Pool).
+    pool_threads:   u8,
+    /// Per-recv idle read timeout (SO_RCVTIMEO) for accepted connections.
+    /// 0 disables. Defaulted so callers need not set it.
+    read_idle_timeout_ms: u32 = DEFAULT_READ_IDLE_TIMEOUT_MS,
 };
 
 pub const Server = struct {
@@ -45,6 +58,9 @@ pub const Server = struct {
     listener:       std.net.Server,
     stop:           std.atomic.Value(bool),
     thread:         std.Thread,
+    active:         std.atomic.Value(u32),
+    pool:           std.Thread.Pool,
+    read_idle_timeout_ms: u32,
 
     /// Start the server.  Returns a heap-allocated Server.  Call deinit() to
     /// stop the accept loop, close the socket, and free the allocation.
@@ -54,17 +70,27 @@ pub const Server = struct {
         self.allocator      = args.allocator;
         self.webhook_secret = args.webhook_secret;
         self.queues         = args.queues;
-        self.listener       = try args.listen_addr.listen(.{ .reuse_address = true });
+        self.read_idle_timeout_ms = args.read_idle_timeout_ms;
+        // kernel_backlog 4096 matches somaxconn; default 128 caused SYN-queue
+        // exhaustion warnings under burst load.
+        self.listener       = try args.listen_addr.listen(.{ .reuse_address = true, .kernel_backlog = 4096 });
         errdefer self.listener.deinit();
         self.stop   = std.atomic.Value(bool).init(false);
+        self.active = std.atomic.Value(u32).init(0);
+        // Pool must be ready before the accept loop (which submits to it) starts.
+        try self.pool.init(.{ .allocator = args.allocator, .n_jobs = @as(usize, args.pool_threads) });
+        errdefer self.pool.deinit();
         self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
         return self;
     }
 
-    /// Signal the accept loop to exit, wait for it, then release resources.
+    /// Signal the accept loop to exit, wait for it, drain the connection pool,
+    /// then release resources.  Order matters: stop accepting before draining
+    /// (no new tasks), drain before freeing (tasks hold *Server).
     pub fn deinit(self: *Server) void {
         self.stop.store(true, .release);
         self.thread.join();
+        self.pool.deinit(); // joins workers after draining the run-queue
         self.listener.deinit();
         self.allocator.destroy(self);
     }
@@ -96,12 +122,34 @@ fn acceptLoop(srv: *Server) void {
             log.warn("accept: {s}", .{@errorName(err)});
             continue;
         };
-        const t = std.Thread.spawn(.{}, handleConnection, .{ srv, conn }) catch |err| {
-            log.warn("thread spawn: {s}", .{@errorName(err)});
+        if (srv.active.load(.acquire) >= MAX_CONNECTIONS) {
+            log.warn("connection limit ({d}) reached — dropping", .{MAX_CONNECTIONS});
+            conn.stream.close();
+            continue;
+        }
+        // Drop connections when every worker queue is at capacity to prevent
+        // thread-churn SIGSEGV.
+        const all_saturated = blk: {
+            for (srv.queues) |q| {
+                if (q.len() < q.buf.len) break :blk false;
+            }
+            break :blk true;
+        };
+        if (all_saturated) {
+            log.warn("all worker queues saturated — dropping connection", .{});
+            sendStatus(conn.stream, "503 Service Unavailable") catch {};
+            conn.stream.close();
+            continue;
+        }
+        // active is incremented here and decremented in handleConnection's defer;
+        // it bounds both concurrent handlers and the pool run-queue depth.
+        _ = srv.active.fetchAdd(1, .acquire);
+        srv.pool.spawn(handleConnection, .{ srv, conn }) catch |err| {
+            _ = srv.active.fetchSub(1, .release);
+            log.warn("connection task submit: {s}", .{@errorName(err)});
             conn.stream.close();
             continue;
         };
-        t.detach();
     }
 }
 
@@ -110,9 +158,24 @@ fn acceptLoop(srv: *Server) void {
 // ---------------------------------------------------------------------------
 
 fn handleConnection(srv: *Server, conn: std.net.Server.Connection) void {
+    defer _ = srv.active.fetchSub(1, .release);
     defer conn.stream.close();
+    setReadTimeout(conn.stream.handle, srv.read_idle_timeout_ms);
     handleRequest(srv, conn.stream) catch |err| {
         log.warn("request error: {s}", .{@errorName(err)});
+    };
+}
+
+/// Apply a per-recv idle timeout (SO_RCVTIMEO) so a stalled client cannot hold a
+/// pool thread indefinitely. Best-effort: a failure to set it is logged, not fatal.
+fn setReadTimeout(fd: std.posix.socket_t, timeout_ms: u32) void {
+    if (timeout_ms == 0) return;
+    const tv = std.posix.timeval{
+        .sec  = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch |err| {
+        log.warn("setsockopt SO_RCVTIMEO failed: {s}", .{@errorName(err)});
     };
 }
 
@@ -126,9 +189,9 @@ fn sendStatus(stream: std.net.Stream, comptime status: []const u8) !void {
 }
 
 fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
-    // Arena for the HTTP line/header scratch space and body buffer.
-    // Freed at end of function.  JSON-parsed Update strings are separately
-    // owned by the arena inside std.json.Parsed (backed by srv.allocator).
+    // Arena for the HTTP line/header scratch space, body buffer, and the
+    // user_id extraction scanner.  Freed at end of function.  The body copy
+    // handed to the worker is allocated separately from srv.allocator.
     var line_arena = std.heap.ArenaAllocator.init(srv.allocator);
     defer line_arena.deinit();
     const la = line_arena.allocator();
@@ -207,7 +270,7 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
         return;
     };
 
-    // ── Point-extract the routing user_id (no full parse — ADR-0001 §AD-2) ───
+    // ── Point-extract the routing user_id (no full parse) ────────────────────
     // A syntactically malformed body is rejected here; a well-formed body with
     // no identifiable sender routes to worker 0 (user_id 0).
     const user_id = extractUserId(la, body) catch {
@@ -223,26 +286,37 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
         try sendStatus(stream, "500 Internal Server Error");
         return;
     };
-    const item = types.WorkItem{ .body = owned_body, .user_id = user_id };
-    const idx  = worker.hashUserId(user_id orelse 0, @intCast(srv.queues.len));
-    srv.queues[idx].push(item) catch {
-        log.warn("queue {d} full — update dropped", .{idx});
+    const item    = types.WorkItem{ .body = owned_body, .user_id = user_id };
+    const n       = srv.queues.len;
+    const primary = worker.hashUserId(user_id orelse 0, @intCast(n));
+    var pushed    = false;
+    for (0..n) |i| {
+        const idx = (primary + i) % n;
+        srv.queues[idx].push(item) catch continue;
+        if (i > 0) log.debug("worker {d} full — overflowed update to worker {d}", .{ primary, idx });
+        pushed = true;
+        break;
+    }
+    if (!pushed) {
+        log.warn("all queues full — update dropped (primary={d})", .{primary});
         srv.allocator.free(owned_body);
-    };
+        try sendStatus(stream, "503 Service Unavailable");
+        return;
+    }
 
     // ── Respond 200 immediately ───────────────────────────────────────────────
     try sendStatus(stream, "200 OK");
 }
 
 // ---------------------------------------------------------------------------
-// user_id extraction (ADR-0001 §AD-2)
+// user_id extraction
 //
 // The worker-routing key is point-extracted from the raw webhook JSON with a
-// streaming scanner — never a full parse.  We navigate to `message.from.id`
+// streaming scanner — never a full parse.  The scanner navigates to `message.from.id`
 // (preferred) or `callback_query.from.id` and stop as soon as an id is found;
 // trailing bytes are not scanned.  Telegram lists `message` before
-// `callback_query` in the Update object, so first-match equals the old
-// `effectiveUserId` precedence.
+// `callback_query` in the Update object, so first-match gives `message`
+// precedence.
 //
 // Returns error.InvalidJson when the body is not syntactically valid JSON up
 // to the point an id is found (a fully malformed body is always rejected).
@@ -378,6 +452,10 @@ const TestSetup = struct {
     srv:     *Server,
 
     fn init(n: usize, secret: []const u8) !*TestSetup {
+        return initTimeout(n, secret, DEFAULT_READ_IDLE_TIMEOUT_MS);
+    }
+
+    fn initTimeout(n: usize, secret: []const u8, read_idle_timeout_ms: u32) !*TestSetup {
         std.debug.assert(n > 0 and n <= MAX_Q);
         const self = try testing.allocator.create(TestSetup);
         errdefer testing.allocator.destroy(self);
@@ -386,12 +464,14 @@ const TestSetup = struct {
             self.q_store[i] = try Queue(types.WorkItem).init(testing.allocator, 512);
             self.q_ptrs[i]  = &self.q_store[i];
         }
-        const bind_addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+        const bind_addr = try std.net.Address.parseIp4("127.0.0.2", 0);
         self.srv = try Server.init(.{
             .listen_addr    = bind_addr,
             .webhook_secret = secret,
             .queues         = self.q_ptrs[0..n],
             .allocator      = testing.allocator,
+            .pool_threads   = 2,
+            .read_idle_timeout_ms = read_idle_timeout_ms,
         });
         return self;
     }
@@ -480,10 +560,10 @@ fn httpOversizeBody(address: std.net.Address, secret: []const u8) !u16 {
 }
 
 // ---------------------------------------------------------------------------
-// AC tests
+// Webhook endpoint tests
 // ---------------------------------------------------------------------------
 
-test "AC-10.1: valid POST /webhook with correct secret → 200 OK, update enqueued" {
+test "valid POST /webhook with correct secret → 200 OK, update enqueued" {
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
@@ -492,7 +572,7 @@ test "AC-10.1: valid POST /webhook with correct secret → 200 OK, update enqueu
     try testing.expectEqual(@as(usize, 1), ts.queueLen(0));
 }
 
-test "AC-10.2: GET /webhook → 403 Forbidden, nothing enqueued" {
+test "GET /webhook → 403 Forbidden, nothing enqueued" {
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
@@ -501,7 +581,7 @@ test "AC-10.2: GET /webhook → 403 Forbidden, nothing enqueued" {
     try testing.expectEqual(@as(usize, 0), ts.queueLen(0));
 }
 
-test "AC-10.3: POST /notwebhook → 403 Forbidden, nothing enqueued" {
+test "POST /notwebhook → 403 Forbidden, nothing enqueued" {
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
@@ -510,7 +590,7 @@ test "AC-10.3: POST /notwebhook → 403 Forbidden, nothing enqueued" {
     try testing.expectEqual(@as(usize, 0), ts.queueLen(0));
 }
 
-test "AC-10.4: POST /webhook with no secret header → 403 Forbidden" {
+test "POST /webhook with no secret header → 403 Forbidden" {
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
@@ -518,7 +598,7 @@ test "AC-10.4: POST /webhook with no secret header → 403 Forbidden" {
     try testing.expectEqual(@as(u16, 403), status);
 }
 
-test "AC-10.5: POST /webhook with wrong secret → 403 Forbidden" {
+test "POST /webhook with wrong secret → 403 Forbidden" {
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
@@ -526,7 +606,7 @@ test "AC-10.5: POST /webhook with wrong secret → 403 Forbidden" {
     try testing.expectEqual(@as(u16, 403), status);
 }
 
-test "AC-10.6: valid secret, malformed JSON body → 400 Bad Request, nothing enqueued" {
+test "valid secret, malformed JSON body → 400 Bad Request, nothing enqueued" {
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
@@ -535,7 +615,7 @@ test "AC-10.6: valid secret, malformed JSON body → 400 Bad Request, nothing en
     try testing.expectEqual(@as(usize, 0), ts.queueLen(0));
 }
 
-test "AC-10.7: 200 OK arrives within 50ms" {
+test "200 OK arrives within 50ms" {
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
@@ -547,7 +627,7 @@ test "AC-10.7: 200 OK arrives within 50ms" {
     try testing.expect(elapsed < 50);
 }
 
-test "AC-10.8: 100 requests with same user_id → all enqueued to same worker queue" {
+test "100 requests with same user_id → all enqueued to same worker queue" {
     const N = 4;
     const ts = try TestSetup.init(N, TEST_SECRET);
     defer ts.deinit();
@@ -569,7 +649,7 @@ test "AC-10.8: 100 requests with same user_id → all enqueued to same worker qu
     }
 }
 
-test "AC-10.9: 10 simultaneous connections → all 200 OK, all updates enqueued" {
+test "10 simultaneous connections → all 200 OK, all updates enqueued" {
     const N = 10;
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
@@ -614,7 +694,7 @@ test "AC-10.9: 10 simultaneous connections → all 200 OK, all updates enqueued"
     try testing.expectEqual(@as(usize, N), enqueued);
 }
 
-test "AC-10.10: body > 1 MB → 413, server does not allocate unbounded memory" {
+test "body > 1 MB → 413, server does not allocate unbounded memory" {
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
@@ -624,13 +704,13 @@ test "AC-10.10: body > 1 MB → 413, server does not allocate unbounded memory" 
 }
 
 // ---------------------------------------------------------------------------
-// Sub-step 13b — raw body forwarding + point-extracted user_id (ADR-0001 §AD-2)
+// Raw body forwarding + point-extracted user_id
 //
-// AC-13.8 (oversize / malformed-JSON rejection) is regression-protected by the
-// existing AC-10.6 and AC-10.10 above — no separate test.
+// Oversize / malformed-JSON rejection is already covered by the malformed-JSON
+// and oversize-body tests above — no separate test.
 // ---------------------------------------------------------------------------
 
-test "AC-13.5: server forwards the raw webhook body verbatim to the worker" {
+test "server forwards the raw webhook body verbatim to the worker" {
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
@@ -645,7 +725,7 @@ test "AC-13.5: server forwards the raw webhook body verbatim to the worker" {
     try testing.expectEqual(@as(?i64, 100), item.user_id);
 }
 
-test "AC-13.6: extractUserId — message / callback_query / edge cases" {
+test "extractUserId — message / callback_query / edge cases" {
     const A = testing.allocator;
 
     // message.from.id
@@ -692,7 +772,7 @@ test "AC-13.6: extractUserId — message / callback_query / edge cases" {
     try testing.expectError(error.InvalidJson, extractUserId(A, "[1,2,3]"));
 }
 
-test "AC-13.7: extractUserId early-exits once the routing id is found" {
+test "extractUserId early-exits once the routing id is found" {
     // The id is reachable; the bytes after it are invalid JSON.  A full scan
     // would raise error.InvalidJson — returning the id proves the scan stopped
     // as soon as `message.from.id` was captured.
@@ -700,11 +780,10 @@ test "AC-13.7: extractUserId early-exits once the routing id is found" {
     try testing.expectEqual(@as(?i64, 777), try extractUserId(testing.allocator, body));
 }
 
-test "AC-13.9: server→worker WorkItem handoff leaks nothing under testing.allocator" {
+test "server→worker WorkItem handoff leaks nothing under testing.allocator" {
     // The server allocates one WorkItem.body per accepted update.  Draining the
     // queues exactly as a worker does (take item, free body) must leave the
-    // testing.allocator balanced — proving the server↔worker ownership contract
-    // and that the pre-ADR Parsed(Update) arena leak is gone.
+    // testing.allocator balanced — proving the server↔worker ownership contract.
     const ts = try TestSetup.init(2, TEST_SECRET);
     defer ts.deinit();
 
@@ -725,4 +804,39 @@ test "AC-13.9: server→worker WorkItem handoff leaks nothing under testing.allo
         }
     }
     try testing.expectEqual(@as(usize, 20), drained);
+}
+
+test "pool-backed server: 50 sequential connections all 200, deinit drains cleanly" {
+    const ts = try TestSetup.init(2, TEST_SECRET);
+    defer ts.deinit();
+
+    for (0..50) |_| {
+        try testing.expectEqual(@as(u16, 200),
+            try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, VALID_UPDATE));
+    }
+
+    // Reaching here (and ts.deinit returning) proves pool.deinit() drains the
+    // accepted connections and joins its workers without hanging or leaking.
+}
+
+test "stalled client (sends nothing) is reclaimed by the read timeout" {
+    // Server with a short idle timeout so the test does not wait 15 s.
+    const ts = try TestSetup.initTimeout(1, TEST_SECRET, 200);
+    defer ts.deinit();
+
+    // Open a connection and send nothing. The server's first recv must time
+    // out (SO_RCVTIMEO), and handleRequest's read-failure path closes the conn.
+    const stream = try std.net.tcpConnectToAddress(ts.serverAddr());
+    defer stream.close();
+
+    // Read the response: the server sends "400 Bad Request" then closes, OR the
+    // peer closes (EOF). Either proves the stalled connection was reclaimed
+    // rather than held open indefinitely.
+    var read_buf: [128]u8 = undefined;
+    const t0 = std.time.milliTimestamp();
+    const n = stream.read(&read_buf) catch 0; // closed/reset counts as reclaimed
+    const elapsed = std.time.milliTimestamp() - t0;
+
+    try testing.expect(elapsed < 5_000); // reclaimed well within the 15 s default
+    _ = n;
 }

@@ -1,6 +1,6 @@
-/// schema_store.zig — Telegram Bot API schema: parsing, validation, hot-reload.
+/// tg_schema.zig — Telegram Bot API schema: parsing, validation, hot-watcher.
 ///
-/// The schema is the *data* side of outgoing-call validation (ADR-0001 Step 8).
+/// The schema is the *data* side of outgoing-call validation.
 /// It is a vendored JSON file (`schema/botapi.json`, PaulSonOfLars format):
 ///
 ///   { "methods": { "<name>": { "fields": [ { name, types, required }, ... ] } } }
@@ -9,12 +9,12 @@
 /// behind an atomic pointer so the watcher can swap in a re-parsed copy
 /// without locking the read path. The validator (`validate`) is the *logic*
 /// side — it lives here, in the Zig core, because the structural-check
-/// algorithm is stable (ADR-0001 amends AD-6).
+/// algorithm is stable.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const ziglua = @import("ziglua");
-const reload = @import("reload.zig");
+const watcher = @import("watcher.zig");
 
 const Lua = ziglua.Lua;
 const log = std.log.scoped(.schema);
@@ -23,7 +23,7 @@ const log = std.log.scoped(.schema);
 const MAX_SCHEMA_BYTES: usize = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// JSON shape (PaulSonOfLars api.json) — only the fields we use are declared;
+// JSON shape (PaulSonOfLars api.json) — only the fields in use are declared;
 // `ignore_unknown_fields` drops name/href/description/returns etc.
 // ---------------------------------------------------------------------------
 
@@ -81,8 +81,8 @@ pub const SchemaStore = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Validation — structural only (ADR-0001 §AD-5): known method, required
-// params present, primitive types match. Never semantic.
+// Validation — structural only: known method, required params present,
+// primitive types match. Never semantic.
 // ---------------------------------------------------------------------------
 
 pub const ValidationError = error{
@@ -104,7 +104,7 @@ fn classifyOne(t: []const u8) ParamKind {
     if (std.mem.eql(u8, t, "Float")) return .float;
     if (std.mem.eql(u8, t, "Float number")) return .float;
     // InputFile accepts both a string (file_id / URL) and a binary upload — treat
-    // it as unclassifiable so we never produce a false-positive TypeMismatch when
+    // it as unclassifiable so the validator never produces a false-positive TypeMismatch when
     // a rule passes a string file_id.
     if (std.mem.eql(u8, t, "InputFile")) return .any;
     // "Array of ...", concrete object type names, etc.
@@ -220,7 +220,7 @@ pub const SchemaSlot = struct {
     pub fn deinit(self: *SchemaSlot) void {
         // Swap current to null under the mutex so a concurrent install() that
         // hasn't been stopped yet cannot displace the same pointer into retired
-        // after we've already freed it (double-free).
+        // after deinit has already freed it (double-free).
         self.mutex.lock();
         const c = self.current.swap(null, .release);
         self.mutex.unlock();
@@ -247,7 +247,7 @@ pub fn loadInitial(slot: *SchemaSlot, path: []const u8) void {
 // ---------------------------------------------------------------------------
 // Schema file watcher — re-parses SCHEMA_FILE on change and swaps the slot.
 // A parse failure increments `failures` and keeps the previous schema.
-// Reuses reload.zig's kernel watchers (ADR-0001 Step 8).
+// Reuses watcher.zig's kernel watchers.
 // ---------------------------------------------------------------------------
 
 const SchemaWatchCtx = struct {
@@ -279,7 +279,7 @@ pub const SchemaWatcherArgs = struct {
 /// forever). Duplicates schema_file so the caller can free its copy immediately
 /// after spawning. The defer executes only if the underlying watcher returns
 /// early due to a system error (e.g. inotify fd exhaustion) — in the normal
-/// infinite-loop case it is unreachable. See KNOWN_ALLOCATIONS.md §3.
+/// infinite-loop case it is unreachable.
 pub fn schemaWatcherThread(args: SchemaWatcherArgs) void {
     const owned_path = args.allocator.dupe(u8, args.schema_file) catch {
         log.err("schemaWatcherThread: OOM duplicating schema path — watcher not started", .{});
@@ -287,15 +287,15 @@ pub fn schemaWatcherThread(args: SchemaWatcherArgs) void {
     };
     defer args.allocator.free(owned_path);
     var ctx = SchemaWatchCtx{ .slot = args.slot, .path = owned_path };
-    const target = reload.WatchTarget{
+    const target = watcher.WatchTarget{
         .path = owned_path,
         .context = &ctx,
         .on_write = onSchemaChange,
     };
     switch (builtin.os.tag) {
-        .linux => reload.watchInotify(target),
-        .freebsd => reload.watchKqueue(target),
-        else => reload.watchPoll(target, 500, null),
+        .linux => watcher.watchInotify(target),
+        .freebsd => watcher.watchKqueue(target),
+        else => watcher.watchPoll(target, 500, null),
     }
 }
 
@@ -305,7 +305,7 @@ pub fn schemaWatcherThread(args: SchemaWatcherArgs) void {
 
 const testing = std.testing;
 
-/// A minimal valid schema used across schema_store tests.
+/// A minimal valid schema used across tg_schema tests.
 const FIXTURE_SCHEMA =
     \\{"methods":{
     \\  "sendMessage":{"fields":[
@@ -319,7 +319,7 @@ const FIXTURE_SCHEMA =
     \\},"types":{}}
 ;
 
-test "AC-14.1: SchemaStore.fromSlice parses methods and fields" {
+test "SchemaStore.fromSlice parses methods and fields" {
     const store = try SchemaStore.fromSlice(testing.allocator, FIXTURE_SCHEMA);
     defer store.destroy(testing.allocator);
 
@@ -333,7 +333,7 @@ test "AC-14.1: SchemaStore.fromSlice parses methods and fields" {
     try testing.expect(store.method("noSuchMethod") == null);
 }
 
-test "AC-14.1: SchemaStore.fromSlice rejects malformed JSON" {
+test "SchemaStore.fromSlice rejects malformed JSON" {
     try testing.expectError(
         error.SyntaxError,
         SchemaStore.fromSlice(testing.allocator, "{not json"),
@@ -348,7 +348,7 @@ fn pushParams(lua: *Lua, table_literal: [:0]const u8) !i32 {
     return lua.getTop();
 }
 
-test "AC-14.1: validate accepts a well-formed call, rejects a missing required param" {
+test "validate accepts a well-formed call, rejects a missing required param" {
     const store = try SchemaStore.fromSlice(testing.allocator, FIXTURE_SCHEMA);
     defer store.destroy(testing.allocator);
 
@@ -371,7 +371,7 @@ test "AC-14.1: validate accepts a well-formed call, rejects a missing required p
     }
 }
 
-test "AC-14.2: validate rejects an unknown method" {
+test "validate rejects an unknown method" {
     const store = try SchemaStore.fromSlice(testing.allocator, FIXTURE_SCHEMA);
     defer store.destroy(testing.allocator);
 
@@ -387,7 +387,7 @@ test "AC-14.2: validate rejects an unknown method" {
     lua.pop(1);
 }
 
-test "AC-14.8: validate rejects a primitive type mismatch" {
+test "validate rejects a primitive type mismatch" {
     const store = try SchemaStore.fromSlice(testing.allocator, FIXTURE_SCHEMA);
     defer store.destroy(testing.allocator);
 
@@ -411,7 +411,7 @@ test "AC-14.8: validate rejects a primitive type mismatch" {
     lua.pop(1);
 }
 
-test "AC-14.8: InputFile field accepts a Lua string (no false TypeMismatch)" {
+test "InputFile field accepts a Lua string (no false TypeMismatch)" {
     // InputFile can be passed as a string (file_id or URL) from Lua rules.
     // The validator must not reject string values for InputFile-typed fields.
     const schema =
@@ -438,14 +438,14 @@ test "AC-14.8: InputFile field accepts a Lua string (no false TypeMismatch)" {
     lua.pop(1);
 }
 
-test "AC-14.7: SchemaSlot with no schema → get() is null (Tier-0)" {
+test "SchemaSlot with no schema → get() is null (Tier-0)" {
     var slot = SchemaSlot.init(testing.allocator);
     defer slot.deinit();
     try testing.expect(slot.get() == null);
     try testing.expectEqual(@as(u64, 0), slot.version.load(.acquire));
 }
 
-test "AC-14.5: loadInitial reads a file; install swaps and retires" {
+test "loadInitial reads a file; install swaps and retires" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     {
@@ -471,7 +471,7 @@ test "AC-14.5: loadInitial reads a file; install swaps and retires" {
     try testing.expectEqual(@as(usize, 1), slot.retired.items.len);
 }
 
-test "AC-14.7: loadInitial on a missing file leaves the slot empty" {
+test "loadInitial on a missing file leaves the slot empty" {
     var slot = SchemaSlot.init(testing.allocator);
     defer slot.deinit();
     loadInitial(&slot, "/nonexistent/zora-no-such-schema.json");
@@ -479,7 +479,7 @@ test "AC-14.7: loadInitial on a missing file leaves the slot empty" {
     try testing.expectEqual(@as(u64, 0), slot.version.load(.acquire));
 }
 
-test "AC-14.5: schema watcher hot-reloads; a broken file is rejected" {
+test "schema watcher hot-reloads; a broken file is rejected" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -499,11 +499,11 @@ test "AC-14.5: schema watcher hot-reloads; a broken file is rejected" {
     var ctx = SchemaWatchCtx{ .slot = &slot, .path = path };
     var stop = std.atomic.Value(bool).init(false);
     const t = try std.Thread.spawn(.{}, struct {
-        fn run(target: reload.WatchTarget, stp: *std.atomic.Value(bool)) void {
-            reload.watchPoll(target, 50, stp);
+        fn run(target: watcher.WatchTarget, stp: *std.atomic.Value(bool)) void {
+            watcher.watchPoll(target, 50, stp);
         }
     }.run, .{
-        reload.WatchTarget{ .path = path, .context = &ctx, .on_write = onSchemaChange },
+        watcher.WatchTarget{ .path = path, .context = &ctx, .on_write = onSchemaChange },
         &stop,
     });
     defer {

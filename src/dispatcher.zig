@@ -1,6 +1,6 @@
 // dispatcher.zig — outbound HTTP thread pool → Telegram API
 //
-// APICALL STRING-PAYLOAD OWNERSHIP CONTRACT (see TECH_DEBT.md TD-4)
+// APICALL STRING-PAYLOAD OWNERSHIP CONTRACT
 // ----------------------------------------------------------------
 // worker.zig transfers ownership of both heap-allocated strings inside each
 // ApiCall (`method` and `body`) to this dispatcher.  The dispatcher MUST free
@@ -13,13 +13,15 @@
 //
 // Failure to call types.freeApiCall leaks memory on every dispatched call.
 //
-// The dispatcher is API-agnostic (ADR-0001 §AD-1): it POSTs `body` verbatim
+// The dispatcher is API-agnostic: it POSTs `body` verbatim
 // to /bot<token>/<method> with Content-Type: application/json.  It does not
 // know — or need to know — which Telegram method it is calling.
 
 const std = @import("std");
 const types = @import("types.zig");
 const queue_mod = @import("queue.zig");
+const io_pool = @import("io_pool.zig");
+const metrics_mod = @import("metrics.zig");
 
 const log = std.log.scoped(.dispatcher);
 
@@ -33,10 +35,15 @@ pub const DispatcherArgs = struct {
     bot_token: []const u8,
     /// Base URL for the Telegram Bot API.
     /// Production: "https://api.telegram.org"
-    /// Tests:      "http://127.0.0.1:{port}"  (plain HTTP, no TLS, to a mock)
+    /// Tests:      "http://127.0.0.2:{port}"  (plain HTTP, no TLS, to a mock)
     api_base: []const u8,
     allocator: std.mem.Allocator,
     stop: *std.atomic.Value(bool),
+    /// Per-worker result queues indexed by worker_id.
+    /// Non-null only when tracked sends are expected. Existing tests pass null.
+    io_result_queues: ?[]*queue_mod.Queue(io_pool.IoResult) = null,
+    /// Optional metrics sink. Null means "don't count" (existing tests default to null).
+    metrics: ?*metrics_mod.Metrics = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,7 +71,7 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
         // Always free string payloads, whether send succeeds or not.
         defer types.freeApiCall(call, args.allocator);
 
-        sendWithRetry(&client, call, url_prefix, args.allocator) catch |err| {
+        sendWithRetry(&client, call, url_prefix, args.allocator, args.io_result_queues, args.metrics) catch |err| {
             log.warn("dispatcher {d}: dropped call after retry failure: {s}", .{ args.id, @errorName(err) });
         };
     }
@@ -76,38 +83,56 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
 // ---------------------------------------------------------------------------
 
 fn sendWithRetry(
-    client: *std.http.Client,
-    call: types.ApiCall,
-    url_prefix: []const u8,
-    allocator: std.mem.Allocator,
+    client:        *std.http.Client,
+    call:          types.ApiCall,
+    url_prefix:    []const u8,
+    allocator:     std.mem.Allocator,
+    result_queues: ?[]*queue_mod.Queue(io_pool.IoResult),
+    metrics:       ?*metrics_mod.Metrics,
 ) !void {
-    if (send(client, call, url_prefix, allocator)) {
+    if (send(client, call, url_prefix, allocator, result_queues, metrics)) {
         return;
     } else |err| {
-        log.warn("send failed ({s}), retrying in 1s", .{@errorName(err)});
-        std.Thread.sleep(1 * std.time.ns_per_s);
+        log.warn("send failed ({s}), retrying in 200ms", .{@errorName(err)});
+        std.Thread.sleep(200 * std.time.ns_per_ms);
         // Reinitialize the client so the retry always opens a fresh TCP
         // connection — any pooled connection from the failed attempt may be
         // broken and would cause a second WriteFailed/ReadFailed.
         client.deinit();
         client.* = std.http.Client{ .allocator = allocator };
-        try send(client, call, url_prefix, allocator);
+        send(client, call, url_prefix, allocator, result_queues, metrics) catch |retry_err| {
+            if (call.tracking) |tracking| {
+                pushTrackedErr(result_queues, tracking.worker_id, tracking.coro_id, @errorName(retry_err), allocator);
+            }
+            return retry_err;
+        };
     }
 }
 
 // ---------------------------------------------------------------------------
 // Private: single HTTP POST to the Telegram Bot API
 //
-// Generic by construction (ADR-0001 §AD-1): payload is switched on the
+// Generic by construction: payload is switched on the
 // ApiCall.payload union — JSON body POSTed verbatim, or multipart built
 // from parts.  No per-method branching.
 // ---------------------------------------------------------------------------
 
+/// Treat any non-2xx response as a retryable error, logging the status.
+/// Returns error.TelegramApiError so sendWithRetry triggers the single retry.
+fn checkStatus(status: std.http.Status, method: []const u8) !void {
+    if (status.class() != .success) {
+        log.warn("Telegram API returned HTTP {d} for {s}", .{ @intFromEnum(status), method });
+        return error.TelegramApiError;
+    }
+}
+
 fn send(
-    client:     *std.http.Client,
-    call:       types.ApiCall,
-    url_prefix: []const u8,
-    allocator:  std.mem.Allocator,
+    client:        *std.http.Client,
+    call:          types.ApiCall,
+    url_prefix:    []const u8,
+    allocator:     std.mem.Allocator,
+    result_queues: ?[]*queue_mod.Queue(io_pool.IoResult),
+    metrics:       ?*metrics_mod.Metrics,
 ) !void {
     const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ url_prefix, call.method });
     defer allocator.free(url);
@@ -115,20 +140,52 @@ fn send(
     switch (call.payload) {
         .json => |body| {
             log.debug("→ {s} (json) {s}", .{ call.method, body });
-            const result = try client.fetch(.{
-                .location      = .{ .url = url },
-                .payload       = body,
-                .keep_alive    = true,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "application/json" },
-                },
-            });
-            if (result.status.class() != .success) {
-                log.warn("Telegram API returned HTTP {d} for {s}",
-                    .{ @intFromEnum(result.status), call.method });
-                return error.TelegramApiError;
+            if (call.tracking) |tracking| {
+                // Tracked path: capture response body to extract message_id.
+                var al_writer = std.Io.Writer.Allocating.initCapacity(allocator, 512) catch |err| {
+                    // OOM allocating the response buffer — retryable, do not push IoResult here.
+                    return err;
+                };
+                defer al_writer.deinit();
+                const result = client.fetch(.{
+                    .location        = .{ .url = url },
+                    .payload         = body,
+                    .keep_alive      = true,
+                    .extra_headers   = &.{.{ .name = "Content-Type", .value = "application/json" }},
+                    .response_writer = &al_writer.writer,
+                }) catch |err| {
+                    // Network/TLS error — retryable, do not push IoResult here.
+                    return err;
+                };
+                // HTTP error — retryable, do not push IoResult here.
+                try checkStatus(result.status, call.method);
+                const resp_body = al_writer.toOwnedSlice() catch |err| {
+                    // OOM extracting body — retryable, do not push IoResult here.
+                    return err;
+                };
+                defer allocator.free(resp_body);
+                const message_id = parseMessageId(resp_body, allocator) catch {
+                    log.warn("tracked send: missing message_id in response for {s}", .{call.method});
+                    if (metrics) |m| _ = m.tracked_send_failures_total.fetchAdd(1, .monotonic);
+                    pushTrackedErr(result_queues, tracking.worker_id, tracking.coro_id, "missing message_id in response", allocator);
+                    return;
+                };
+                pushTrackedSend(result_queues, tracking.worker_id, tracking.coro_id, message_id);
+                log.debug("← {d} {s} tracked message_id={d}",
+                    .{ @intFromEnum(result.status), call.method, message_id });
+            } else {
+                // Existing untracked path — unchanged.
+                const result = try client.fetch(.{
+                    .location      = .{ .url = url },
+                    .payload       = body,
+                    .keep_alive    = true,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "application/json" },
+                    },
+                });
+                try checkStatus(result.status, call.method);
+                log.debug("← {d} {s}", .{ @intFromEnum(result.status), call.method });
             }
-            log.debug("← {d} {s}", .{ @intFromEnum(result.status), call.method });
         },
         .multipart => |parts| {
             const mb = try buildMultipartBody(parts, allocator);
@@ -145,18 +202,14 @@ fn send(
                     .{ .name = "Content-Type", .value = ct },
                 },
             });
-            if (result.status.class() != .success) {
-                log.warn("Telegram API returned HTTP {d} for {s}",
-                    .{ @intFromEnum(result.status), call.method });
-                return error.TelegramApiError;
-            }
+            try checkStatus(result.status, call.method);
             log.debug("← {d} {s}", .{ @intFromEnum(result.status), call.method });
         },
     }
 }
 
 // ---------------------------------------------------------------------------
-// Private: multipart body building (Phase 15)
+// Private: multipart body building
 // ---------------------------------------------------------------------------
 
 const MultipartBody = struct {
@@ -226,16 +279,78 @@ fn buildMultipartBody(
 }
 
 // ---------------------------------------------------------------------------
+// Private: tracked-send helpers
+// ---------------------------------------------------------------------------
+
+fn parseMessageId(body: []const u8, allocator: std.mem.Allocator) !i64 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const root_obj = switch (parsed.value) {
+        .object => |o| o,
+        else    => return error.NotFound,
+    };
+    const result_val = root_obj.get("result") orelse return error.NotFound;
+    const result_obj = switch (result_val) {
+        .object => |o| o,
+        else    => return error.NotFound,
+    };
+    const mid_val = result_obj.get("message_id") orelse return error.NotFound;
+    return switch (mid_val) {
+        .integer => |n| n,
+        else     => error.NotFound,
+    };
+}
+
+fn pushTrackedSend(
+    queues:     ?[]*queue_mod.Queue(io_pool.IoResult),
+    worker_id:  u8,
+    coro_id:    u32,
+    message_id: i64,
+) void {
+    const qs = queues orelse {
+        log.warn("tracked send: io_result_queues is null", .{});
+        return;
+    };
+    if (worker_id >= qs.len) {
+        log.warn("tracked send: worker_id {d} out of range (len={d})", .{ worker_id, qs.len });
+        return;
+    }
+    qs[worker_id].push(.{
+        .coro_id = coro_id,
+        .outcome = .{ .send = .{ .message_id = message_id } },
+    }) catch {
+        log.warn("tracked send: result queue full for worker {d}", .{worker_id});
+    };
+}
+
+fn pushTrackedErr(
+    queues:    ?[]*queue_mod.Queue(io_pool.IoResult),
+    worker_id: u8,
+    coro_id:   u32,
+    msg:       []const u8,
+    allocator: std.mem.Allocator,
+) void {
+    const qs = queues orelse return;
+    if (worker_id >= qs.len) return;
+    const duped = allocator.dupe(u8, msg) catch return;
+    qs[worker_id].push(.{
+        .coro_id = coro_id,
+        .outcome = .{ .err = duped },
+    }) catch {
+        allocator.free(duped);
+        log.warn("tracked send: result queue full for worker {d}", .{worker_id});
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
-// Sub-step 13a (ADR-0001): the per-method `buildBody` / `actionMethod`
-// unit tests are retired — the dispatcher no longer builds bodies or maps
-// method names.  Body construction moved to lua_engine's actionToApiCall
-// adapter (tested there: AC-6.2, AC-6.4).  Wire-level coverage is the
-// MockServer integration tests below (AC-13.2, AC-13.3, AC-13.4).
+// The dispatcher does not build bodies or map method names — body
+// construction lives in lua_engine.  Wire-level coverage is the MockServer
+// integration tests below.
 
 // ── Mock HTTP server ─────────────────────────────────────────────────────────
 
@@ -270,7 +385,7 @@ pub const MockServer = struct {
     pub fn init(allocator: std.mem.Allocator) !*MockServer {
         const self = try allocator.create(MockServer);
         errdefer allocator.destroy(self);
-        const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+        const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
         self.server = try addr.listen(.{ .reuse_address = true });
         errdefer self.server.deinit();
         self.allocator = allocator;
@@ -285,7 +400,7 @@ pub const MockServer = struct {
     pub fn deinit(self: *MockServer) void {
         self.stop.store(true, .release);
         // mockLoop polls with a 10ms timeout and re-checks stop on each
-        // iteration, so it will exit within ~10ms of seeing stop = true.
+        // iteration, so it exits within ~10ms of seeing stop = true.
         // The server fd is only closed below, after the thread has exited —
         // so mockLoop never sees a closed fd.
         self.thread.join();
@@ -304,7 +419,7 @@ pub const MockServer = struct {
     }
 
     pub fn baseUrl(self: *const MockServer, buf: []u8) []u8 {
-        return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}", .{
+        return std.fmt.bufPrint(buf, "http://127.0.0.2:{d}", .{
             std.mem.bigToNative(u16, self.port()),
         }) catch unreachable;
     }
@@ -323,7 +438,7 @@ pub const MockServer = struct {
 fn mockLoop(srv: *MockServer) void {
     const fd = srv.server.stream.handle;
     while (!srv.stop.load(.acquire)) {
-        // Poll with a short timeout so we re-check `stop` regularly without
+        // Poll with a short timeout to re-check `stop` regularly without
         // ever calling accept() on a closed fd.  The fd is only closed in
         // MockServer.deinit() *after* thread.join(), so it is always valid here.
         var pfd = std.posix.pollfd{
@@ -416,7 +531,7 @@ fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?Mock
     const content_type = try allocator.dupe(u8, content_type_raw);
     errdefer allocator.free(content_type);
 
-    // Ensure we have the full body.
+    // Ensure the full body is present.
     const body_start = he + 4;
     const needed = body_start + content_length;
     while (buf.items.len < needed) {
@@ -482,7 +597,7 @@ const TestDispatcher = struct {
     }
 };
 
-// ── Mock server integration tests (ADR-0001 sub-step 13a) ───────────────────
+// ── Mock server integration tests ──────────────────────────────────────────
 
 /// Push a JSON ApiCall with heap-duplicated method+body.  The dispatcher takes
 /// ownership and frees both after sending (ApiCall ownership contract).
@@ -493,7 +608,7 @@ fn pushCall(q: *queue_mod.Queue(types.ApiCall), method: []const u8, body: []cons
     });
 }
 
-test "AC-13.2: ApiCall POSTs to /bot{token}/{method} with verbatim JSON body" {
+test "ApiCall POSTs to /bot{token}/{method} with verbatim JSON body" {
     const mock = try MockServer.init(testing.allocator);
     defer mock.deinit();
 
@@ -514,9 +629,9 @@ test "AC-13.2: ApiCall POSTs to /bot{token}/{method} with verbatim JSON body" {
     );
 }
 
-test "AC-13.3: a method the dispatcher never names (sendDice) round-trips end-to-end" {
-    // Proof of API-agnosticism (ADR-0001 §AD-1): no code path special-cases
-    // "sendDice" — it reaches the wire purely because ApiCall.method is opaque.
+test "a method the dispatcher never names (sendDice) round-trips end-to-end" {
+    // Proof of API-agnosticism: no code path special-cases "sendDice" — it
+    // reaches the wire purely because ApiCall.method is opaque.
     const mock = try MockServer.init(testing.allocator);
     defer mock.deinit();
 
@@ -534,18 +649,18 @@ test "AC-13.3: a method the dispatcher never names (sendDice) round-trips end-to
     try testing.expectEqualStrings("{\"chat_id\":7}", req.body);
 }
 
-test "AC-13.4: dispatcher retries once after server closes connection; exactly 2 attempts" {
+test "dispatcher retries once after server closes connection; exactly 2 attempts" {
     // First connection: accept but immediately close without a response.
     // Second connection: answer normally.
     // The dispatcher must have retried exactly once.
 
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
     var server = try addr.listen(.{ .reuse_address = true });
     defer server.deinit();
 
     const srv_port = server.listen_address.in.sa.port;
     var url_buf: [64]u8 = undefined;
-    const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{
+    const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.2:{d}", .{
         std.mem.bigToNative(u16, srv_port),
     }) catch unreachable;
 
@@ -588,13 +703,13 @@ test "AC-13.4: dispatcher retries once after server closes connection; exactly 2
     try testing.expectEqual(@as(u32, 2), attempt_count.load(.acquire));
 }
 
-test "AC-13.4: both attempts fail — call discarded, no third attempt, no crash" {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+test "both attempts fail — call discarded, no third attempt, no crash" {
+    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
     var server = try addr.listen(.{ .reuse_address = true });
 
     const srv_port = server.listen_address.in.sa.port;
     var url_buf: [64]u8 = undefined;
-    const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{
+    const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.2:{d}", .{
         std.mem.bigToNative(u16, srv_port),
     }) catch unreachable;
 
@@ -616,7 +731,7 @@ test "AC-13.4: both attempts fail — call discarded, no third attempt, no crash
     }.run, .{ctx});
 
     // Close the server so the dispatcher can't make a third attempt.
-    // (We wait for both drops first, then close.)
+    // (Wait for both drops first, then close.)
 
     const d = try TestDispatcher.init(testing.allocator, "TOK", api_base);
     defer d.deinit();
@@ -630,9 +745,29 @@ test "AC-13.4: both attempts fail — call discarded, no third attempt, no crash
     try testing.expectEqual(@as(u32, 2), attempt_count.load(.acquire));
 }
 
-// Sub-step 13a: the former AC-9.7 (100-call concurrency) and AC-9.8 (dispatch
-// order) tests are retired.  Queue-level concurrency and FIFO ordering are
-// covered by queue.zig's AC-4.x; wire-level dispatch is covered by AC-13.2/3.
+test "parseMessageId extracts integer from valid response" {
+    const body = "{\"ok\":true,\"result\":{\"message_id\":42,\"chat\":{\"id\":1}}}";
+    const mid = try parseMessageId(body, testing.allocator);
+    try testing.expectEqual(@as(i64, 42), mid);
+}
+
+test "parseMessageId returns NotFound when message_id absent" {
+    const body = "{\"ok\":true,\"result\":{\"chat\":{\"id\":1}}}";
+    try testing.expectError(error.NotFound, parseMessageId(body, testing.allocator));
+}
+
+test "parseMessageId returns NotFound when result absent" {
+    const body = "{\"ok\":true}";
+    try testing.expectError(error.NotFound, parseMessageId(body, testing.allocator));
+}
+
+test "parseMessageId returns NotFound when message_id is not integer" {
+    const body = "{\"ok\":true,\"result\":{\"message_id\":\"notanint\"}}";
+    try testing.expectError(error.NotFound, parseMessageId(body, testing.allocator));
+}
+
+// Queue-level concurrency and FIFO ordering are covered by queue.zig;
+// wire-level dispatch is covered by the mock-server tests above.
 
 // ── Multipart boundary splitter (test-only helper) ───────────────────────────
 
@@ -667,8 +802,8 @@ fn splitMultipart(body: []const u8, boundary: []const u8, parts: [][]const u8) u
     return found;
 }
 
-// AC-15.1 — multipart ApiCall reaches mock server with correct Content-Type and parts
-test "AC-15.1: multipart ApiCall sends multipart/form-data with file part" {
+// multipart ApiCall reaches mock server with correct Content-Type and parts
+test "multipart ApiCall sends multipart/form-data with file part" {
     const alloc = testing.allocator;
     const mock = try MockServer.init(alloc);
     defer mock.deinit();
@@ -711,8 +846,8 @@ test "AC-15.1: multipart ApiCall sends multipart/form-data with file part" {
     try testing.expect(found_file);
 }
 
-// AC-15.2 — string-only params → JSON (regression: no multipart regression)
-test "AC-15.2: json ApiCall still sends application/json" {
+// string-only params → JSON (no multipart regression)
+test "json ApiCall still sends application/json" {
     const alloc = testing.allocator;
     const mock = try MockServer.init(alloc);
     defer mock.deinit();
@@ -734,8 +869,8 @@ test "AC-15.2: json ApiCall still sends application/json" {
     try testing.expectEqualStrings("{\"chat_id\":1,\"text\":\"hi\"}", req.body);
 }
 
-// AC-15.4 — mixed scalar + file → multipart with both parts on the wire
-test "AC-15.4: mixed multipart ApiCall contains both text and file parts" {
+// mixed scalar + file → multipart with both parts on the wire
+test "mixed multipart ApiCall contains both text and file parts" {
     const alloc = testing.allocator;
     const mock = try MockServer.init(alloc);
     defer mock.deinit();
@@ -785,8 +920,8 @@ test "AC-15.4: mixed multipart ApiCall contains both text and file parts" {
     try testing.expect(found_file);
 }
 
-// AC-24 — header injection: CRLF or quote in name/filename → error.InvalidHeaderValue
-test "AC-24: buildMultipartBody rejects CRLF in field name" {
+// header injection: CRLF or quote in name/filename → error.InvalidHeaderValue
+test "buildMultipartBody rejects CRLF in field name" {
     const alloc = testing.allocator;
     var parts = try alloc.alloc(types.MultipartPart, 1);
     parts[0] = .{
@@ -827,7 +962,7 @@ test "AC-24: buildMultipartBody rejects CRLF in field name" {
     try testing.expectEqual(@as(usize, 0), mock.received.len());
 }
 
-test "AC-24: buildMultipartBody rejects CRLF in filename" {
+test "buildMultipartBody rejects CRLF in filename" {
     const alloc = testing.allocator;
     const mock = try MockServer.init(alloc);
     defer mock.deinit();
@@ -855,7 +990,7 @@ test "AC-24: buildMultipartBody rejects CRLF in filename" {
 
 // ── Live integration test ─────────────────────────────────────────────────────
 
-test "AC-13.live: send real Telegram message via dispatcher" {
+test "send real Telegram message via dispatcher" {
     const token = std.posix.getenv("TELEGRAM_BOT_TOKEN") orelse return error.SkipZigTest;
     const chat_id_str = std.posix.getenv("TELEGRAM_CHAT_ID") orelse return error.SkipZigTest;
     const chat_id = try std.fmt.parseInt(i64, chat_id_str, 10);
@@ -865,7 +1000,7 @@ test "AC-13.live: send real Telegram message via dispatcher" {
 
     const body = try std.fmt.allocPrint(
         testing.allocator,
-        "{{\"chat_id\":{d},\"text\":\"zora dispatcher live — Phase 13a wired up.\"}}",
+        "{{\"chat_id\":{d},\"text\":\"zora dispatcher live test.\"}}",
         .{chat_id},
     );
     defer testing.allocator.free(body);
@@ -873,4 +1008,77 @@ test "AC-13.live: send real Telegram message via dispatcher" {
 
     // Give the dispatcher enough time to send and confirm.
     std.Thread.sleep(4 * std.time.ns_per_s);
+}
+
+// ── tracked_send_failures_total ──────────────────────────────────────────────
+
+test "tracked_send_failures_total increments when message_id absent in response" {
+    const alloc = testing.allocator;
+
+    // Inline stub: accepts one connection, returns 200 with a JSON body
+    // that has no message_id — triggers the parseMessageId catch path.
+    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const srv_port = server.listen_address.in.sa.port;
+    var url_buf: [64]u8 = undefined;
+    const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.2:{d}", .{
+        std.mem.bigToNative(u16, srv_port),
+    }) catch unreachable;
+
+    const srv_thread = try std.Thread.spawn(.{}, struct {
+        fn run(srv: *std.net.Server) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            var buf: [4096]u8 = undefined;
+            _ = conn.stream.read(&buf) catch {};
+            conn.stream.writeAll(
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: application/json\r\n" ++
+                "Content-Length: 11\r\n" ++
+                "\r\n" ++
+                "{\"ok\":true}",
+            ) catch {};
+        }
+    }.run, .{&server});
+
+    var m = metrics_mod.Metrics{};
+    var rq = try queue_mod.Queue(io_pool.IoResult).init(alloc, 8);
+    defer rq.deinit(alloc);
+    var rq_slice = [1]*queue_mod.Queue(io_pool.IoResult){&rq};
+
+    var stop = std.atomic.Value(bool).init(false);
+    var dq = try queue_mod.Queue(types.ApiCall).init(alloc, 16);
+    defer dq.deinit(alloc);
+
+    const disp_thread = try std.Thread.spawn(.{}, dispatcherThread, .{DispatcherArgs{
+        .id               = 0,
+        .queue            = &dq,
+        .bot_token        = "TOK",
+        .api_base         = api_base,
+        .allocator        = alloc,
+        .stop             = &stop,
+        .io_result_queues = &rq_slice,
+        .metrics          = &m,
+    }});
+
+    // Push a tracked sendMessage. Dispatcher owns method+payload after push.
+    try dq.push(.{
+        .method   = try alloc.dupe(u8, "sendMessage"),
+        .payload  = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1,\"text\":\"hi\"}") },
+        .tracking = .{ .worker_id = 0, .coro_id = 7 },
+    });
+
+    // Wait for the error IoResult pushed by pushTrackedErr (up to 2 s).
+    const maybe_result = rq.popTimeout(2_000 * std.time.ns_per_ms);
+    try testing.expect(maybe_result != null);
+    io_pool.freeIoResult(maybe_result.?, alloc);
+
+    // failure counter must be exactly 1.
+    try testing.expectEqual(@as(u64, 1), m.tracked_send_failures_total.load(.monotonic));
+
+    stop.store(true, .release);
+    disp_thread.join();
+    srv_thread.join();
 }

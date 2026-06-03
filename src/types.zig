@@ -6,7 +6,7 @@ const std = @import("std");
 const ziglua = @import("ziglua");
 
 // ---------------------------------------------------------------------------
-// ApiCall — generic outgoing Telegram API call (ADR-0001 §AD-1)
+// ApiCall — generic outgoing Telegram API call.
 //
 // The payload is a tagged union: `.json` for plain API calls (verbatim JSON
 // body), `.multipart` for calls that upload files (slice of MultipartPart).
@@ -27,6 +27,8 @@ pub const ApiCall = struct {
         json:      []const u8,      // verbatim JSON body — owned
         multipart: []MultipartPart, // slice of parts     — owned
     },
+    /// Non-null for tracked sends only. Value-typed — freeApiCall unchanged.
+    tracking: ?struct { worker_id: u8, coro_id: u32 } = null,
 };
 
 pub fn freeApiCall(call: ApiCall, allocator: std.mem.Allocator) void {
@@ -50,12 +52,11 @@ pub fn freeApiCalls(calls: []ApiCall, allocator: std.mem.Allocator) void {
 }
 
 // ---------------------------------------------------------------------------
-// WorkItem — one inbound webhook update queued for a worker (ADR-0001 §AD-2)
+// WorkItem — one inbound webhook update queued for a worker.
 //
-// The server no longer parses the webhook body into a typed Update tree.
-// It forwards the raw JSON `body` verbatim plus a `user_id` it point-extracts
-// for queue routing.  `body` is heap-allocated; the worker frees it after
-// `callOnMessage` returns.
+// The server forwards the raw JSON `body` verbatim plus a `user_id` it
+// point-extracts for queue routing.  `body` is heap-allocated; the worker
+// frees it after `callOnMessage` returns.
 // ---------------------------------------------------------------------------
 
 pub const WorkItem = struct {
@@ -68,7 +69,7 @@ pub const WorkItem = struct {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// ValidationMode — outgoing-call schema validation policy (ADR-0001 §AD-5)
+// ValidationMode — outgoing-call schema validation policy.
 //
 //   off    — no validation
 //   warn   — validate; log a warning on failure, send the call anyway
@@ -86,26 +87,29 @@ pub const Config = struct {
     worker_count:       u8,
     queue_capacity:     u16,
     dispatcher_threads: u8,
+    conn_pool_threads:  u8,
     schema_file:        [:0]const u8,
     api_validation:     ValidationMode,
     api_base:           []const u8,
     multipart_max_file: usize,
+    json_max_bytes:     usize,
+    io_pool_threads:    u8,
+    io_queue_capacity:  u16,
+    io_job_timeout_ms:  u64,
+    proc_max_output:         usize,
+    max_inflight_per_worker: u16,
+    workflow_deadline_ms:    u64,
+    metrics_log:             bool,
 };
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-// AC-1.1 (typed Update/Message/CallbackQuery instantiation + effectiveUserId)
-// and AC-1.2 (Action tagged-union) retired in sub-step 13c — the typed Update
-// tree and Action union are removed.  Inbound routing is now AC-13.6
-// (server-side extractUserId); outbound calls are AC-13.11.
-
-// ---------------------------------------------------------------------------
-// AC-13.1 — ApiCall lifecycle (no leaks under testing.allocator)
+// ApiCall lifecycle — no leaks under testing.allocator
 // ---------------------------------------------------------------------------
 
-test "AC-13.1: freeApiCall releases method and body" {
+test "freeApiCall releases method and body" {
     const call = ApiCall{
         .method  = try std.testing.allocator.dupe(u8, "sendDice"),
         .payload = .{ .json = try std.testing.allocator.dupe(u8, "{\"chat_id\":1}") },
@@ -113,7 +117,7 @@ test "AC-13.1: freeApiCall releases method and body" {
     freeApiCall(call, std.testing.allocator);
 }
 
-test "AC-13.1: freeApiCalls releases a slice of ApiCalls" {
+test "freeApiCalls releases a slice of ApiCalls" {
     var calls = try std.testing.allocator.alloc(ApiCall, 3);
     calls[0] = .{
         .method  = try std.testing.allocator.dupe(u8, "sendMessage"),
@@ -131,10 +135,10 @@ test "AC-13.1: freeApiCalls releases a slice of ApiCalls" {
 }
 
 // ---------------------------------------------------------------------------
-// AC-15.5 — freeApiCall handles multipart payload (no leaks)
+// freeApiCall handles multipart payload — no leaks
 // ---------------------------------------------------------------------------
 
-test "AC-15.5: freeApiCall on multipart ApiCall releases all parts" {
+test "freeApiCall on multipart ApiCall releases all parts" {
     const alloc = std.testing.allocator;
     var parts = try alloc.alloc(MultipartPart, 2);
     parts[0] = .{
@@ -154,11 +158,33 @@ test "AC-15.5: freeApiCall on multipart ApiCall releases all parts" {
     freeApiCall(call, alloc);
 }
 
-test "AC-15.5: freeApiCall on json ApiCall releases body" {
+test "freeApiCall on json ApiCall releases body" {
     const alloc = std.testing.allocator;
     const call = ApiCall{
         .method  = try alloc.dupe(u8, "sendMessage"),
         .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1}") },
     };
     freeApiCall(call, alloc);
+}
+
+test "ApiCall tracking field defaults null, can be set, freeApiCall unchanged" {
+    const alloc = std.testing.allocator;
+    // tracked call
+    const tracked = ApiCall{
+        .method   = try alloc.dupe(u8, "sendMessage"),
+        .payload  = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1}") },
+        .tracking = .{ .worker_id = 2, .coro_id = 99 },
+    };
+    defer freeApiCall(tracked, alloc);
+    try std.testing.expect(tracked.tracking != null);
+    try std.testing.expectEqual(@as(u8, 2),  tracked.tracking.?.worker_id);
+    try std.testing.expectEqual(@as(u32, 99), tracked.tracking.?.coro_id);
+
+    // untracked call — default null
+    const plain = ApiCall{
+        .method  = try alloc.dupe(u8, "sendMessage"),
+        .payload = .{ .json = try alloc.dupe(u8, "{}") },
+    };
+    defer freeApiCall(plain, alloc);
+    try std.testing.expect(plain.tracking == null);
 }
