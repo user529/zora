@@ -103,6 +103,10 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.EnvMap) Config
     const workflow_deadline_ms    = try parseUint(u64, env, "WORKFLOW_DEADLINE_MS", 60_000);
     const metrics_log             = try parseBool(env, "METRICS_LOG", true);
 
+    const delay_queue_capacity   = try parseUint(u16, env, "DELAY_QUEUE_CAPACITY", 4096);
+    const retry_after_max_ms     = try parseUint(u64, env, "RETRY_AFTER_MAX_MS", 60_000);
+    const retry_after_default_ms = try parseUint(u64, env, "RETRY_AFTER_DEFAULT_MS", 1_000);
+
     return Config{
         .bot_token          = bot_token,
         .webhook_secret     = webhook_secret,
@@ -125,6 +129,9 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.EnvMap) Config
         .max_inflight_per_worker = max_inflight_per_worker,
         .workflow_deadline_ms    = workflow_deadline_ms,
         .metrics_log             = metrics_log,
+        .delay_queue_capacity    = delay_queue_capacity,
+        .retry_after_max_ms      = retry_after_max_ms,
+        .retry_after_default_ms  = retry_after_default_ms,
     };
 }
 
@@ -210,7 +217,7 @@ fn makeEnv(allocator: std.mem.Allocator, pairs: []const [2][]const u8) !std.proc
     return env;
 }
 
-test "all required and optional vars set — returns correct Config" {
+test "loads every field from a fully populated environment" {
     var env = try makeEnv(testing.allocator, &.{
         .{ "BOT_TOKEN",          "tok123" },
         .{ "WEBHOOK_SECRET",     "sec456" },
@@ -233,29 +240,17 @@ test "all required and optional vars set — returns correct Config" {
     try testing.expectEqual(@as(u32, 8), cfg.worker_count);
     try testing.expectEqual(@as(u32, 512), cfg.queue_capacity);
     try testing.expectEqual(@as(u32, 2), cfg.dispatcher_threads);
+
+    // Field types: the numeric fields are unsigned ints and the parsed listen
+    // address carries a non-zero port.
+    const wc: u32 = cfg.worker_count;
+    try testing.expectEqual(@as(u32, 8), wc);
+    const qc: u32 = cfg.queue_capacity;
+    try testing.expectEqual(@as(u32, 512), qc);
+    try testing.expect(cfg.listen_addr.in.sa.port != 0);
 }
 
-test "BOT_TOKEN absent returns error.MissingRequiredField" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env.deinit();
-
-    const result = loadFromMap(testing.allocator, env);
-    try testing.expectError(error.MissingRequiredField, result);
-}
-
-test "WEBHOOK_SECRET absent returns error.MissingRequiredField" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN", "tok" },
-    });
-    defer env.deinit();
-
-    const result = loadFromMap(testing.allocator, env);
-    try testing.expectError(error.MissingRequiredField, result);
-}
-
-test "all optional fields absent — defaults applied" {
+test "applies defaults when optional fields are absent" {
     var env = try makeEnv(testing.allocator, &.{
         .{ "BOT_TOKEN",      "tok" },
         .{ "WEBHOOK_SECRET", "sec" },
@@ -269,189 +264,121 @@ test "all optional fields absent — defaults applied" {
     try testing.expectEqualStrings("state.db", cfg.db_path);
     try testing.expectEqual(@as(u32, 1024), cfg.queue_capacity);
     try testing.expect(cfg.dispatcher_threads >= 2);
-    // listen_addr default: 0.0.0.0:8443
-    const expected_addr = try std.net.Address.parseIpAndPort("0.0.0.0:8443");
-    try testing.expectEqual(expected_addr.in.sa.port, cfg.listen_addr.in.sa.port);
+    // LISTEN_ADDR default is 0.0.0.0:8443 (port in network byte order).
+    try testing.expectEqual(std.mem.nativeToBig(u16, 8443), cfg.listen_addr.in.sa.port);
 }
 
-test "CONN_POOL_THREADS: explicit value parsed; absent → default >= 2" {
-    // Explicit value.
-    var env1 = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-        .{ "CONN_POOL_THREADS", "5" },
-    });
-    defer env1.deinit();
-    const cfg1 = try loadFromMap(testing.allocator, env1);
-    defer deinit(cfg1, testing.allocator);
-    try testing.expectEqual(@as(u8, 5), cfg1.conn_pool_threads);
-
-    // Absent → cpuScaledThreads(1) (CPU count, min 2).
-    var env2 = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env2.deinit();
-    const cfg2 = try loadFromMap(testing.allocator, env2);
-    defer deinit(cfg2, testing.allocator);
-    try testing.expect(cfg2.conn_pool_threads >= 2);
-}
-
-test "DISPATCHER_THREADS absent → 2 * cpu_count, minimum 2" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env.deinit();
-
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-
+test "thread counts scale with CPU and accept explicit overrides" {
     const cpu_count = std.Thread.getCpuCount() catch 1;
-    const expected: u8 = @max(2, @as(u8, @intCast(
-        @min(cpu_count * 2, @as(usize, std.math.maxInt(u8))))));
-    try testing.expectEqual(expected, cfg.dispatcher_threads);
-    try testing.expect(cfg.dispatcher_threads >= 2);
+
+    // Absent: worker/dispatcher/conn-pool default to CPU-scaled values (min 2).
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+
+        // WORKER_COUNT → cpu_count, minimum 2.
+        const exp_worker: u32 = @max(2, @as(u32, @intCast(@min(cpu_count, @as(usize, std.math.maxInt(u32))))));
+        try testing.expectEqual(exp_worker, cfg.worker_count);
+        try testing.expect(cfg.worker_count >= 2);
+
+        // DISPATCHER_THREADS → 2 * cpu_count, minimum 2.
+        const exp_disp: u8 = @max(2, @as(u8, @intCast(@min(cpu_count * 2, @as(usize, std.math.maxInt(u8))))));
+        try testing.expectEqual(exp_disp, cfg.dispatcher_threads);
+        try testing.expect(cfg.dispatcher_threads >= 2);
+
+        // CONN_POOL_THREADS → cpu_count, minimum 2.
+        try testing.expect(cfg.conn_pool_threads >= 2);
+    }
+    // An explicit CONN_POOL_THREADS is used verbatim.
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            .{ "CONN_POOL_THREADS", "5" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(u8, 5), cfg.conn_pool_threads);
+    }
 }
 
-test "WORKER_COUNT absent — defaults to cpu_count, minimum 2" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env.deinit();
-
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-
-    const cpu_count = std.Thread.getCpuCount() catch 1;
-    const expected: u32 = @max(2, @as(u32, @intCast(@min(cpu_count, @as(usize, std.math.maxInt(u32))))));
-    try testing.expectEqual(expected, cfg.worker_count);
-    try testing.expect(cfg.worker_count >= 2);
+test "WORKER_COUNT trims whitespace and accepts the minimum of 1" {
+    // Whitespace around the value is trimmed.
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            .{ "WORKER_COUNT", "  4  " },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(u32, 4), cfg.worker_count);
+    }
+    // 1 is accepted (the minimum boundary).
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            .{ "WORKER_COUNT", "1" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(u32, 1), cfg.worker_count);
+    }
 }
 
-test "WORKER_COUNT non-numeric returns error.InvalidConfig" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-        .{ "WORKER_COUNT",   "not_a_number" },
-    });
-    defer env.deinit();
-
-    const result = loadFromMap(testing.allocator, env);
-    try testing.expectError(error.InvalidConfig, result);
+test "missing a required field returns MissingRequiredField" {
+    // BOT_TOKEN absent.
+    {
+        var env = try makeEnv(testing.allocator, &.{.{ "WEBHOOK_SECRET", "sec" }});
+        defer env.deinit();
+        try testing.expectError(error.MissingRequiredField, loadFromMap(testing.allocator, env));
+    }
+    // WEBHOOK_SECRET absent.
+    {
+        var env = try makeEnv(testing.allocator, &.{.{ "BOT_TOKEN", "tok" }});
+        defer env.deinit();
+        try testing.expectError(error.MissingRequiredField, loadFromMap(testing.allocator, env));
+    }
+    // Both absent → the first missing field errors.
+    {
+        var env = try makeEnv(testing.allocator, &.{});
+        defer env.deinit();
+        try testing.expectError(error.MissingRequiredField, loadFromMap(testing.allocator, env));
+    }
 }
 
-test "WORKER_COUNT float string returns error.InvalidConfig" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-        .{ "WORKER_COUNT",   "3.5" },
-    });
-    defer env.deinit();
-
-    const result = loadFromMap(testing.allocator, env);
-    try testing.expectError(error.InvalidConfig, result);
+test "numeric fields reject non-numeric input" {
+    // Every integer field rejects a value that is not a base-10 integer. The
+    // float case guards against accidental parseFloat tolerance.
+    const cases = [_]struct { key: []const u8, val: []const u8 }{
+        .{ .key = "WORKER_COUNT",            .val = "not_a_number" },
+        .{ .key = "WORKER_COUNT",            .val = "3.5" },
+        .{ .key = "QUEUE_CAPACITY",          .val = "lots" },
+        .{ .key = "DISPATCHER_THREADS",      .val = "four" },
+        .{ .key = "IO_POOL_THREADS",         .val = "many" },
+        .{ .key = "MAX_INFLIGHT_PER_WORKER", .val = "lots" },
+        .{ .key = "WORKFLOW_DEADLINE_MS",    .val = "never" },
+        .{ .key = "JSON_MAX_BYTES",          .val = "abc" },
+    };
+    for (cases) |c| {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            .{ c.key, c.val },
+        });
+        defer env.deinit();
+        testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env)) catch |e| {
+            std.debug.print("field {s}={s} did not return InvalidConfig\n", .{ c.key, c.val });
+            return e;
+        };
+    }
 }
 
-test "QUEUE_CAPACITY non-numeric returns error.InvalidConfig" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",       "tok" },
-        .{ "WEBHOOK_SECRET",  "sec" },
-        .{ "QUEUE_CAPACITY",  "lots" },
-    });
-    defer env.deinit();
-
-    const result = loadFromMap(testing.allocator, env);
-    try testing.expectError(error.InvalidConfig, result);
-}
-
-test "DISPATCHER_THREADS non-numeric returns error.InvalidConfig" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",           "tok" },
-        .{ "WEBHOOK_SECRET",      "sec" },
-        .{ "DISPATCHER_THREADS",  "four" },
-    });
-    defer env.deinit();
-
-    const result = loadFromMap(testing.allocator, env);
-    try testing.expectError(error.InvalidConfig, result);
-}
-
-test "Config fields have correct types" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-        .{ "WORKER_COUNT",   "4" },
-    });
-    defer env.deinit();
-
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-
-    // worker_count is u32
-    const wc: u32 = cfg.worker_count;
-    try testing.expectEqual(@as(u32, 4), wc);
-
-    // queue_capacity is u32
-    const qc: u32 = cfg.queue_capacity;
-    try testing.expectEqual(@as(u32, 1024), qc);
-
-    // listen_addr is std.net.Address — verify it holds a port
-    const port = cfg.listen_addr.in.sa.port;
-    try testing.expect(port != 0);
-}
-
-test "LISTEN_ADDR default parses to 0.0.0.0:8443" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env.deinit();
-
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-
-    // Port 8443 in network byte order
-    const expected_port = std.mem.nativeToBig(u16, 8443);
-    try testing.expectEqual(expected_port, cfg.listen_addr.in.sa.port);
-}
-
-test "WORKER_COUNT whitespace-trimmed value parses correctly" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-        .{ "WORKER_COUNT",   "  4  " },
-    });
-    defer env.deinit();
-
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-
-    try testing.expectEqual(@as(u32, 4), cfg.worker_count);
-}
-
-test "both required fields absent — first missing field errors" {
-    var env = try makeEnv(testing.allocator, &.{});
-    defer env.deinit();
-
-    const result = loadFromMap(testing.allocator, env);
-    try testing.expectError(error.MissingRequiredField, result);
-}
-
-test "WORKER_COUNT=1 is accepted (minimum boundary)" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-        .{ "WORKER_COUNT",   "1" },
-    });
-    defer env.deinit();
-
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-
-    try testing.expectEqual(@as(u32, 1), cfg.worker_count);
-}
-
-test "BOT_API_BASE absent → default; present → used" {
+test "BOT_API_BASE absent uses the default; present is used" {
     var env_default = try makeEnv(testing.allocator, &.{
         .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
     });
@@ -501,7 +428,7 @@ test "API_VALIDATION parsed; default warn; invalid → InvalidConfig" {
     try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env_bad));
 }
 
-test "SCHEMA_FILE absent → default; present → used" {
+test "SCHEMA_FILE absent uses the default; present is used" {
     var env_default = try makeEnv(testing.allocator, &.{
         .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
     });
@@ -520,223 +447,164 @@ test "SCHEMA_FILE absent → default; present → used" {
     try testing.expectEqualStrings("/etc/zora/api.json", cfg_set.schema_file);
 }
 
-test "MULTIPART_MAX_FILE parses correctly" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",           "tok" },
-        .{ "WEBHOOK_SECRET",      "sec" },
-        .{ "MULTIPART_MAX_FILE",  "10485760" },
-    });
-    defer env.deinit();
-
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-    try testing.expectEqual(@as(usize, 10485760), cfg.multipart_max_file);
+test "MULTIPART_MAX_FILE parses a value and defaults to 50 MB" {
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            .{ "MULTIPART_MAX_FILE", "10485760" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(usize, 10485760), cfg.multipart_max_file);
+    }
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(usize, 52428800), cfg.multipart_max_file);
+    }
 }
 
-test "MULTIPART_MAX_FILE defaults to 52428800" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env.deinit();
-
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-    try testing.expectEqual(@as(usize, 52428800), cfg.multipart_max_file);
+test "JSON_MAX_BYTES parses a value and defaults to 1 MB" {
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(usize, 1048576), cfg.json_max_bytes);
+    }
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            .{ "JSON_MAX_BYTES", "524288" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(usize, 524288), cfg.json_max_bytes);
+    }
 }
 
-// ---------------------------------------------------------------------------
-// JSON_MAX_BYTES
-// ---------------------------------------------------------------------------
-
-test "JSON_MAX_BYTES absent → default 1048576" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env.deinit();
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-    try testing.expectEqual(@as(usize, 1048576), cfg.json_max_bytes);
+test "io_pool fields parse explicit values and apply defaults" {
+    // Absent → defaults.
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(u8,    8),      cfg.io_pool_threads);
+        try testing.expectEqual(@as(u16,   256),    cfg.io_queue_capacity);
+        try testing.expectEqual(@as(u64,   30_000), cfg.io_job_timeout_ms);
+        try testing.expectEqual(@as(usize, 65_536), cfg.proc_max_output);
+    }
+    // Present → parsed.
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN",         "tok" }, .{ "WEBHOOK_SECRET",   "sec" },
+            .{ "IO_POOL_THREADS",   "8" },   .{ "IO_QUEUE_CAPACITY", "512" },
+            .{ "IO_JOB_TIMEOUT_MS", "10000" }, .{ "PROC_MAX_OUTPUT", "131072" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(u8,    8),       cfg.io_pool_threads);
+        try testing.expectEqual(@as(u16,   512),     cfg.io_queue_capacity);
+        try testing.expectEqual(@as(u64,   10_000),  cfg.io_job_timeout_ms);
+        try testing.expectEqual(@as(usize, 131_072), cfg.proc_max_output);
+    }
 }
 
-test "JSON_MAX_BYTES set to 524288" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-        .{ "JSON_MAX_BYTES", "524288" },
-    });
-    defer env.deinit();
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-    try testing.expectEqual(@as(usize, 524288), cfg.json_max_bytes);
+test "MAX_INFLIGHT_PER_WORKER and WORKFLOW_DEADLINE_MS parse and default" {
+    // Absent → defaults.
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(u16, 64),     cfg.max_inflight_per_worker);
+        try testing.expectEqual(@as(u64, 60_000), cfg.workflow_deadline_ms);
+    }
+    // Present → parsed.
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            .{ "MAX_INFLIGHT_PER_WORKER", "32" }, .{ "WORKFLOW_DEADLINE_MS", "30000" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(u16, 32),     cfg.max_inflight_per_worker);
+        try testing.expectEqual(@as(u64, 30_000), cfg.workflow_deadline_ms);
+    }
 }
 
-test "JSON_MAX_BYTES invalid → error.InvalidConfig" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-        .{ "JSON_MAX_BYTES", "abc" },
-    });
-    defer env.deinit();
-    try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
+test "METRICS_LOG parses booleans and rejects invalid values" {
+    const ok = [_]struct { val: ?[]const u8, want: bool }{
+        .{ .val = null,    .want = true },  // absent → default true
+        .{ .val = "false", .want = false },
+        .{ .val = "0",     .want = false },
+        .{ .val = "true",  .want = true },
+    };
+    for (ok) |c| {
+        var env = if (c.val) |v|
+            try makeEnv(testing.allocator, &.{
+                .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" }, .{ "METRICS_LOG", v },
+            })
+        else
+            try makeEnv(testing.allocator, &.{
+                .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(c.want, cfg.metrics_log);
+    }
+    // An unrecognised value is rejected.
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" }, .{ "METRICS_LOG", "yes" },
+        });
+        defer env.deinit();
+        try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
+    }
 }
 
-// ---------------------------------------------------------------------------
-// io_pool config fields
-// ---------------------------------------------------------------------------
-
-test "io_pool env vars absent → defaults applied" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env.deinit();
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-
-    try testing.expectEqual(@as(u8,    8),      cfg.io_pool_threads);
-    try testing.expectEqual(@as(u16,   256),    cfg.io_queue_capacity);
-    try testing.expectEqual(@as(u64,   30_000), cfg.io_job_timeout_ms);
-    try testing.expectEqual(@as(usize, 65_536), cfg.proc_max_output);
-}
-
-test "io_pool env vars set → parsed correctly" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",           "tok" },
-        .{ "WEBHOOK_SECRET",      "sec" },
-        .{ "IO_POOL_THREADS",     "8" },
-        .{ "IO_QUEUE_CAPACITY",   "512" },
-        .{ "IO_JOB_TIMEOUT_MS",   "10000" },
-        .{ "PROC_MAX_OUTPUT",     "131072" },
-    });
-    defer env.deinit();
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-
-    try testing.expectEqual(@as(u8,    8),       cfg.io_pool_threads);
-    try testing.expectEqual(@as(u16,   512),     cfg.io_queue_capacity);
-    try testing.expectEqual(@as(u64,   10_000),  cfg.io_job_timeout_ms);
-    try testing.expectEqual(@as(usize, 131_072), cfg.proc_max_output);
-}
-
-test "IO_POOL_THREADS non-numeric → error.InvalidConfig" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",       "tok" },
-        .{ "WEBHOOK_SECRET",  "sec" },
-        .{ "IO_POOL_THREADS", "many" },
-    });
-    defer env.deinit();
-    try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
-}
-
-// ---------------------------------------------------------------------------
-// MAX_INFLIGHT_PER_WORKER + WORKFLOW_DEADLINE_MS
-// ---------------------------------------------------------------------------
-
-test "MAX_INFLIGHT_PER_WORKER and WORKFLOW_DEADLINE_MS absent → defaults" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env.deinit();
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-
-    try testing.expectEqual(@as(u16, 64),     cfg.max_inflight_per_worker);
-    try testing.expectEqual(@as(u64, 60_000), cfg.workflow_deadline_ms);
-}
-
-test "MAX_INFLIGHT_PER_WORKER and WORKFLOW_DEADLINE_MS set → parsed" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",              "tok" },
-        .{ "WEBHOOK_SECRET",         "sec" },
-        .{ "MAX_INFLIGHT_PER_WORKER", "32" },
-        .{ "WORKFLOW_DEADLINE_MS",   "30000" },
-    });
-    defer env.deinit();
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-
-    try testing.expectEqual(@as(u16, 32),     cfg.max_inflight_per_worker);
-    try testing.expectEqual(@as(u64, 30_000), cfg.workflow_deadline_ms);
-}
-
-test "MAX_INFLIGHT_PER_WORKER non-numeric → error.InvalidConfig" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",              "tok"  },
-        .{ "WEBHOOK_SECRET",         "sec"  },
-        .{ "MAX_INFLIGHT_PER_WORKER", "lots" },
-    });
-    defer env.deinit();
-    try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
-}
-
-test "WORKFLOW_DEADLINE_MS non-numeric → error.InvalidConfig" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",           "tok"   },
-        .{ "WEBHOOK_SECRET",      "sec"   },
-        .{ "WORKFLOW_DEADLINE_MS", "never" },
-    });
-    defer env.deinit();
-    try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
-}
-
-// ── METRICS_LOG config ──────────────────────────────────────────────
-
-test "METRICS_LOG absent → default true" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env.deinit();
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-    try testing.expect(cfg.metrics_log == true);
-}
-
-test "METRICS_LOG=false → false" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok"   },
-        .{ "WEBHOOK_SECRET", "sec"   },
-        .{ "METRICS_LOG",    "false" },
-    });
-    defer env.deinit();
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-    try testing.expect(cfg.metrics_log == false);
-}
-
-test "METRICS_LOG=0 → false" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-        .{ "METRICS_LOG",    "0"   },
-    });
-    defer env.deinit();
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-    try testing.expect(cfg.metrics_log == false);
-}
-
-test "METRICS_LOG=true → true" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok"  },
-        .{ "WEBHOOK_SECRET", "sec"  },
-        .{ "METRICS_LOG",    "true" },
-    });
-    defer env.deinit();
-    const cfg = try loadFromMap(testing.allocator, env);
-    defer deinit(cfg, testing.allocator);
-    try testing.expect(cfg.metrics_log == true);
-}
-
-test "METRICS_LOG invalid value → error.InvalidConfig" {
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "sec" },
-        .{ "METRICS_LOG",    "yes" },
-    });
-    defer env.deinit();
-    try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
+test "throttle config defaults and overrides" {
+    // Defaults (only required keys provided).
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "t" }, .{ "WEBHOOK_SECRET", "s" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(u16, 4096),  cfg.delay_queue_capacity);
+        try testing.expectEqual(@as(u64, 60000), cfg.retry_after_max_ms);
+        try testing.expectEqual(@as(u64, 1000),  cfg.retry_after_default_ms);
+    }
+    // Overrides.
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "t" }, .{ "WEBHOOK_SECRET", "s" },
+            .{ "DELAY_QUEUE_CAPACITY", "256" },
+            .{ "RETRY_AFTER_MAX_MS", "30000" },
+            .{ "RETRY_AFTER_DEFAULT_MS", "500" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(u16, 256),   cfg.delay_queue_capacity);
+        try testing.expectEqual(@as(u64, 30000), cfg.retry_after_max_ms);
+        try testing.expectEqual(@as(u64, 500),   cfg.retry_after_default_ms);
+    }
 }

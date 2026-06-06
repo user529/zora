@@ -318,111 +318,85 @@ test "fresh in-memory DB creates all tables without error" {
     }
 }
 
-test "after schema, meta contains schema_version = '1'" {
+test "schema_version is seeded, matched on open, and mismatch is rejected" {
+    // A fresh DB seeds meta.schema_version = '1'.
+    {
+        var store = try openMem();
+        defer store.close();
+        const stmt = try store.prepare("SELECT value FROM meta WHERE key = 'schema_version'");
+        defer _ = c.sqlite3_finalize(stmt);
+        try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+        const text = c.sqlite3_column_text(stmt, 0);
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        try testing.expect(text != null);
+        try testing.expectEqualStrings("1", text[0..len]);
+    }
+    // Opening with a matching version succeeds (open() checks implicitly).
+    {
+        var store = try openMem();
+        store.close();
+    }
+    // Opening a DB whose stored version differs returns SchemaMismatch.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_path = try tmp.dir.realpath(".", &path_buf);
+        var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+        const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/v.db", .{dir_path});
+
+        // First open creates and seeds schema_version = '1'.
+        var store = try StateStore.open(testing.allocator, db_path);
+        // Corrupt the stored version to '99'.
+        const upd = try store.prepare("UPDATE meta SET value = '99' WHERE key = 'schema_version'");
+        _ = c.sqlite3_step(upd);
+        _ = c.sqlite3_finalize(upd);
+        store.close();
+
+        // The second open detects the mismatch.
+        try testing.expectError(error.SchemaMismatch, StateStore.open(testing.allocator, db_path));
+    }
+}
+
+test "state round-trips for user, chat, and global" {
     var store = try openMem();
     defer store.close();
 
-    const stmt = try store.prepare("SELECT value FROM meta WHERE key = 'schema_version'");
-    defer _ = c.sqlite3_finalize(stmt);
+    // user_state
+    try store.setUserState(42, "{\"count\":7}");
+    const u = try store.getUserState(42);
+    defer testing.allocator.free(u);
+    try testing.expectEqualStrings("{\"count\":7}", u);
 
-    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
-    const text = c.sqlite3_column_text(stmt, 0);
-    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-    try testing.expect(text != null);
-    try testing.expectEqualStrings("1", text[0..len]);
-}
-
-test "opening a DB with matching schema_version succeeds" {
-    // open() implicitly checks — if it returns Ok, version matches
-    var store = try openMem();
-    store.close();
-}
-
-test "opening a DB with mismatched schema_version returns SchemaMismatch" {
-    // Create a file-based DB and manually corrupt the schema_version.
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path = try tmp.dir.realpath(".", &path_buf);
-    var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/v.db", .{dir_path});
-
-    // First open: creates and seeds schema_version = '1'
-    var store = try StateStore.open(testing.allocator, db_path);
-
-    // Corrupt schema_version to '99'
-    const upd = try store.prepare("UPDATE meta SET value = '99' WHERE key = 'schema_version'");
-    _ = c.sqlite3_step(upd);
-    _ = c.sqlite3_finalize(upd);
-    store.close();
-
-    // Second open: should detect mismatch and return error
-    const result = StateStore.open(testing.allocator, db_path);
-    try testing.expectError(error.SchemaMismatch, result);
-}
-
-test "setUserState / getUserState round-trip" {
-    var store = try openMem();
-    defer store.close();
-
-    const data = "{\"count\":7}";
-    try store.setUserState(42, data);
-    const got = try store.getUserState(42);
-    defer testing.allocator.free(got);
-
-    try testing.expectEqualStrings(data, got);
-}
-
-test "getUserState for unknown user_id returns '{}'" {
-    var store = try openMem();
-    defer store.close();
-
-    const got = try store.getUserState(999_999);
-    defer testing.allocator.free(got);
-
-    try testing.expectEqualStrings("{}", got);
-}
-
-test "setChatState / getChatState round-trip" {
-    var store = try openMem();
-    defer store.close();
-
+    // chat_state
     try store.setChatState(-100, "{\"muted\":true}");
-    const got = try store.getChatState(-100);
-    defer testing.allocator.free(got);
+    const ch = try store.getChatState(-100);
+    defer testing.allocator.free(ch);
+    try testing.expectEqualStrings("{\"muted\":true}", ch);
 
-    try testing.expectEqualStrings("{\"muted\":true}", got);
-}
-
-test "getChatState for unknown chat_id returns '{}'" {
-    var store = try openMem();
-    defer store.close();
-
-    const got = try store.getChatState(1);
-    defer testing.allocator.free(got);
-
-    try testing.expectEqualStrings("{}", got);
-}
-
-test "setGlobal / getGlobal round-trip" {
-    var store = try openMem();
-    defer store.close();
-
+    // global_state
     try store.setGlobal("total", "99");
-    const got = try store.getGlobal("total");
-    defer if (got) |v| testing.allocator.free(v);
-
-    try testing.expect(got != null);
-    try testing.expectEqualStrings("99", got.?);
+    const g = try store.getGlobal("total");
+    defer if (g) |v| testing.allocator.free(v);
+    try testing.expect(g != null);
+    try testing.expectEqualStrings("99", g.?);
 }
 
-test "getGlobal for missing key returns null" {
+test "unknown keys return the empty default" {
     var store = try openMem();
     defer store.close();
 
-    const got = try store.getGlobal("no_such_key");
-    try testing.expectEqual(@as(?[]u8, null), got);
+    // Unknown user/chat ids return "{}".
+    const u = try store.getUserState(999_999);
+    defer testing.allocator.free(u);
+    try testing.expectEqualStrings("{}", u);
+
+    const ch = try store.getChatState(1);
+    defer testing.allocator.free(ch);
+    try testing.expectEqualStrings("{}", ch);
+
+    // A missing global key returns null.
+    try testing.expectEqual(@as(?[]u8, null), try store.getGlobal("no_such_key"));
 }
 
 test "3 connections on same file-based DB, concurrent reads, WAL confirmed" {
@@ -468,59 +442,50 @@ test "3 connections on same file-based DB, concurrent reads, WAL confirmed" {
     try testing.expectEqualStrings("wal", jm_text[0..jm_len]);
 }
 
-test "setUserState upserts — second write overwrites first" {
+test "a second write upserts over the first" {
     var store = try openMem();
     defer store.close();
 
+    // user_state upsert.
     try store.setUserState(1, "{\"v\":\"A\"}");
     try store.setUserState(1, "{\"v\":\"B\"}");
+    const u = try store.getUserState(1);
+    defer testing.allocator.free(u);
+    try testing.expectEqualStrings("{\"v\":\"B\"}", u);
 
-    const got = try store.getUserState(1);
-    defer testing.allocator.free(got);
-
-    try testing.expectEqualStrings("{\"v\":\"B\"}", got);
-}
-
-test "setGlobal upserts — second write overwrites first" {
-    var store = try openMem();
-    defer store.close();
-
+    // global_state upsert.
     try store.setGlobal("k", "first");
     try store.setGlobal("k", "second");
-
-    const got = try store.getGlobal("k");
-    defer if (got) |v| testing.allocator.free(v);
-
-    try testing.expectEqualStrings("second", got.?);
+    const g = try store.getGlobal("k");
+    defer if (g) |v| testing.allocator.free(v);
+    try testing.expectEqualStrings("second", g.?);
 }
 
-test "beginImmediate + commit persists write" {
+test "an immediate transaction commits and rolls back" {
     var store = try openMem();
     defer store.close();
 
+    // commit persists the write.
     try store.beginImmediate();
     try store.setUserState(1, "{\"x\":42}");
     try store.commit();
+    {
+        const data = try store.getUserState(1);
+        defer store.allocator.free(data);
+        try testing.expect(std.mem.indexOf(u8, data, "\"x\":42") != null);
+    }
 
-    const data = try store.getUserState(1);
-    defer store.allocator.free(data);
-    try testing.expect(std.mem.indexOf(u8, data, "\"x\":42") != null);
-}
-
-test "beginImmediate + rollback reverts write" {
-    var store = try openMem();
-    defer store.close();
-
-    try store.setUserState(1, "{\"x\":0}");
-
+    // rollback reverts the write to the last committed value.
+    try store.setUserState(2, "{\"x\":0}");
     try store.beginImmediate();
-    try store.setUserState(1, "{\"x\":99}");
+    try store.setUserState(2, "{\"x\":99}");
     store.rollback();
-
-    const data = try store.getUserState(1);
-    defer store.allocator.free(data);
-    try testing.expect(std.mem.indexOf(u8, data, "\"x\":0") != null);
-    try testing.expect(std.mem.indexOf(u8, data, "\"x\":99") == null);
+    {
+        const data = try store.getUserState(2);
+        defer store.allocator.free(data);
+        try testing.expect(std.mem.indexOf(u8, data, "\"x\":0") != null);
+        try testing.expect(std.mem.indexOf(u8, data, "\"x\":99") == null);
+    }
 }
 
 /// Count live (un-finalized) prepared statements on a connection.
@@ -531,7 +496,7 @@ fn countStmts(db: *c.sqlite3) usize {
     return n;
 }
 
-test "AC-CACHE-4: open prepares exactly 6 cached statements; close() tears down cleanly" {
+test "open prepares exactly 6 cached statements; close tears down cleanly" {
     var store = try openMem();
     // Exactly the six cached CRUD statements are live after open().
     try testing.expectEqual(@as(usize, 6), countStmts(store.db));
@@ -541,7 +506,7 @@ test "AC-CACHE-4: open prepares exactly 6 cached statements; close() tears down 
     store.close();
 }
 
-test "AC-CACHE-4: finalizing the six cached statements lets sqlite3_close return OK" {
+test "finalizing the six cached statements lets sqlite3_close return OK" {
     // White-box check mirroring close()'s teardown: finalizing exactly the six
     // cached statements leaves no live statement, so sqlite3_close returns
     // SQLITE_OK (it would return SQLITE_BUSY if any statement were still live).
@@ -556,7 +521,7 @@ test "AC-CACHE-4: finalizing the six cached statements lets sqlite3_close return
     try testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_close(store.db));
 }
 
-test "AC-CACHE-5: prepareInto finalizes the prepared prefix on a mid-sequence failure" {
+test "prepareInto finalizes the prepared prefix on a mid-sequence failure" {
     var store = try openMem();
     defer store.close();
 
@@ -572,7 +537,7 @@ test "AC-CACHE-5: prepareInto finalizes the prepared prefix on a mid-sequence fa
     try testing.expectEqual(before, countStmts(store.db));
 }
 
-test "AC-CACHE-2: setGlobal/getGlobal reuse the cached statement (count stays 6)" {
+test "setGlobal/getGlobal reuse the cached statement (count stays 6)" {
     var store = try openMem();
     defer store.close();
 
@@ -590,7 +555,7 @@ test "AC-CACHE-2: setGlobal/getGlobal reuse the cached statement (count stays 6)
     try testing.expectEqual(@as(usize, 6), countStmts(store.db));
 }
 
-test "AC-CACHE-3: user/chat statements reset cleanly across mixed access" {
+test "user/chat statements reset cleanly across mixed access" {
     var store = try openMem();
     defer store.close();
 
@@ -621,7 +586,7 @@ test "AC-CACHE-3: user/chat statements reset cleanly across mixed access" {
     try testing.expectEqual(@as(usize, 6), countStmts(store.db));
 }
 
-test "AC-CACHE-3: global statement reset is clean across mixed read/write/miss" {
+test "global statement reset is clean across mixed read/write/miss" {
     var store = try openMem();
     defer store.close();
 

@@ -186,6 +186,16 @@ pub fn getCtx(lua: *Lua) *ApiCtx {
 ///   { __file_bytes = "...", filename = "name" }   — inline bytes
 ///
 /// Errors: error.FileTooLarge, error.MissingFilename, file-read errors, OOM.
+/// Read an integer `chat_id` from a Lua params table, if present. Leaves the
+/// stack balanced. Returns null when absent or non-integer.
+fn extractChatId(lua: *Lua, params_idx: i32) ?i64 {
+    if (!lua.isTable(params_idx)) return null;
+    _ = lua.getField(params_idx, "chat_id");
+    defer lua.pop(1);
+    if (!lua.isInteger(-1)) return null;
+    return lua.toInteger(-1) catch null;
+}
+
 pub fn buildApiCall(
     lua:        *Lua,
     params_idx: i32,
@@ -196,11 +206,14 @@ pub fn buildApiCall(
     const method_owned = try alloc.dupe(u8, method);
     errdefer alloc.free(method_owned);
 
+    const chat_id: ?i64 = extractChatId(lua, params_idx);
+
     // No params → JSON "{}"
     if (!lua.isTable(params_idx)) {
         return .{
             .method  = method_owned,
             .payload = .{ .json = try alloc.dupe(u8, "{}") },
+            .route   = if (chat_id) |c| .{ .chat_id = c } else null,
         };
     }
 
@@ -341,6 +354,7 @@ pub fn buildApiCall(
         return .{
             .method  = method_owned,
             .payload = .{ .multipart = try parts.toOwnedSlice(alloc) },
+            .route   = if (chat_id) |c| .{ .chat_id = c } else null,
         };
     }
 
@@ -356,6 +370,7 @@ pub fn buildApiCall(
     return .{
         .method  = method_owned,
         .payload = .{ .json = body },
+        .route   = if (chat_id) |c| .{ .chat_id = c } else null,
     };
 }
 
@@ -837,6 +852,7 @@ fn botSendMessageTracked(state: ?*ziglua.LuaState) callconv(.c) c_int {
         .method   = method,
         .payload  = .{ .json = body },
         .tracking = .{ .worker_id = 0, .coro_id = 0 },
+        .route    = if (extractChatId(lua, 1)) |c| .{ .chat_id = c } else null,
     }};
 
     lua.yieldCont(0, 0, trackedSendCont);
@@ -848,7 +864,7 @@ fn botSendMessageTracked(state: ?*ziglua.LuaState) callconv(.c) c_int {
 
 const testing = std.testing;
 
-test "bot.set_user_state + bot.get_user_state round-trip" {
+test "state round-trips through bot.*" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
 
@@ -860,55 +876,19 @@ test "bot.set_user_state + bot.get_user_state round-trip" {
     lua.openBase();
     register(lua, &ctx, 1);
 
-    // set_user_state(1, {count = 3})
+    // User, chat, and global state each round-trip; a missing key reads back nil.
     try lua.doString(
         \\bot.set_user_state(1, {count = 3})
-    );
-
-    // get_user_state(1) → push table onto stack
-    try lua.doString(
-        \\local s = bot.get_user_state(1)
-        \\assert(s.count == 3, "expected count=3 got " .. tostring(s.count))
-    );
-}
-
-test "bot.set_chat_state + bot.get_chat_state round-trip" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-
-    var ctx = testCtx(&db);
-
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    try lua.doString(
+        \\local u = bot.get_user_state(1)
+        \\assert(u.count == 3, "expected count=3 got " .. tostring(u.count))
+        \\
         \\bot.set_chat_state(42, {step = "started"})
-        \\local s = bot.get_chat_state(42)
-        \\assert(s.step == "started", "expected step=started got " .. tostring(s.step))
-    );
-}
-
-test "bot.get_global / bot.set_global" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-
-    var ctx = testCtx(&db);
-
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    try lua.doString(
+        \\local c = bot.get_chat_state(42)
+        \\assert(c.step == "started", "expected step=started got " .. tostring(c.step))
+        \\
         \\bot.set_global("counter", "42")
-        \\local v = bot.get_global("counter")
-        \\assert(v == "42", "expected 42 got " .. tostring(v))
-        \\local missing = bot.get_global("__no_such_key__")
-        \\assert(missing == nil, "expected nil for missing key")
+        \\assert(bot.get_global("counter") == "42", "global round-trip failed")
+        \\assert(bot.get_global("__no_such_key__") == nil, "expected nil for missing key")
     );
 }
 
@@ -1005,6 +985,8 @@ test "tg.<method>{...} == bot.emit{method=...,params=...}" {
     const json_body = actions[0].payload.json;
     try testing.expect(std.mem.indexOf(u8, json_body, "\"chat_id\":7") != null);
     try testing.expect(std.mem.indexOf(u8, json_body, "\"text\":\"via facade\"") != null);
+    try testing.expect(actions[0].route != null);
+    try testing.expectEqual(@as(i64, 7), actions[0].route.?.chat_id);
 }
 
 test "two engines have independent ApiCtx (no registry aliasing)" {
@@ -1046,73 +1028,69 @@ test "two engines have independent ApiCtx (no registry aliasing)" {
 // a file larger than max_file_bytes → error.FileTooLarge
 // ---------------------------------------------------------------------------
 
-test "buildApiCall with __file descriptor returns multipart" {
+test "buildApiCall builds multipart and enforces the file limit" {
     const alloc = testing.allocator;
     var db = try state_store.StateStore.open(alloc, ":memory:");
     defer db.close();
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "img.jpg", .data = "\xff\xd8\xff" });
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("img.jpg", &path_buf);
 
-    var ctx = ApiCtx{ .db = &db, .allocator = alloc, .max_file_bytes = 1024, .json_max_bytes = 1048576 };
     var lua = try Lua.init(alloc);
     defer lua.deinit();
     lua.openBase();
-    register(lua, &ctx, 1);
 
-    // Build params table: { photo = { __file = path } }
-    lua.newTable();           // params at index 1
-    lua.newTable();           // descriptor at index 2
-    _ = lua.pushString(path);
-    lua.setField(-2, "__file"); // descriptor.__file = path
-    lua.setField(-2, "photo");  // params.photo = descriptor
-    const params_idx: i32 = lua.getTop();
+    // A __file descriptor under the limit becomes a multipart part.
+    {
+        try tmp.dir.writeFile(.{ .sub_path = "img.jpg", .data = "\xff\xd8\xff" });
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try tmp.dir.realpath("img.jpg", &path_buf);
 
-    const call = try buildApiCall(lua, params_idx, "sendPhoto", &ctx);
-    defer types.freeApiCall(call, alloc);
+        var ctx = ApiCtx{ .db = &db, .allocator = alloc, .max_file_bytes = 1024, .json_max_bytes = 1048576 };
+        register(lua, &ctx, 1);
 
-    try testing.expectEqualStrings("sendPhoto", call.method);
-    switch (call.payload) {
-        .multipart => |parts| {
-            try testing.expectEqual(@as(usize, 1), parts.len);
-            try testing.expectEqualStrings("photo", parts[0].name);
-            try testing.expectEqualStrings("\xff\xd8\xff", parts[0].content);
-            try testing.expectEqualStrings("img.jpg", parts[0].filename.?);
-        },
-        .json => return error.ExpectedMultipart,
+        // Build params table: { photo = { __file = path } }
+        lua.newTable();             // params
+        lua.newTable();             // descriptor
+        _ = lua.pushString(path);
+        lua.setField(-2, "__file"); // descriptor.__file = path
+        lua.setField(-2, "photo");  // params.photo = descriptor
+        const params_idx: i32 = lua.getTop();
+
+        const call = try buildApiCall(lua, params_idx, "sendPhoto", &ctx);
+        defer types.freeApiCall(call, alloc);
+        lua.setTop(0);
+
+        try testing.expectEqualStrings("sendPhoto", call.method);
+        switch (call.payload) {
+            .multipart => |parts| {
+                try testing.expectEqual(@as(usize, 1), parts.len);
+                try testing.expectEqualStrings("photo", parts[0].name);
+                try testing.expectEqualStrings("\xff\xd8\xff", parts[0].content);
+                try testing.expectEqualStrings("img.jpg", parts[0].filename.?);
+            },
+            .json => return error.ExpectedMultipart,
+        }
     }
-}
+    // A file larger than the limit → FileTooLarge (11 bytes, limit 10).
+    {
+        try tmp.dir.writeFile(.{ .sub_path = "big.bin", .data = "hello world" });
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try tmp.dir.realpath("big.bin", &path_buf);
 
-test "buildApiCall returns FileTooLarge when file exceeds limit" {
-    const alloc = testing.allocator;
-    var db = try state_store.StateStore.open(alloc, ":memory:");
-    defer db.close();
+        var ctx = ApiCtx{ .db = &db, .allocator = alloc, .max_file_bytes = 10, .json_max_bytes = 1048576 };
+        register(lua, &ctx, 1);
 
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    // 11 bytes, limit is 10
-    try tmp.dir.writeFile(.{ .sub_path = "big.bin", .data = "hello world" });
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("big.bin", &path_buf);
+        lua.newTable();
+        lua.newTable();
+        _ = lua.pushString(path);
+        lua.setField(-2, "__file");
+        lua.setField(-2, "photo");
+        const params_idx: i32 = lua.getTop();
 
-    var ctx = ApiCtx{ .db = &db, .allocator = alloc, .max_file_bytes = 10, .json_max_bytes = 1048576 };
-    var lua = try Lua.init(alloc);
-    defer lua.deinit();
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    lua.newTable();
-    lua.newTable();
-    _ = lua.pushString(path);
-    lua.setField(-2, "__file");
-    lua.setField(-2, "photo");
-    const params_idx: i32 = lua.getTop();
-
-    const result = buildApiCall(lua, params_idx, "sendPhoto", &ctx);
-    try testing.expectError(error.FileTooLarge, result);
+        try testing.expectError(error.FileTooLarge, buildApiCall(lua, params_idx, "sendPhoto", &ctx));
+        lua.setTop(0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,89 +1112,80 @@ fn testCtx(db: *state_store.StateStore) ApiCtx {
     return testCtxCap(db, 1048576);
 }
 
-test "json.decode parses valid JSON to Lua table" {
+test "json.decode handles valid, oversized, and malformed input" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = testCtx(&db);
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
     lua.openBase();
-    register(lua, &ctx, 1);
 
-    try lua.doString(
-        \\local t = json.decode('{"ok":true,"n":42}')
-        \\assert(t.ok == true,  "expected ok=true got " .. tostring(t.ok))
-        \\assert(t.n  == 42,    "expected n=42 got "   .. tostring(t.n))
-    );
+    // Valid JSON decodes to a Lua table (default 1 MB cap).
+    {
+        var ctx = testCtx(&db);
+        register(lua, &ctx, 1);
+        try lua.doString(
+            \\local t = json.decode('{"ok":true,"n":42}')
+            \\assert(t.ok == true,  "expected ok=true got " .. tostring(t.ok))
+            \\assert(t.n  == 42,    "expected n=42 got "   .. tostring(t.n))
+        );
+    }
+    // Oversized input raises a Lua error; the state survives for later code.
+    {
+        var ctx = testCtxCap(&db, 4); // tiny cap
+        register(lua, &ctx, 1);
+        const result = lua.doString("json.decode('{\"ok\":true}')");
+        if (result) |_| return error.TestExpectedLuaError else |_| {}
+        try lua.doString("local x = 1 + 1");
+    }
+    // Malformed JSON raises a Lua error (doString restores the stack).
+    {
+        var ctx = testCtx(&db);
+        register(lua, &ctx, 1);
+        const result = lua.doString("json.decode('{bad json}')");
+        if (result) |_| return error.TestExpectedLuaError else |_| {}
+    }
 }
 
-test "json.decode on oversized string raises Lua error, worker survives" {
+test "json.encode enforces size and depth limits" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
-    var ctx = testCtxCap(&db, 4); // tiny cap
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
     lua.openBase();
-    register(lua, &ctx, 1);
 
-    const result = lua.doString(
-        \\json.decode('{"ok":true}')
-    );
-    if (result) |_| return error.TestExpectedLuaError else |_| {}
-
-    // Worker survives: can still run normal Lua code
-    try lua.doString("local x = 1 + 1");
-}
-
-test "json.decode on malformed JSON raises Lua error, stack clean" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    const top_before = lua.getTop();
-    const result = lua.doString(
-        \\json.decode('{bad json}')
-    );
-    if (result) |_| return error.TestExpectedLuaError else |_| {}
-    // doString restores on error; stack must be as before the call
-    _ = top_before;
-}
-
-test "json.encode returns valid JSON string" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    try lua.doString(
-        \\local s = json.encode({a = 1, b = "x"})
-        \\assert(type(s) == "string", "expected string got " .. type(s))
-        \\local t = json.decode(s)
-        \\assert(t.a == 1,   "expected a=1 got " .. tostring(t.a))
-        \\assert(t.b == "x", "expected b=x got " .. tostring(t.b))
-    );
-}
-
-test "json.encode on table exceeding json_max_bytes raises Lua error" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtxCap(&db, 10); // tiny cap
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    const result = lua.doString(
-        \\json.encode({key = "this is a long value that exceeds the cap"})
-    );
-    if (result) |_| return error.TestExpectedLuaError else |_| {}
+    // A small table encodes to a string that decodes back (default cap).
+    {
+        var ctx = testCtx(&db);
+        register(lua, &ctx, 1);
+        try lua.doString(
+            \\local s = json.encode({a = 1, b = "x"})
+            \\assert(type(s) == "string", "expected string got " .. type(s))
+            \\local t = json.decode(s)
+            \\assert(t.a == 1,   "expected a=1 got " .. tostring(t.a))
+            \\assert(t.b == "x", "expected b=x got " .. tostring(t.b))
+        );
+    }
+    // A table over json_max_bytes raises a Lua error.
+    {
+        var ctx = testCtxCap(&db, 10); // tiny cap
+        register(lua, &ctx, 1);
+        const result = lua.doString(
+            \\json.encode({key = "this is a long value that exceeds the cap"})
+        );
+        if (result) |_| return error.TestExpectedLuaError else |_| {}
+    }
+    // A table nested past the depth limit raises a Lua error.
+    {
+        var ctx = testCtx(&db);
+        register(lua, &ctx, 1);
+        const result = lua.doString(
+            \\local t = {}
+            \\local cur = t
+            \\for i = 1, 9 do cur.inner = {}; cur = cur.inner end
+            \\json.encode(t)
+        );
+        if (result) |_| return error.TestExpectedLuaError else |_| {}
+    }
 }
 
 test "json.decode(json.encode(t)) round-trips" {
@@ -1237,26 +1206,7 @@ test "json.decode(json.encode(t)) round-trips" {
     );
 }
 
-test "json.encode on 9-level nested table raises Lua error" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    // Build a 9-level deep Lua table and try to encode it.
-    const result = lua.doString(
-        \\local t = {}
-        \\local cur = t
-        \\for i = 1, 9 do cur.inner = {}; cur = cur.inner end
-        \\json.encode(t)
-    );
-    if (result) |_| return error.TestExpectedLuaError else |_| {}
-}
-
-test "bot.url_encode encodes correctly" {
+test "bot.url_encode encodes reserved and passes unreserved chars" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
     var ctx = testCtx(&db);
@@ -1266,24 +1216,10 @@ test "bot.url_encode encodes correctly" {
     register(lua, &ctx, 1);
 
     try lua.doString(
-        \\local s = bot.url_encode("hello world&q=1")
-        \\assert(s == "hello%20world%26q%3D1",
-        \\       "got: " .. s)
-    );
-}
-
-test "bot.url_encode unreserved chars pass through" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    try lua.doString(
-        \\local s = bot.url_encode("Az09-_.~")
-        \\assert(s == "Az09-_.~", "unreserved chars changed: " .. s)
+        \\assert(bot.url_encode("hello world&q=1") == "hello%20world%26q%3D1",
+        \\       "reserved: " .. bot.url_encode("hello world&q=1"))
+        \\assert(bot.url_encode("Az09-_.~") == "Az09-_.~",
+        \\       "unreserved chars changed: " .. bot.url_encode("Az09-_.~"))
     );
 }
 
@@ -1321,77 +1257,80 @@ test "json.* and bot.url_encode/shell_quote available without require" {
     );
 }
 
-test "bot.send_message sets pending_job to .tracked_send" {
+test "bot.send_message produces a tracked send with merged opts" {
     const lua_engine_mod = @import("lua_engine.zig");
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var engine = try lua_engine_mod.LuaEngine.init(testing.allocator, &ctx);
-    defer engine.deinit();
 
-    // A rule that calls bot.send_message yields.
-    try engine.loadString(
-        \\function on_message(u)
-        \\  local mid = bot.send_message{ chat_id = 1, text = "hi" }
-        \\  return {}
-        \\end
-    );
+    // A bare send yields a .tracked_send stamped with the worker/coro ids.
+    {
+        var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+        defer db.close();
+        var ctx = testCtx(&db);
+        var engine = try lua_engine_mod.LuaEngine.init(testing.allocator, &ctx);
+        defer engine.deinit();
 
-    // startHandler returns .yielded with a .tracked_send pending job
-    const outcome = try engine.startHandler("{}", 7, 3, testing.allocator);
-    switch (outcome) {
-        .yielded => |y| {
-            defer lua_engine_mod.teardownCoro(engine.lua, y.handle);
-            switch (y.pending_job) {
-                .tracked_send => |call| {
-                    defer types.freeApiCall(call, testing.allocator);
-                    try testing.expectEqualStrings("sendMessage", call.method);
-                    try testing.expect(call.tracking != null);
-                    try testing.expectEqual(@as(u8, 3),  call.tracking.?.worker_id);
-                    try testing.expectEqual(@as(u32, 7), call.tracking.?.coro_id);
-                    try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"chat_id\":1") != null);
-                    try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"text\":\"hi\"") != null);
-                },
-                .io => return error.ExpectedTrackedSend,
-            }
-        },
-        .done => return error.ExpectedYield,
-        .err  => return error.ExpectedYield,
+        try engine.loadString(
+            \\function on_message(u)
+            \\  local mid = bot.send_message{ chat_id = 1, text = "hi" }
+            \\  return {}
+            \\end
+        );
+
+        const outcome = try engine.startHandler("{}", 7, 3, testing.allocator);
+        switch (outcome) {
+            .yielded => |y| {
+                defer lua_engine_mod.teardownCoro(engine.lua, y.handle);
+                switch (y.pending_job) {
+                    .tracked_send => |call| {
+                        defer types.freeApiCall(call, testing.allocator);
+                        try testing.expectEqualStrings("sendMessage", call.method);
+                        try testing.expect(call.tracking != null);
+                        try testing.expectEqual(@as(u8, 3),  call.tracking.?.worker_id);
+                        try testing.expectEqual(@as(u32, 7), call.tracking.?.coro_id);
+                        try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"chat_id\":1") != null);
+                        try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"text\":\"hi\"") != null);
+                        try testing.expect(call.route != null);
+                        try testing.expectEqual(@as(i64, 1), call.route.?.chat_id);
+                    },
+                    .io => return error.ExpectedTrackedSend,
+                }
+            },
+            .done => return error.ExpectedYield,
+            .err  => return error.ExpectedYield,
+        }
     }
-}
+    // opts are merged into the JSON body.
+    {
+        var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+        defer db.close();
+        var ctx = testCtx(&db);
+        var engine = try lua_engine_mod.LuaEngine.init(testing.allocator, &ctx);
+        defer engine.deinit();
 
-test "bot.send_message merges opts into JSON body" {
-    const lua_engine_mod = @import("lua_engine.zig");
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var engine = try lua_engine_mod.LuaEngine.init(testing.allocator, &ctx);
-    defer engine.deinit();
+        try engine.loadString(
+            \\function on_message(u)
+            \\  local mid = bot.send_message{
+            \\    chat_id = 5,
+            \\    text    = "hello",
+            \\    opts    = { parse_mode = "HTML" }
+            \\  }
+            \\  return {}
+            \\end
+        );
 
-    try engine.loadString(
-        \\function on_message(u)
-        \\  local mid = bot.send_message{
-        \\    chat_id = 5,
-        \\    text    = "hello",
-        \\    opts    = { parse_mode = "HTML" }
-        \\  }
-        \\  return {}
-        \\end
-    );
-
-    const outcome = try engine.startHandler("{}", 1, 0, testing.allocator);
-    switch (outcome) {
-        .yielded => |y| {
-            defer lua_engine_mod.teardownCoro(engine.lua, y.handle);
-            switch (y.pending_job) {
-                .tracked_send => |call| {
-                    defer types.freeApiCall(call, testing.allocator);
-                    try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"parse_mode\":\"HTML\"") != null);
-                    try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"chat_id\":5") != null);
-                },
-                .io => return error.ExpectedTrackedSend,
-            }
-        },
-        else => return error.ExpectedYield,
+        const outcome = try engine.startHandler("{}", 1, 0, testing.allocator);
+        switch (outcome) {
+            .yielded => |y| {
+                defer lua_engine_mod.teardownCoro(engine.lua, y.handle);
+                switch (y.pending_job) {
+                    .tracked_send => |call| {
+                        defer types.freeApiCall(call, testing.allocator);
+                        try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"parse_mode\":\"HTML\"") != null);
+                        try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"chat_id\":5") != null);
+                    },
+                    .io => return error.ExpectedTrackedSend,
+                }
+            },
+            else => return error.ExpectedYield,
+        }
     }
 }

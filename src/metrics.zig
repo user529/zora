@@ -16,4 +16,26 @@ pub const Metrics = struct {
 
     // Dispatcher
     tracked_send_failures_total: std.atomic.Value(u64) = .init(0),
+    response_oversize_total:     std.atomic.Value(u64) = .init(0), // replies over the response ceiling, dropped
+
+    // Throttle / reactive rate limiting
+    throttle_429_total:     std.atomic.Value(u64) = .init(0), // 429s observed
+    throttle_delayed_total: std.atomic.Value(u64) = .init(0), // calls parked in delay_q
+    throttle_shed_total:    std.atomic.Value(u64) = .init(0), // delay_q overflow drops
+    throttle_delay_depth:   std.atomic.Value(i64) = .init(0), // gauge: delay_q size
 };
+
+const testing = std.testing;
+
+test "throttle counters default to zero and increment" {
+    var m = Metrics{};
+    try testing.expectEqual(@as(u64, 0), m.throttle_429_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.throttle_delayed_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.throttle_shed_total.load(.monotonic));
+    _ = m.throttle_429_total.fetchAdd(1, .monotonic);
+    _ = m.throttle_delayed_total.fetchAdd(2, .monotonic);
+    _ = m.throttle_shed_total.fetchAdd(3, .monotonic);
+    try testing.expectEqual(@as(u64, 1), m.throttle_429_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), m.throttle_delayed_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 3), m.throttle_shed_total.load(.monotonic));
+}

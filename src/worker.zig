@@ -856,84 +856,74 @@ test "worker thread alive (not exited) after 200ms with empty queue" {
     try testing.expectEqual(@as(usize, 0), ctx.input_q.len());
 }
 
-test "worker in strict mode drops calls that fail schema validation" {
+test "schema validation mode drops or keeps a failing call" {
     const SCHEMA =
         \\{"methods":{"sendMessage":{"fields":[
         \\  {"name":"chat_id","types":["Integer","String"],"required":true},
         \\  {"name":"text","types":["String"],"required":true}
         \\]}},"types":{}}
     ;
-    var slot = tg_schema.SchemaSlot.init(testing.allocator);
-    slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA));
-
-    var ctx = try TestCtx.init(testing.allocator,
-        // returns sendMessage with only chat_id — missing required `text`
+    // The rule returns sendMessage with only chat_id — the required `text` is missing.
+    const RULE =
         \\function on_message(u)
         \\  return { { method="sendMessage", params={ chat_id=1 } } }
         \\end
-    );
-    const args = WorkerArgs{
-        .id               = 0,
-        .rules_path       = ctx.rules_path,
-        .allocator        = testing.allocator,
-        .queue            = &ctx.input_q,
-        .dispatcher_queue = &ctx.output_q,
-        .db               = &ctx.db,
-        .stop             = &ctx.stop,
-        .reload_ver       = &ctx.reload_ver,
-        .schema           = &slot,
-        .validation       = .strict,
-    };
-    const t = try std.Thread.spawn(.{}, workerThread, .{args});
-    // Cleanup order: join worker first, then free slot.
-    defer { ctx.deinit(t); slot.deinit(); }
-
-    std.Thread.sleep(30 * std.time.ns_per_ms);
-    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
-    std.Thread.sleep(100 * std.time.ns_per_ms);
-
-    // strict mode: missing required `text` → call dropped, dispatcher queue stays empty
-    try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
-}
-
-test "worker in warn mode keeps calls that fail schema validation" {
-    const SCHEMA =
-        \\{"methods":{"sendMessage":{"fields":[
-        \\  {"name":"chat_id","types":["Integer","String"],"required":true},
-        \\  {"name":"text","types":["String"],"required":true}
-        \\]}},"types":{}}
     ;
-    var slot = tg_schema.SchemaSlot.init(testing.allocator);
-    slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA));
 
-    var ctx = try TestCtx.init(testing.allocator,
-        \\function on_message(u)
-        \\  return { { method="sendMessage", params={ chat_id=1 } } }
-        \\end
-    );
-    const args = WorkerArgs{
-        .id               = 0,
-        .rules_path       = ctx.rules_path,
-        .allocator        = testing.allocator,
-        .queue            = &ctx.input_q,
-        .dispatcher_queue = &ctx.output_q,
-        .db               = &ctx.db,
-        .stop             = &ctx.stop,
-        .reload_ver       = &ctx.reload_ver,
-        .schema           = &slot,
-        .validation       = .warn,
-    };
-    const t = try std.Thread.spawn(.{}, workerThread, .{args});
-    defer { ctx.deinit(t); slot.deinit(); }
+    // strict mode: the invalid call is dropped, the dispatcher queue stays empty.
+    {
+        var slot = tg_schema.SchemaSlot.init(testing.allocator);
+        slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA));
+        var ctx = try TestCtx.init(testing.allocator, RULE);
+        const args = WorkerArgs{
+            .id               = 0,
+            .rules_path       = ctx.rules_path,
+            .allocator        = testing.allocator,
+            .queue            = &ctx.input_q,
+            .dispatcher_queue = &ctx.output_q,
+            .db               = &ctx.db,
+            .stop             = &ctx.stop,
+            .reload_ver       = &ctx.reload_ver,
+            .schema           = &slot,
+            .validation       = .strict,
+        };
+        const t = try std.Thread.spawn(.{}, workerThread, .{args});
+        // Cleanup order: join worker first, then free slot.
+        defer { ctx.deinit(t); slot.deinit(); }
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
-    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
-    try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
+        std.Thread.sleep(30 * std.time.ns_per_ms);
+        try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+        try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
+    }
+    // warn mode: the same invalid call is kept (logged but forwarded).
+    {
+        var slot = tg_schema.SchemaSlot.init(testing.allocator);
+        slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA));
+        var ctx = try TestCtx.init(testing.allocator, RULE);
+        const args = WorkerArgs{
+            .id               = 0,
+            .rules_path       = ctx.rules_path,
+            .allocator        = testing.allocator,
+            .queue            = &ctx.input_q,
+            .dispatcher_queue = &ctx.output_q,
+            .db               = &ctx.db,
+            .stop             = &ctx.stop,
+            .reload_ver       = &ctx.reload_ver,
+            .schema           = &slot,
+            .validation       = .warn,
+        };
+        const t = try std.Thread.spawn(.{}, workerThread, .{args});
+        defer { ctx.deinit(t); slot.deinit(); }
 
-    // warn mode: invalid call is kept (logged but forwarded)
-    const action = popAction(&ctx.output_q);
-    defer types.freeApiCall(action, testing.allocator);
-    try testing.expectEqualStrings("sendMessage", action.method);
+        std.Thread.sleep(30 * std.time.ns_per_ms);
+        try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
+        try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
+
+        const action = popAction(&ctx.output_q);
+        defer types.freeApiCall(action, testing.allocator);
+        try testing.expectEqualStrings("sendMessage", action.method);
+    }
 }
 
 test "hashUserId is deterministic — 10k ids × 8 workers always same index" {
@@ -1608,53 +1598,56 @@ test "worker drains in-flight coroutines on stop; exits cleanly" {
 
 // ── exit bounded by WORKFLOW_DEADLINE_MS ─────────────────────────────────────
 
-test "state written in sync handler is committed after .done" {
-    var ctx = try TestCtx.init(testing.allocator,
-        \\function on_message(u)
-        \\    bot.set_user_state(1, {x=42})
-        \\    return { { method="sendMessage", params={chat_id=1, text="ok"} } }
-        \\end
-    );
-    const t = try ctx.spawnWorker();
-    defer ctx.deinit(t);
+test "state commits after .done and rolls back on Lua error" {
+    // A handler that writes state then returns: the write is committed.
+    {
+        var ctx = try TestCtx.init(testing.allocator,
+            \\function on_message(u)
+            \\    bot.set_user_state(1, {x=42})
+            \\    return { { method="sendMessage", params={chat_id=1, text="ok"} } }
+            \\end
+        );
+        const t = try ctx.spawnWorker();
+        defer ctx.deinit(t);
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
-    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
+        std.Thread.sleep(30 * std.time.ns_per_ms);
+        try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
 
-    // Wait for the dispatched action — proves .done path completed.
-    try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
-    const action = popAction(&ctx.output_q);
-    types.freeApiCall(action, testing.allocator);
+        // Wait for the dispatched action — proves the .done path completed.
+        try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
+        const action = popAction(&ctx.output_q);
+        types.freeApiCall(action, testing.allocator);
 
-    const data = try ctx.db.getUserState(1);
-    defer testing.allocator.free(data);
-    try testing.expect(std.mem.indexOf(u8, data, "\"x\":42") != null);
-}
+        const data = try ctx.db.getUserState(1);
+        defer testing.allocator.free(data);
+        try testing.expect(std.mem.indexOf(u8, data, "\"x\":42") != null);
+    }
+    // A handler that writes state then errors: the write is rolled back.
+    {
+        var ctx = try TestCtx.init(testing.allocator,
+            \\function on_message(u)
+            \\    bot.set_user_state(1, {x=99})
+            \\    error("deliberate error to test rollback")
+            \\end
+        );
+        const t = try ctx.spawnWorker();
+        defer ctx.deinit(t);
 
-test "state written before Lua error is rolled back" {
-    var ctx = try TestCtx.init(testing.allocator,
-        \\function on_message(u)
-        \\    bot.set_user_state(1, {x=99})
-        \\    error("deliberate error to test rollback")
-        \\end
-    );
-    const t = try ctx.spawnWorker();
-    defer ctx.deinit(t);
+        // Set initial committed state before pushing the message.
+        try ctx.db.setUserState(1, "{\"x\":0}");
 
-    // Set initial committed state before pushing the message.
-    try ctx.db.setUserState(1, "{\"x\":0}");
+        std.Thread.sleep(30 * std.time.ns_per_ms);
+        try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
-    try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
+        // No output is dispatched on Lua error — wait long enough for processing.
+        std.Thread.sleep(150 * std.time.ns_per_ms);
 
-    // No output is dispatched on Lua error — wait long enough for processing.
-    std.Thread.sleep(150 * std.time.ns_per_ms);
-
-    const data = try ctx.db.getUserState(1);
-    defer testing.allocator.free(data);
-    // Rollback must have reverted the {x:99} write.
-    try testing.expect(std.mem.indexOf(u8, data, "\"x\":99") == null);
-    try testing.expect(std.mem.indexOf(u8, data, "\"x\":0") != null);
+        const data = try ctx.db.getUserState(1);
+        defer testing.allocator.free(data);
+        // Rollback must have reverted the {x:99} write.
+        try testing.expect(std.mem.indexOf(u8, data, "\"x\":99") == null);
+        try testing.expect(std.mem.indexOf(u8, data, "\"x\":0") != null);
+    }
 }
 
 test "worker exits within WORKFLOW_DEADLINE_MS + 200ms with non-responding stub" {

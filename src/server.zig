@@ -572,38 +572,21 @@ test "valid POST /webhook with correct secret → 200 OK, update enqueued" {
     try testing.expectEqual(@as(usize, 1), ts.queueLen(0));
 }
 
-test "GET /webhook → 403 Forbidden, nothing enqueued" {
+test "non-POST, wrong path, or bad secret → 403 Forbidden, nothing enqueued" {
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
-    const status = try httpReq("GET", ts.serverAddr(), "/webhook", TEST_SECRET, "");
-    try testing.expectEqual(@as(u16, 403), status);
+    // GET instead of POST.
+    try testing.expectEqual(@as(u16, 403), try httpReq("GET", ts.serverAddr(), "/webhook", TEST_SECRET, ""));
+    // Wrong path.
+    try testing.expectEqual(@as(u16, 403), try httpReq("POST", ts.serverAddr(), "/notwebhook", TEST_SECRET, VALID_UPDATE));
+    // Missing secret header.
+    try testing.expectEqual(@as(u16, 403), try httpReq("POST", ts.serverAddr(), "/webhook", null, VALID_UPDATE));
+    // Wrong secret.
+    try testing.expectEqual(@as(u16, 403), try httpReq("POST", ts.serverAddr(), "/webhook", "wrong-secret", VALID_UPDATE));
+
+    // No rejected request enqueued anything.
     try testing.expectEqual(@as(usize, 0), ts.queueLen(0));
-}
-
-test "POST /notwebhook → 403 Forbidden, nothing enqueued" {
-    const ts = try TestSetup.init(1, TEST_SECRET);
-    defer ts.deinit();
-
-    const status = try httpReq("POST", ts.serverAddr(), "/notwebhook", TEST_SECRET, VALID_UPDATE);
-    try testing.expectEqual(@as(u16, 403), status);
-    try testing.expectEqual(@as(usize, 0), ts.queueLen(0));
-}
-
-test "POST /webhook with no secret header → 403 Forbidden" {
-    const ts = try TestSetup.init(1, TEST_SECRET);
-    defer ts.deinit();
-
-    const status = try httpReq("POST", ts.serverAddr(), "/webhook", null, VALID_UPDATE);
-    try testing.expectEqual(@as(u16, 403), status);
-}
-
-test "POST /webhook with wrong secret → 403 Forbidden" {
-    const ts = try TestSetup.init(1, TEST_SECRET);
-    defer ts.deinit();
-
-    const status = try httpReq("POST", ts.serverAddr(), "/webhook", "wrong-secret", VALID_UPDATE);
-    try testing.expectEqual(@as(u16, 403), status);
 }
 
 test "valid secret, malformed JSON body → 400 Bad Request, nothing enqueued" {
@@ -770,14 +753,10 @@ test "extractUserId — message / callback_query / edge cases" {
     try testing.expectError(error.InvalidJson, extractUserId(A, ""));
     // top-level array (not an object) → error
     try testing.expectError(error.InvalidJson, extractUserId(A, "[1,2,3]"));
-}
-
-test "extractUserId early-exits once the routing id is found" {
-    // The id is reachable; the bytes after it are invalid JSON.  A full scan
-    // would raise error.InvalidJson — returning the id proves the scan stopped
-    // as soon as `message.from.id` was captured.
-    const body = "{\"message\":{\"from\":{\"id\":777,\"junk\":NOTVALID}}}";
-    try testing.expectEqual(@as(?i64, 777), try extractUserId(testing.allocator, body));
+    // early exit: the id is found before the trailing invalid JSON is reached,
+    // so the scan stops and returns the id rather than raising InvalidJson.
+    try testing.expectEqual(@as(?i64, 777), try extractUserId(A,
+        "{\"message\":{\"from\":{\"id\":777,\"junk\":NOTVALID}}}"));
 }
 
 test "server→worker WorkItem handoff leaks nothing under testing.allocator" {

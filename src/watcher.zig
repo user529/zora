@@ -308,17 +308,14 @@ const LUA_V0 = "-- rules v0";
 const LUA_V1 = "-- rules v1";
 const LUA_V2 = "-- rules v2";
 
-test "reload_version starts at 0" {
-    // The test checks the initial value of the global, not a local counter.
-    // Note: if other tests already incremented the global, this test can fail
-    // when run in isolation.  The check uses the initial value stored in the type.
+test "reload_version starts at zero and Value(u64) orders with acquire/release" {
+    // A fresh counter starts at 0. The process-global reload_version may have
+    // been advanced by other tests, so only its non-negative invariant holds.
     const fresh = std.atomic.Value(u64).init(0);
     try testing.expectEqual(@as(u64, 0), fresh.load(.acquire));
-    // The global is also 0 at program start (documented invariant).
     try testing.expect(reload_version.raw >= 0);
-}
 
-test "std.atomic.Value(u64) provides .release/.acquire ordering" {
+    // fetchAdd(.release) is observed in order by load(.acquire).
     var v = std.atomic.Value(u64).init(0);
     _ = v.fetchAdd(1, .release);
     try testing.expectEqual(@as(u64, 1), v.load(.acquire));

@@ -504,48 +504,49 @@ test "http_request to unreachable address → IoResult.err, thread survives" {
     try testing.expect(r2.outcome == .err);
 }
 
-test "exec{argv={/bin/echo, hello}} → exit_code 0, stdout hello\n" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
-    defer rq.deinit(testing.allocator);
-    var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
-        .{ .thread_count = 1, .queue_capacity = 8,
-           .timeout_ms = 5_000, .proc_max_output = 65_536 },
-        &.{&rq});
-    defer pool.deinit();
+test "exec and shell run a command and capture output" {
+    // exec: the argv form runs /bin/echo and returns its stdout.
+    {
+        var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+        defer rq.deinit(testing.allocator);
+        var pool: IoPool = undefined;
+        try pool.init(testing.allocator,
+            .{ .thread_count = 1, .queue_capacity = 8,
+               .timeout_ms = 5_000, .proc_max_output = 65_536 },
+            &.{&rq});
+        defer pool.deinit();
 
-    try pool.submit(.{ .worker_id = 0, .coro_id = 10, .deadline_ms = -1,
-        .payload = .{ .exec = .{ .argv = &.{ "/bin/echo", "hello" } } } });
+        try pool.submit(.{ .worker_id = 0, .coro_id = 10, .deadline_ms = -1,
+            .payload = .{ .exec = .{ .argv = &.{ "/bin/echo", "hello" } } } });
 
-    const result = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
-    defer freeIoResult(result, testing.allocator);
+        const result = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
+        defer freeIoResult(result, testing.allocator);
+        try testing.expectEqual(@as(u32, 10), result.coro_id);
+        try testing.expect(result.outcome == .proc);
+        try testing.expectEqual(@as(i32, 0), result.outcome.proc.exit_code);
+        try testing.expectEqualStrings("hello\n", result.outcome.proc.stdout);
+    }
+    // shell: the command runs under a shell, so $((...)) is evaluated.
+    {
+        var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+        defer rq.deinit(testing.allocator);
+        var pool: IoPool = undefined;
+        try pool.init(testing.allocator,
+            .{ .thread_count = 1, .queue_capacity = 8,
+               .timeout_ms = 5_000, .proc_max_output = 65_536 },
+            &.{&rq});
+        defer pool.deinit();
 
-    try testing.expectEqual(@as(u32, 10), result.coro_id);
-    try testing.expect(result.outcome == .proc);
-    try testing.expectEqual(@as(i32, 0), result.outcome.proc.exit_code);
-    try testing.expectEqualStrings("hello\n", result.outcome.proc.stdout);
-}
+        try pool.submit(.{ .worker_id = 0, .coro_id = 30, .deadline_ms = -1,
+            .payload = .{ .shell = .{ .command = "echo $((1+1))" } } });
 
-test "shell{command='echo $((1+1))'} → exit_code 0, stdout 2\n" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
-    defer rq.deinit(testing.allocator);
-    var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
-        .{ .thread_count = 1, .queue_capacity = 8,
-           .timeout_ms = 5_000, .proc_max_output = 65_536 },
-        &.{&rq});
-    defer pool.deinit();
-
-    try pool.submit(.{ .worker_id = 0, .coro_id = 30, .deadline_ms = -1,
-        .payload = .{ .shell = .{ .command = "echo $((1+1))" } } });
-
-    const result = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
-    defer freeIoResult(result, testing.allocator);
-
-    try testing.expectEqual(@as(u32, 30), result.coro_id);
-    try testing.expect(result.outcome == .proc);
-    try testing.expectEqual(@as(i32, 0), result.outcome.proc.exit_code);
-    try testing.expectEqualStrings("2\n", result.outcome.proc.stdout);
+        const result = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
+        defer freeIoResult(result, testing.allocator);
+        try testing.expectEqual(@as(u32, 30), result.coro_id);
+        try testing.expect(result.outcome == .proc);
+        try testing.expectEqual(@as(i32, 0), result.outcome.proc.exit_code);
+        try testing.expectEqualStrings("2\n", result.outcome.proc.stdout);
+    }
 }
 
 test "command exceeding IO_JOB_TIMEOUT_MS → IoResult.err, child killed" {
@@ -566,26 +567,6 @@ test "command exceeding IO_JOB_TIMEOUT_MS → IoResult.err, child killed" {
     defer freeIoResult(result, testing.allocator);
     // Returning without hanging confirms the child was reaped (no zombie).
     try testing.expect(result.outcome == .err);
-}
-
-test "submit at capacity → error.QueueFull, no crash" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 4);
-    defer rq.deinit(testing.allocator);
-
-    // thread_count = 0: no consumers, queue fills immediately.
-    var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
-        .{ .thread_count = 0, .queue_capacity = 1,
-           .timeout_ms = 1_000, .proc_max_output = 65_536 },
-        &.{&rq});
-    defer pool.deinit();
-
-    const job = IoJob{
-        .worker_id = 0, .coro_id = 1, .deadline_ms = -1,
-        .payload = .{ .shell = .{ .command = "true" } },
-    };
-    try pool.submit(job);
-    try testing.expectError(error.QueueFull, pool.submit(job));
 }
 
 test "stdout exceeding PROC_MAX_OUTPUT → truncated and marked" {
@@ -654,7 +635,7 @@ test "io_pool metrics — jobs_total, inflight, errors, timeouts" {
     try testing.expectEqual(@as(u64, 1), m.io_timeouts_total.load(.monotonic));
 }
 
-test "QueueFull does not inflate io_jobs_total or io_jobs_inflight" {
+test "submit at capacity returns QueueFull without inflating metrics" {
     var m = metrics_mod.Metrics{};
 
     var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 4);

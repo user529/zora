@@ -707,7 +707,7 @@ const SCHEMA_FIX =
     \\]}},"types":{}}
 ;
 
-test "off/warn keep an invalid call; strict drops it" {
+test "validation mode governs both bot.emit and the return-list" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
     var ctx = testCtx(&db);
@@ -716,93 +716,87 @@ test "off/warn keep an invalid call; strict drops it" {
     defer slot.deinit();
     slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
 
-    const cases = .{
-        .{ types.ValidationMode.off, @as(usize, 1) },
-        .{ types.ValidationMode.warn, @as(usize, 1) },
-        .{ types.ValidationMode.strict, @as(usize, 0) },
-    };
-    inline for (cases) |c| {
+    // off and warn keep an invalid return-list call; strict drops it.
+    {
+        const cases = .{
+            .{ types.ValidationMode.off, @as(usize, 1) },
+            .{ types.ValidationMode.warn, @as(usize, 1) },
+            .{ types.ValidationMode.strict, @as(usize, 0) },
+        };
+        inline for (cases) |c| {
+            var engine = try LuaEngine.init(testing.allocator, &ctx);
+            defer engine.deinit();
+            engine.setValidation(&slot, c[0]);
+            try engine.loadString(
+                \\function on_message(u)
+                \\  return { { method = "sendMessage", params = { chat_id = 1 } } }
+                \\end
+            ); // invalid: required `text` missing
+            const actions = try engine.callOnMessage(testing.allocator, "{}");
+            defer types.freeApiCalls(actions, testing.allocator);
+            try testing.expectEqual(c[1], actions.len);
+        }
+    }
+    // strict validates both the emit path and the return-list; of three calls
+    // only the one valid emit survives.
+    {
         var engine = try LuaEngine.init(testing.allocator, &ctx);
         defer engine.deinit();
-        engine.setValidation(&slot, c[0]);
+        engine.setValidation(&slot, .strict);
+        try engine.loadString(
+            \\function on_message(u)
+            \\  bot.emit{ method = "sendMessage", params = { chat_id = 1 } }            -- invalid
+            \\  bot.emit{ method = "sendMessage", params = { chat_id = 1, text = "k" } } -- valid
+            \\  return { { method = "sendMessage", params = { chat_id = 2 } } }          -- invalid
+            \\end
+        );
+        const actions = try engine.callOnMessage(testing.allocator, "{}");
+        defer types.freeApiCalls(actions, testing.allocator);
+        try testing.expectEqual(@as(usize, 1), actions.len);
+        try expectMsgBody(actions[0].payload.json, 1, "k");
+    }
+}
+
+test "schema slot is shared by pointer and an empty slot validates nothing" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+    var ctx = testCtx(&db);
+
+    // One installed slot is referenced by pointer from every engine. The schema
+    // never enters a lua_State, so adding engines (workers) never multiplies its
+    // memory.
+    {
+        var slot = tg_schema.SchemaSlot.init(testing.allocator);
+        defer slot.deinit();
+        slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
+
+        var e1 = try LuaEngine.init(testing.allocator, &ctx);
+        defer e1.deinit();
+        var e2 = try LuaEngine.init(testing.allocator, &ctx);
+        defer e2.deinit();
+        e1.setValidation(&slot, .warn);
+        e2.setValidation(&slot, .warn);
+
+        try testing.expectEqual(e1.schema_slot.?, e2.schema_slot.?);
+        try testing.expectEqual(slot.get().?, e2.schema_slot.?.get().?);
+    }
+    // An empty slot under strict mode is a no-op: nothing is dropped (Tier-0).
+    {
+        var slot = tg_schema.SchemaSlot.init(testing.allocator); // never installed
+        defer slot.deinit();
+
+        var engine = try LuaEngine.init(testing.allocator, &ctx);
+        defer engine.deinit();
+        engine.setValidation(&slot, .strict); // strict, but no schema → no-op
         try engine.loadString(
             \\function on_message(u)
             \\  return { { method = "sendMessage", params = { chat_id = 1 } } }
             \\end
-        ); // invalid: required `text` missing
+        );
         const actions = try engine.callOnMessage(testing.allocator, "{}");
         defer types.freeApiCalls(actions, testing.allocator);
-        try testing.expectEqual(c[1], actions.len);
+        try testing.expectEqual(@as(usize, 1), actions.len);
     }
-}
-
-test "strict validation covers both bot.emit and the return-list" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-
-    var slot = tg_schema.SchemaSlot.init(testing.allocator);
-    defer slot.deinit();
-    slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
-
-    var engine = try LuaEngine.init(testing.allocator, &ctx);
-    defer engine.deinit();
-    engine.setValidation(&slot, .strict);
-    try engine.loadString(
-        \\function on_message(u)
-        \\  bot.emit{ method = "sendMessage", params = { chat_id = 1 } }            -- invalid
-        \\  bot.emit{ method = "sendMessage", params = { chat_id = 1, text = "k" } } -- valid
-        \\  return { { method = "sendMessage", params = { chat_id = 2 } } }          -- invalid
-        \\end
-    );
-    const actions = try engine.callOnMessage(testing.allocator, "{}");
-    defer types.freeApiCalls(actions, testing.allocator);
-    try testing.expectEqual(@as(usize, 1), actions.len);
-    try expectMsgBody(actions[0].payload.json, 1, "k");
-}
-
-test "the schema is shared by pointer across engines (single copy)" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-
-    var slot = tg_schema.SchemaSlot.init(testing.allocator);
-    defer slot.deinit();
-    slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
-
-    var e1 = try LuaEngine.init(testing.allocator, &ctx);
-    defer e1.deinit();
-    var e2 = try LuaEngine.init(testing.allocator, &ctx);
-    defer e2.deinit();
-    e1.setValidation(&slot, .warn);
-    e2.setValidation(&slot, .warn);
-
-    // Both engines reference the one SchemaSlot — and the one SchemaStore
-    // inside it. The schema never enters a lua_State, so adding engines
-    // (workers) never multiplies its memory.
-    try testing.expectEqual(e1.schema_slot.?, e2.schema_slot.?);
-    try testing.expectEqual(slot.get().?, e2.schema_slot.?.get().?);
-}
-
-test "an empty schema slot validates nothing (Tier-0)" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-
-    var slot = tg_schema.SchemaSlot.init(testing.allocator); // never installed
-    defer slot.deinit();
-
-    var engine = try LuaEngine.init(testing.allocator, &ctx);
-    defer engine.deinit();
-    engine.setValidation(&slot, .strict); // strict, but no schema → no-op
-    try engine.loadString(
-        \\function on_message(u)
-        \\  return { { method = "sendMessage", params = { chat_id = 1 } } }
-        \\end
-    );
-    const actions = try engine.callOnMessage(testing.allocator, "{}");
-    defer types.freeApiCalls(actions, testing.allocator);
-    try testing.expectEqual(@as(usize, 1), actions.len);
 }
 
 test "shipped rules/rules.lua produces sendMessage calls (generic form)" {
@@ -828,7 +822,7 @@ test "shipped rules/rules.lua produces sendMessage calls (generic form)" {
         defer types.freeApiCalls(actions, testing.allocator);
         try testing.expectEqual(@as(usize, 1), actions.len);
         try testing.expectEqualStrings("sendMessage", actions[0].method);
-        try expectMsgBody(actions[0].payload.json, 9, "Welcome! You are message #1");
+        try expectMsgBody(actions[0].payload.json, 9, "Welcome! You are message #1.");
     }
     // Plain text → echo.
     {

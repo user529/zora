@@ -336,109 +336,130 @@ fn newLua(allocator: std.mem.Allocator) !*Lua {
     return try Lua.init(allocator);
 }
 
-test "nil round-trips as JSON null" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    lua.pushNil();
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    try testing.expectEqualStrings("null", json);
-
-    // null → Lua nil
-    try jsonToLuaTable(lua, "null", testing.allocator);
-    try testing.expect(lua.isNil(-1));
-    lua.pop(1);
-    try testing.expectEqual(@as(i32, 0), lua.getTop());
+/// Helper: push a table nested `levels` deep onto the stack. Each level holds
+/// one string key "inner" pointing at the next, so the value is an object.
+fn pushNested(lua: *Lua, levels: u32) void {
+    lua.createTable(0, 0); // innermost
+    var n = levels;
+    while (n > 1) : (n -= 1) {
+        const inner = lua.getTop();
+        lua.createTable(0, 1);
+        _ = lua.pushString("inner");
+        lua.pushValue(inner);
+        lua.rawSetTable(-3);
+        lua.remove(inner);
+    }
 }
 
-test "boolean true round-trips" {
+test "scalar values round-trip through JSON" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
-    lua.pushBoolean(true);
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
+    // nil → "null" → nil; the stack returns to empty afterwards.
+    {
+        lua.pushNil();
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expectEqualStrings("null", json);
 
-    try testing.expectEqualStrings("true", json);
-
-    try jsonToLuaTable(lua, json, testing.allocator);
-    try testing.expect(lua.toBoolean(-1) == true);
-    lua.pop(1);
-    try testing.expectEqual(@as(i32, 0), lua.getTop());
-}
-
-test "boolean false round-trips" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    lua.pushBoolean(false);
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    try testing.expectEqualStrings("false", json);
-
-    try jsonToLuaTable(lua, json, testing.allocator);
-    try testing.expect(lua.toBoolean(-1) == false);
-    lua.pop(1);
-}
-
-test "integer round-trips" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    lua.pushInteger(42);
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    try testing.expectEqualStrings("42", json);
-
-    try jsonToLuaTable(lua, json, testing.allocator);
-    try testing.expect(lua.isInteger(-1));
-    try testing.expectEqual(@as(ziglua.Integer, 42), try lua.toInteger(-1));
-    lua.pop(1);
-}
-
-test "float round-trips" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    lua.pushNumber(3.14);
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    // Must have a decimal indicator so it comes back as float
-    const has_point = std.mem.indexOfAny(u8, json, ".eE") != null;
-    try testing.expect(has_point);
-
-    try jsonToLuaTable(lua, json, testing.allocator);
-    try testing.expect(!lua.isInteger(-1)); // must be float
-    const v = try lua.toNumber(-1);
-    try testing.expectApproxEqRel(3.14, v, 1e-9);
-    lua.pop(1);
-}
-
-test "string round-trips" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    _ = lua.pushString("hello, world");
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    try testing.expectEqualStrings("\"hello, world\"", json);
-
-    try jsonToLuaTable(lua, json, testing.allocator);
-    const s = try lua.toString(-1);
-    try testing.expectEqualStrings("hello, world", s);
-    lua.pop(1);
+        try jsonToLuaTable(lua, "null", testing.allocator);
+        try testing.expect(lua.isNil(-1));
+        lua.pop(1);
+        try testing.expectEqual(@as(i32, 0), lua.getTop());
+    }
+    // boolean true.
+    {
+        lua.pushBoolean(true);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expectEqualStrings("true", json);
+        try jsonToLuaTable(lua, json, testing.allocator);
+        try testing.expect(lua.toBoolean(-1) == true);
+        lua.pop(1);
+    }
+    // boolean false.
+    {
+        lua.pushBoolean(false);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expectEqualStrings("false", json);
+        try jsonToLuaTable(lua, json, testing.allocator);
+        try testing.expect(lua.toBoolean(-1) == false);
+        lua.pop(1);
+    }
+    // integer.
+    {
+        lua.pushInteger(42);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expectEqualStrings("42", json);
+        try jsonToLuaTable(lua, json, testing.allocator);
+        try testing.expect(lua.isInteger(-1));
+        try testing.expectEqual(@as(ziglua.Integer, 42), try lua.toInteger(-1));
+        lua.pop(1);
+    }
+    // float — must carry a decimal indicator so it returns as a float.
+    {
+        lua.pushNumber(3.14);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expect(std.mem.indexOfAny(u8, json, ".eE") != null);
+        try jsonToLuaTable(lua, json, testing.allocator);
+        try testing.expect(!lua.isInteger(-1));
+        try testing.expectApproxEqRel(@as(f64, 3.14), try lua.toNumber(-1), 1e-9);
+        lua.pop(1);
+    }
+    // string.
+    {
+        _ = lua.pushString("hello, world");
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expectEqualStrings("\"hello, world\"", json);
+        try jsonToLuaTable(lua, json, testing.allocator);
+        try testing.expectEqualStrings("hello, world", try lua.toString(-1));
+        lua.pop(1);
+    }
+    // large integer 2^53 — no precision loss through JSON.
+    {
+        const big: ziglua.Integer = 9007199254740992;
+        lua.pushInteger(big);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try jsonToLuaTable(lua, json, testing.allocator);
+        try testing.expect(lua.isInteger(-1));
+        try testing.expectEqual(big, try lua.toInteger(-1));
+        lua.pop(1);
+    }
+    // max i64.
+    {
+        const max_int: ziglua.Integer = std.math.maxInt(i64);
+        lua.pushInteger(max_int);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try jsonToLuaTable(lua, json, testing.allocator);
+        try testing.expect(lua.isInteger(-1));
+        try testing.expectEqual(max_int, try lua.toInteger(-1));
+        lua.pop(1);
+    }
+    // min i64 (negative).
+    {
+        const n: ziglua.Integer = std.math.minInt(i64);
+        lua.pushInteger(n);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try jsonToLuaTable(lua, json, testing.allocator);
+        try testing.expectEqual(n, try lua.toInteger(-1));
+        lua.pop(1);
+    }
 }
 
 test "string with special chars escapes correctly" {
@@ -456,460 +477,255 @@ test "string with special chars escapes correctly" {
     );
 }
 
-test "array table (1..N integer keys) serializes to JSON array" {
+test "table shape maps to a JSON array or object" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
-    // {10, 20, 30}
-    lua.createTable(3, 0);
-    lua.pushInteger(10);
-    lua.rawSetIndex(-2, 1);
-    lua.pushInteger(20);
-    lua.rawSetIndex(-2, 2);
-    lua.pushInteger(30);
-    lua.rawSetIndex(-2, 3);
-
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    try testing.expectEqualStrings("[10,20,30]", json);
-}
-
-test "JSON array round-trips back to Lua sequence" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    try jsonToLuaTable(lua, "[1,2,3]", testing.allocator);
-    try testing.expect(lua.isTable(-1));
-
-    _ = lua.rawGetIndex(-1, 1);
-    try testing.expectEqual(@as(ziglua.Integer, 1), try lua.toInteger(-1));
-    lua.pop(1);
-
-    _ = lua.rawGetIndex(-1, 2);
-    try testing.expectEqual(@as(ziglua.Integer, 2), try lua.toInteger(-1));
-    lua.pop(1);
-
-    _ = lua.rawGetIndex(-1, 3);
-    try testing.expectEqual(@as(ziglua.Integer, 3), try lua.toInteger(-1));
-    lua.pop(1);
-
-    lua.pop(1);
-}
-
-test "object table (string keys) serializes to JSON object" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // { name = "bob" }
-    lua.createTable(0, 1);
-    _ = lua.pushString("name");
-    _ = lua.pushString("bob");
-    lua.rawSetTable(-3);
-
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    try testing.expectEqualStrings("{\"name\":\"bob\"}", json);
-}
-
-test "non-consecutive integer keys → object, not array" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // { [1] = "a", [3] = "c" }  — gap at 2, not a sequence
-    lua.createTable(0, 2);
-    lua.pushInteger(1);
-    _ = lua.pushString("a");
-    lua.rawSetTable(-3);
-    lua.pushInteger(3);
-    _ = lua.pushString("c");
-    lua.rawSetTable(-3);
-
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    // Must be an object, not "[...]"
-    try testing.expect(json[0] == '{');
-}
-
-test "nesting depth 8 succeeds" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // Build 8 levels: {{{{{{{{}}}}}}}}}  (each wrapping the previous)
-    lua.createTable(0, 0); // level 8 (innermost, empty)
-    var level: u32 = 7;
-    while (level > 0) : (level -= 1) {
-        const inner = lua.getTop();
-        lua.createTable(0, 1);
-        _ = lua.pushString("inner");
-        lua.pushValue(inner); // push the inner table again
-        lua.rawSetTable(-3);  // outer["inner"] = inner_table
-        // Remove the original inner from stack
-        lua.remove(inner);
+    // Sequence {10,20,30} → JSON array.
+    {
+        lua.createTable(3, 0);
+        lua.pushInteger(10); lua.rawSetIndex(-2, 1);
+        lua.pushInteger(20); lua.rawSetIndex(-2, 2);
+        lua.pushInteger(30); lua.rawSetIndex(-2, 3);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expectEqualStrings("[10,20,30]", json);
     }
-
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    // JSON must start with { and contain nested objects
-    try testing.expect(json[0] == '{');
-}
-
-test "nesting depth 9 returns error.MaxDepthExceeded" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // Build 9 levels of nesting
-    lua.createTable(0, 0);
-    var level: u32 = 8;
-    while (level > 0) : (level -= 1) {
-        const inner = lua.getTop();
+    // JSON array → Lua sequence with values at 1..3.
+    {
+        try jsonToLuaTable(lua, "[1,2,3]", testing.allocator);
+        try testing.expect(lua.isTable(-1));
+        var i: ziglua.Integer = 1;
+        while (i <= 3) : (i += 1) {
+            _ = lua.rawGetIndex(-1, i);
+            try testing.expectEqual(i, try lua.toInteger(-1));
+            lua.pop(1);
+        }
+        lua.pop(1);
+    }
+    // Object {name="bob"} → JSON object.
+    {
         lua.createTable(0, 1);
-        _ = lua.pushString("inner");
-        lua.pushValue(inner);
+        _ = lua.pushString("name");
+        _ = lua.pushString("bob");
         lua.rawSetTable(-3);
-        lua.remove(inner);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expectEqualStrings("{\"name\":\"bob\"}", json);
     }
-
-    const top_before = lua.getTop();
-    const result = luaTableToJson(lua, -1, testing.allocator);
-    try testing.expectError(error.MaxDepthExceeded, result);
-    lua.pop(1);
-    _ = top_before;
-}
-
-test "JSON array 8 levels deep succeeds" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-    // [[[[[[[[]]]]]]]]  — 8 opening brackets
-    try jsonToLuaTable(lua, "[[[[[[[[]]]]]]]]", testing.allocator);
-    try testing.expect(lua.isTable(-1));
-    lua.pop(1);
-}
-
-test "JSON array 9 levels deep returns error.MaxDepthExceeded" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-    // [[[[[[[[[]]]]]]]]]  — 9 opening brackets
-    const top_before = lua.getTop();
-    const result = jsonToLuaTable(lua, "[[[[[[[[[]]]]]]]]]", testing.allocator);
-    try testing.expectError(error.MaxDepthExceeded, result);
-    try testing.expectEqual(top_before, lua.getTop());
-}
-
-test "serializing table exceeding 64 KiB returns error.MaxSizeExceeded" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // Build an array of long strings totalling > 64 KiB
-    lua.createTable(10, 0);
-    var buf: [8000]u8 = undefined;
-    @memset(&buf, 'x');
-    var i: ziglua.Integer = 1;
-    while (i <= 10) : (i += 1) {
-        _ = lua.pushString(&buf); // 8000 bytes each → 80 KiB total
-        lua.rawSetIndex(-2, i);
+    // Non-consecutive integer keys {[1],[3]} → object, not array.
+    {
+        lua.createTable(0, 2);
+        lua.pushInteger(1); _ = lua.pushString("a"); lua.rawSetTable(-3);
+        lua.pushInteger(3); _ = lua.pushString("c"); lua.rawSetTable(-3);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expect(json[0] == '{');
     }
-
-    const result = luaTableToJson(lua, -1, testing.allocator);
-    try testing.expectError(error.MaxSizeExceeded, result);
-    lua.pop(1);
+    // Mixed integer and string keys → object.
+    {
+        lua.createTable(0, 2);
+        lua.pushInteger(1); _ = lua.pushString("a"); lua.rawSetTable(-3);
+        _ = lua.pushString("name"); _ = lua.pushString("b"); lua.rawSetTable(-3);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expect(json[0] == '{');
+    }
+    // Empty table → "{}".
+    {
+        lua.createTable(0, 0);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expectEqualStrings("{}", json);
+    }
 }
 
-test "empty table serializes to {}" {
+test "rejects nesting past the 8-level limit" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
-    lua.createTable(0, 0);
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
+    // A failed serialize leaves the partially-pushed values on the Lua stack,
+    // so each case resets the stack with setTop(0) before the next to avoid a
+    // stack overflow during the next deep traversal.
 
-    try testing.expectEqualStrings("{}", json);
+    // Lua → JSON: depth 8 serializes, depth 9 errors.
+    {
+        pushNested(lua, 8);
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        try testing.expect(json[0] == '{');
+        lua.setTop(0);
+    }
+    {
+        pushNested(lua, 9);
+        try testing.expectError(error.MaxDepthExceeded, luaTableToJson(lua, -1, testing.allocator));
+        lua.setTop(0);
+    }
+    // The capped entry point propagates the same depth error.
+    {
+        pushNested(lua, 9);
+        try testing.expectError(
+            error.MaxDepthExceeded,
+            luaTableToJsonCapped(lua, -1, testing.allocator, 1024 * 1024),
+        );
+        lua.setTop(0);
+    }
+    // JSON → Lua: depth 8 parses, depth 9 errors with the stack restored.
+    {
+        try jsonToLuaTable(lua, "[[[[[[[[]]]]]]]]", testing.allocator); // 8 levels
+        try testing.expect(lua.isTable(-1));
+        lua.setTop(0);
+    }
+    {
+        const top_before = lua.getTop();
+        try testing.expectError(
+            error.MaxDepthExceeded,
+            jsonToLuaTable(lua, "[[[[[[[[[]]]]]]]]]", testing.allocator), // 9 levels
+        );
+        try testing.expectEqual(top_before, lua.getTop());
+    }
+    {
+        // 9-level object nesting.
+        const deep = "{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{}}}}}}}}}}";
+        const top_before = lua.getTop();
+        try testing.expectError(error.MaxDepthExceeded, jsonToLuaTable(lua, deep, testing.allocator));
+        try testing.expectEqual(top_before, lua.getTop());
+    }
 }
 
-test "JSON null deserializes to Lua nil" {
+test "enforces the size cap" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
-    try jsonToLuaTable(lua, "null", testing.allocator);
-    try testing.expect(lua.isNil(-1));
-    lua.pop(1);
-    try testing.expectEqual(@as(i32, 0), lua.getTop());
+    // Default 64 KiB cap: a small value passes.
+    {
+        _ = lua.pushString("ok");
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expectEqualStrings("\"ok\"", json);
+    }
+    // Default cap: an 80 KiB array is rejected.
+    {
+        lua.createTable(10, 0);
+        var buf: [8000]u8 = undefined;
+        @memset(&buf, 'x');
+        var i: ziglua.Integer = 1;
+        while (i <= 10) : (i += 1) {
+            _ = lua.pushString(&buf); // 8000 bytes each → 80 KiB total
+            lua.rawSetIndex(-2, i);
+        }
+        try testing.expectError(error.MaxSizeExceeded, luaTableToJson(lua, -1, testing.allocator));
+        lua.pop(1);
+    }
+    // Caller-supplied cap: within passes, over fails.
+    {
+        _ = lua.pushString("hello");
+        const json = try luaTableToJsonCapped(lua, -1, testing.allocator, 16);
+        defer testing.allocator.free(json);
+        lua.pop(1);
+        try testing.expectEqualStrings("\"hello\"", json);
+    }
+    {
+        _ = lua.pushString("hello world");
+        try testing.expectError(
+            error.MaxSizeExceeded,
+            luaTableToJsonCapped(lua, -1, testing.allocator, 5),
+        );
+        lua.pop(1);
+    }
+    // jsonToLuaTableCapped checks input length; over the cap errors, stack intact.
+    {
+        const top_before = lua.getTop();
+        try testing.expectError(
+            error.MaxSizeExceeded,
+            jsonToLuaTableCapped(lua, "{\"ok\":true}", testing.allocator, 5),
+        );
+        try testing.expectEqual(top_before, lua.getTop());
+    }
+    {
+        try jsonToLuaTableCapped(lua, "42", testing.allocator, 100);
+        try testing.expect(lua.isInteger(-1));
+        try testing.expectEqual(@as(ziglua.Integer, 42), try lua.toInteger(-1));
+        lua.pop(1);
+    }
+    // jsonToLuaTable itself imposes no input-size limit.
+    {
+        try jsonToLuaTable(lua, "{\"n\":1}", testing.allocator);
+        try testing.expect(lua.isTable(-1));
+        lua.pop(1);
+    }
 }
 
-test "large integer (2^53) round-trips without loss" {
+test "stack stays balanced across success and error" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
-    const big: ziglua.Integer = 9007199254740992; // 2^53
-    lua.pushInteger(big);
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
+    // Invalid and truncated JSON return InvalidJson without touching the stack.
+    {
+        const top_before = lua.getTop();
+        try testing.expectError(error.InvalidJson, jsonToLuaTable(lua, "{invalid}", testing.allocator));
+        try testing.expectEqual(top_before, lua.getTop());
+    }
+    {
+        const top_before = lua.getTop();
+        try testing.expectError(error.InvalidJson, jsonToLuaTable(lua, "{\"key\":", testing.allocator));
+        try testing.expectEqual(top_before, lua.getTop());
+    }
+    // luaTableToJson leaves the stack and the values below it untouched.
+    {
+        lua.pushInteger(999);
+        lua.pushBoolean(true);
+        lua.createTable(0, 1);
+        _ = lua.pushString("k");
+        lua.pushInteger(1);
+        lua.rawSetTable(-3);
 
-    try jsonToLuaTable(lua, json, testing.allocator);
-    try testing.expect(lua.isInteger(-1));
-    try testing.expectEqual(big, try lua.toInteger(-1));
-    lua.pop(1);
+        const top_before = lua.getTop();
+        const json = try luaTableToJson(lua, -1, testing.allocator);
+        defer testing.allocator.free(json);
+        try testing.expectEqual(top_before, lua.getTop());
+        try testing.expect(lua.toBoolean(-2) == true);
+        try testing.expectEqual(@as(ziglua.Integer, 999), try lua.toInteger(-3));
+        lua.pop(3);
+    }
+    // jsonToLuaTable pushes exactly one value on success.
+    {
+        lua.pushInteger(42); // sentinel
+        const top_before = lua.getTop();
+        try jsonToLuaTable(lua, "{\"a\":1}", testing.allocator);
+        try testing.expectEqual(top_before + 1, lua.getTop());
+        try testing.expect(lua.isTable(-1));
+        lua.pop(1);
+        try testing.expectEqual(@as(ziglua.Integer, 42), try lua.toInteger(-1));
+        lua.pop(1);
+    }
+    // jsonToLuaTable restores the stack on error.
+    {
+        lua.pushInteger(77); // sentinel
+        const top_before = lua.getTop();
+        try testing.expectError(error.InvalidJson, jsonToLuaTable(lua, "!!!bad json!!!", testing.allocator));
+        try testing.expectEqual(top_before, lua.getTop());
+        try testing.expectEqual(@as(ziglua.Integer, 77), try lua.toInteger(-1));
+        lua.pop(1);
+    }
 }
 
-test "max Lua integer (2^63-1) round-trips without loss" {
+test "boolean key returns error.UnsupportedKeyType" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
-    const max_int: ziglua.Integer = std.math.maxInt(i64);
-    lua.pushInteger(max_int);
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    try jsonToLuaTable(lua, json, testing.allocator);
-    try testing.expect(lua.isInteger(-1));
-    try testing.expectEqual(max_int, try lua.toInteger(-1));
-    lua.pop(1);
-}
-
-test "negative integer round-trips" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    const n: ziglua.Integer = std.math.minInt(i64);
-    lua.pushInteger(n);
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    try jsonToLuaTable(lua, json, testing.allocator);
-    try testing.expectEqual(n, try lua.toInteger(-1));
-    lua.pop(1);
-}
-
-test "invalid JSON returns error.InvalidJson without stack mutation" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    const top_before = lua.getTop();
-    const result = jsonToLuaTable(lua, "{invalid}", testing.allocator);
-    try testing.expectError(error.InvalidJson, result);
-    try testing.expectEqual(top_before, lua.getTop());
-}
-
-test "truncated JSON returns error.InvalidJson" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    const top_before = lua.getTop();
-    const result = jsonToLuaTable(lua, "{\"key\":", testing.allocator);
-    try testing.expectError(error.InvalidJson, result);
-    try testing.expectEqual(top_before, lua.getTop());
-}
-
-test "stack hygiene — luaTableToJson leaves stack unchanged" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // Push some sentinel values first
-    lua.pushInteger(999);
-    lua.pushBoolean(true);
-
-    // Push a table to serialize
-    lua.createTable(0, 1);
-    _ = lua.pushString("k");
-    lua.pushInteger(1);
-    lua.rawSetTable(-3);
-
-    const top_before = lua.getTop();
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-
-    try testing.expectEqual(top_before, lua.getTop());
-
-    // Sentinels still intact
-    try testing.expect(lua.toBoolean(-2) == true);
-    try testing.expectEqual(@as(ziglua.Integer, 999), try lua.toInteger(-3));
-    lua.pop(3);
-}
-
-test "stack hygiene — jsonToLuaTable pushes exactly one value on success" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    lua.pushInteger(42); // sentinel
-    const top_before = lua.getTop();
-
-    try jsonToLuaTable(lua, "{\"a\":1}", testing.allocator);
-
-    try testing.expectEqual(top_before + 1, lua.getTop());
-    try testing.expect(lua.isTable(-1));
-    lua.pop(1);
-
-    try testing.expectEqual(@as(ziglua.Integer, 42), try lua.toInteger(-1));
-    lua.pop(1);
-}
-
-test "stack hygiene — jsonToLuaTable restores stack on error" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    lua.pushInteger(77); // sentinel
-    const top_before = lua.getTop();
-
-    const result = jsonToLuaTable(lua, "!!!bad json!!!", testing.allocator);
-    try testing.expectError(error.InvalidJson, result);
-    try testing.expectEqual(top_before, lua.getTop());
-    try testing.expectEqual(@as(ziglua.Integer, 77), try lua.toInteger(-1));
-    lua.pop(1);
-}
-
-test "fuzz — mixed integer and string keys in object" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // { [1] = "a", name = "b" }  — mixed keys, not a sequence
-    lua.createTable(0, 2);
-    lua.pushInteger(1);
-    _ = lua.pushString("a");
-    lua.rawSetTable(-3);
-    _ = lua.pushString("name");
-    _ = lua.pushString("b");
-    lua.rawSetTable(-3);
-
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-
-    // Must produce a JSON object
-    try testing.expect(json[0] == '{');
-}
-
-test "fuzz — boolean key returns error.UnsupportedKeyType" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // { [true] = 1 }
+    // { [true] = 1 } — a boolean key cannot be represented in JSON.
     lua.createTable(0, 1);
     lua.pushBoolean(true);
     lua.pushInteger(1);
     lua.rawSetTable(-3);
 
-    const result = luaTableToJson(lua, -1, testing.allocator);
-    try testing.expectError(error.UnsupportedKeyType, result);
-    lua.pop(1);
-}
-
-test "fuzz — JSON nested arrays at depth 9 return MaxDepthExceeded" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    const top_before = lua.getTop();
-    const result = jsonToLuaTable(lua, "[[[[[[[[[]]]]]]]]]", testing.allocator);
-    try testing.expectError(error.MaxDepthExceeded, result);
-    try testing.expectEqual(top_before, lua.getTop());
-}
-
-test "fuzz — deeply nested object at depth 9 returns MaxDepthExceeded" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // 9 levels: {"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{}}}}}}}}}}}
-    const deep = "{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{}}}}}}}}}}";
-    const top_before = lua.getTop();
-    const result = jsonToLuaTable(lua, deep, testing.allocator);
-    try testing.expectError(error.MaxDepthExceeded, result);
-    try testing.expectEqual(top_before, lua.getTop());
-}
-
-// ---------------------------------------------------------------------------
-// luaTableToJsonCapped / jsonToLuaTableCapped
-// ---------------------------------------------------------------------------
-
-test "luaTableToJsonCapped enforces caller-supplied cap" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // A small cap of 10 bytes — "hello" serialises to 7 bytes, fits fine.
-    _ = lua.pushString("hello");
-    const json = try luaTableToJsonCapped(lua, -1, testing.allocator, 16);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-    try testing.expectEqualStrings("\"hello\"", json);
-}
-
-test "luaTableToJsonCapped returns MaxSizeExceeded when over cap" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    _ = lua.pushString("hello world");
-    const result = luaTableToJsonCapped(lua, -1, testing.allocator, 5);
-    try testing.expectError(error.MaxSizeExceeded, result);
-    lua.pop(1);
-}
-
-test "luaTableToJson still uses MAX_SIZE (64 KiB) — unchanged" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // A string that fits under 64 KiB is accepted.
-    _ = lua.pushString("ok");
-    const json = try luaTableToJson(lua, -1, testing.allocator);
-    defer testing.allocator.free(json);
-    lua.pop(1);
-    try testing.expectEqualStrings("\"ok\"", json);
-}
-
-test "jsonToLuaTableCapped rejects input over max_size" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    const top_before = lua.getTop();
-    const result = jsonToLuaTableCapped(lua, "{\"ok\":true}", testing.allocator, 5);
-    try testing.expectError(error.MaxSizeExceeded, result);
-    try testing.expectEqual(top_before, lua.getTop());
-}
-
-test "jsonToLuaTableCapped accepts input within max_size" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    try jsonToLuaTableCapped(lua, "42", testing.allocator, 100);
-    try testing.expect(lua.isInteger(-1));
-    try testing.expectEqual(@as(ziglua.Integer, 42), try lua.toInteger(-1));
-    lua.pop(1);
-}
-
-test "jsonToLuaTable unchanged — no limit on input size" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // Even a large JSON string should still be accepted by jsonToLuaTable.
-    try jsonToLuaTable(lua, "{\"n\":1}", testing.allocator);
-    try testing.expect(lua.isTable(-1));
-    lua.pop(1);
-}
-
-test "depth 9 table → luaTableToJsonCapped propagates MaxDepthExceeded" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    lua.createTable(0, 0);
-    var level: u32 = 8;
-    while (level > 0) : (level -= 1) {
-        const inner = lua.getTop();
-        lua.createTable(0, 1);
-        _ = lua.pushString("inner");
-        lua.pushValue(inner);
-        lua.rawSetTable(-3);
-        lua.remove(inner);
-    }
-
-    const result = luaTableToJsonCapped(lua, -1, testing.allocator, 1024 * 1024);
-    try testing.expectError(error.MaxDepthExceeded, result);
+    try testing.expectError(error.UnsupportedKeyType, luaTableToJson(lua, -1, testing.allocator));
     lua.pop(1);
 }

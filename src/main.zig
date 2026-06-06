@@ -72,6 +72,7 @@ const lua_engine = @import("lua_engine.zig");
 const tg_schema = @import("tg_schema.zig");
 const metrics_mod = @import("metrics.zig");
 const io_pool = @import("io_pool.zig");
+const delay_mod = @import("delay.zig");
 
 const log = std.log.scoped(.main);
 
@@ -95,10 +96,12 @@ fn sigStop(sig: c_int) callconv(std.builtin.CallingConvention.c) void {
 // Metrics log thread — emits a snapshot every 60 s when METRICS_LOG=true
 // ---------------------------------------------------------------------------
 
-/// Format all 7 metric counters into `buf`. Returns the written slice.
+/// Format all 11 metric counters into `buf`. Returns the written slice.
+/// The throttle group reports reactive rate limiting: 429s seen, calls parked
+/// in the delay queue, calls shed on overflow, and the current queue depth.
 pub fn fmtMetrics(m: *const metrics_mod.Metrics, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf,
-        "io_jobs={d} io_inflight={d} io_err={d} io_timeout={d} coros_inflight={d} coros_reaped={d} tracked_fail={d}",
+        "io_jobs={d} io_inflight={d} io_err={d} io_timeout={d} coros_inflight={d} coros_reaped={d} tracked_fail={d} throttle_429={d} throttle_delayed={d} throttle_shed={d} throttle_depth={d}",
         .{
             m.io_jobs_total.load(.monotonic),
             m.io_jobs_inflight.load(.monotonic),
@@ -107,6 +110,10 @@ pub fn fmtMetrics(m: *const metrics_mod.Metrics, buf: []u8) []const u8 {
             m.coroutines_inflight.load(.monotonic),
             m.coroutines_reaped_total.load(.monotonic),
             m.tracked_send_failures_total.load(.monotonic),
+            m.throttle_429_total.load(.monotonic),
+            m.throttle_delayed_total.load(.monotonic),
+            m.throttle_shed_total.load(.monotonic),
+            m.throttle_delay_depth.load(.monotonic),
         },
     ) catch "[metrics fmt overflow]";
 }
@@ -115,7 +122,7 @@ fn metricsLogThread(m: *const metrics_mod.Metrics) void {
     const metrics_log = std.log.scoped(.metrics);
     while (true) {
         std.Thread.sleep(60 * std.time.ns_per_s);
-        var buf: [256]u8 = undefined;
+        var buf: [512]u8 = undefined;
         metrics_log.info("{s}", .{fmtMetrics(m, &buf)});
     }
 }
@@ -188,12 +195,14 @@ fn run(allocator: std.mem.Allocator) !void {
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
 
     // ── Startup banner — before server.init ───────────────────────────────────
-    log.info("zora starting (branch={s} release={d} schema={d} rules_api={d} api_validation={s})", .{
+    log.info("zora starting (branch={s} release={d} schema={d} rules_api={d} api_validation={s} delay_cap={d} retry_max_ms={d})", .{
         GIT_BRANCH,
         RELEASE,
         state_store.SCHEMA_VERSION,
         lua_engine.RULES_API_VERSION,
         @tagName(cfg.api_validation),
+        cfg.delay_queue_capacity,
+        cfg.retry_after_max_ms,
     });
 
     var stop = std.atomic.Value(bool).init(false);
@@ -212,6 +221,17 @@ fn run(allocator: std.mem.Allocator) !void {
     defer disp_q.deinit(allocator);
     disp_q.kind = .dispatcher;
 
+    // ── Throttle: delay queue + per-chat block map + requeue thread ───────────
+    var delay_q = delay_mod.DelayQueue.init(allocator, cfg.delay_queue_capacity);
+    var blocked_until = delay_mod.BlockedMap.init(allocator);
+
+    const requeue_t = try std.Thread.spawn(.{}, delay_mod.requeueThread, .{
+        delay_mod.RequeueArgs{
+            .delay_q = &delay_q, .disp_q = &disp_q, .stop = &stop,
+            .metrics = &g_metrics, .allocator = allocator,
+        },
+    });
+
     const disp_threads = try allocator.alloc(std.Thread, cfg.dispatcher_threads);
     defer allocator.free(disp_threads);
 
@@ -225,6 +245,10 @@ fn run(allocator: std.mem.Allocator) !void {
                 .allocator = allocator,
                 .stop = &stop,
                 .metrics = &g_metrics,
+                .delay_q = &delay_q,
+                .blocked_until = &blocked_until,
+                .retry_after_default_ms = cfg.retry_after_default_ms,
+                .retry_after_max_ms = cfg.retry_after_max_ms,
             },
         });
     }
@@ -364,8 +388,13 @@ fn run(allocator: std.mem.Allocator) !void {
     for (wqs) |*q| while (q.popTimeout(0)) |item| allocator.free(item.body);
     for (dbs) |*db| db.close();
     for (disp_threads) |t| t.join();
-    // Drain ApiCall items dispatchers didn't send before stop (free string payloads).
+    // Stop the requeue thread before draining either queue so nothing moves
+    // between them during teardown.
+    requeue_t.join();
+    // Drain ApiCall items still parked or queued (free string payloads).
+    delay_q.deinitDrain(allocator);
     while (disp_q.popTimeout(0)) |action| types.freeApiCall(action, allocator);
+    blocked_until.deinit();
     // Watcher thread is detached and cannot be joined; its rules_path dupe
     // is freed by the OS on process exit.
     log.info("shutdown complete", .{});
@@ -695,33 +724,44 @@ test "mock API down → server still returns 200 OK, no crash" {
 }
 
 // ---------------------------------------------------------------------------
-// fmtMetrics emits all 7 counter names in the expected format
+// fmtMetrics emits all 11 counter names in the expected format
 // ---------------------------------------------------------------------------
 
-test "fmtMetrics emits all 7 counter names" {
-    var m = metrics_mod.Metrics{};
-    var buf: [256]u8 = undefined;
-    const line = fmtMetrics(&m, &buf);
+test "fmtMetrics emits every counter name and reflects their values" {
+    // All eleven counter names appear in the formatted line.
+    {
+        var m = metrics_mod.Metrics{};
+        var buf: [512]u8 = undefined;
+        const line = fmtMetrics(&m, &buf);
 
-    try testing.expect(std.mem.indexOf(u8, line, "io_jobs=") != null);
-    try testing.expect(std.mem.indexOf(u8, line, "io_inflight=") != null);
-    try testing.expect(std.mem.indexOf(u8, line, "io_err=") != null);
-    try testing.expect(std.mem.indexOf(u8, line, "io_timeout=") != null);
-    try testing.expect(std.mem.indexOf(u8, line, "coros_inflight=") != null);
-    try testing.expect(std.mem.indexOf(u8, line, "coros_reaped=") != null);
-    try testing.expect(std.mem.indexOf(u8, line, "tracked_fail=") != null);
-}
+        try testing.expect(std.mem.indexOf(u8, line, "io_jobs=") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "io_inflight=") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "io_err=") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "io_timeout=") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "coros_inflight=") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "coros_reaped=") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "tracked_fail=") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "throttle_429=") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "throttle_delayed=") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "throttle_shed=") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "throttle_depth=") != null);
+    }
+    // Incremented counters are reflected in the output.
+    {
+        var m = metrics_mod.Metrics{};
+        _ = m.io_jobs_total.fetchAdd(5, .monotonic);
+        _ = m.io_errors_total.fetchAdd(2, .monotonic);
+        _ = m.tracked_send_failures_total.fetchAdd(1, .monotonic);
+        _ = m.throttle_429_total.fetchAdd(7, .monotonic);
+        _ = m.throttle_shed_total.fetchAdd(3, .monotonic);
 
-test "fmtMetrics reflects incremented counter values" {
-    var m = metrics_mod.Metrics{};
-    _ = m.io_jobs_total.fetchAdd(5, .monotonic);
-    _ = m.io_errors_total.fetchAdd(2, .monotonic);
-    _ = m.tracked_send_failures_total.fetchAdd(1, .monotonic);
+        var buf: [512]u8 = undefined;
+        const line = fmtMetrics(&m, &buf);
 
-    var buf: [256]u8 = undefined;
-    const line = fmtMetrics(&m, &buf);
-
-    try testing.expect(std.mem.indexOf(u8, line, "io_jobs=5") != null);
-    try testing.expect(std.mem.indexOf(u8, line, "io_err=2") != null);
-    try testing.expect(std.mem.indexOf(u8, line, "tracked_fail=1") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "io_jobs=5") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "io_err=2") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "tracked_fail=1") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "throttle_429=7") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "throttle_shed=3") != null);
+    }
 }

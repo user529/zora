@@ -319,21 +319,21 @@ const FIXTURE_SCHEMA =
     \\},"types":{}}
 ;
 
-test "SchemaStore.fromSlice parses methods and fields" {
-    const store = try SchemaStore.fromSlice(testing.allocator, FIXTURE_SCHEMA);
-    defer store.destroy(testing.allocator);
+test "fromSlice parses a schema and rejects malformed JSON" {
+    // A valid schema exposes its methods and fields; unknown methods are null.
+    {
+        const store = try SchemaStore.fromSlice(testing.allocator, FIXTURE_SCHEMA);
+        defer store.destroy(testing.allocator);
 
-    const sm = store.method("sendMessage") orelse return error.TestUnexpectedNull;
-    try testing.expectEqual(@as(usize, 3), sm.fields.len);
-    try testing.expectEqualStrings("chat_id", sm.fields[0].name);
-    try testing.expect(sm.fields[0].required);
-    try testing.expect(!sm.fields[2].required);
-
-    try testing.expect(store.method("sendDice") != null);
-    try testing.expect(store.method("noSuchMethod") == null);
-}
-
-test "SchemaStore.fromSlice rejects malformed JSON" {
+        const sm = store.method("sendMessage") orelse return error.TestUnexpectedNull;
+        try testing.expectEqual(@as(usize, 3), sm.fields.len);
+        try testing.expectEqualStrings("chat_id", sm.fields[0].name);
+        try testing.expect(sm.fields[0].required);
+        try testing.expect(!sm.fields[2].required);
+        try testing.expect(store.method("sendDice") != null);
+        try testing.expect(store.method("noSuchMethod") == null);
+    }
+    // Malformed JSON is a SyntaxError.
     try testing.expectError(
         error.SyntaxError,
         SchemaStore.fromSlice(testing.allocator, "{not json"),
@@ -348,7 +348,7 @@ fn pushParams(lua: *Lua, table_literal: [:0]const u8) !i32 {
     return lua.getTop();
 }
 
-test "validate accepts a well-formed call, rejects a missing required param" {
+test "validate accepts valid calls and rejects bad ones" {
     const store = try SchemaStore.fromSlice(testing.allocator, FIXTURE_SCHEMA);
     defer store.destroy(testing.allocator);
 
@@ -356,86 +356,59 @@ test "validate accepts a well-formed call, rejects a missing required param" {
     defer lua.deinit();
     lua.openBase();
 
+    // Well-formed call passes.
     {
         const idx = try pushParams(lua, "p = { chat_id = 1, text = 'hi' }");
         try validate(store, lua, idx, "sendMessage");
         lua.pop(1);
     }
+    // Missing required param → MissingRequired.
     {
         const idx = try pushParams(lua, "p = { text = 'hi' }"); // no chat_id
-        try testing.expectError(
-            error.MissingRequired,
-            validate(store, lua, idx, "sendMessage"),
-        );
+        try testing.expectError(error.MissingRequired, validate(store, lua, idx, "sendMessage"));
         lua.pop(1);
     }
-}
+    // Unknown method → UnknownMethod.
+    {
+        const idx = try pushParams(lua, "p = { chat_id = 1 }");
+        try testing.expectError(error.UnknownMethod, validate(store, lua, idx, "sendUnicorn"));
+        lua.pop(1);
+    }
+    // `text` is String-only; a table value is a TypeMismatch.
+    {
+        const idx = try pushParams(lua, "p = { chat_id = 1, text = {} }");
+        try testing.expectError(error.TypeMismatch, validate(store, lua, idx, "sendMessage"));
+        lua.pop(1);
+    }
+    // `chat_id` is Integer|String (a mixed union → kind `any`): a table value is
+    // not type-checked — the validator never rejects what it cannot classify.
+    {
+        const idx = try pushParams(lua, "p = { chat_id = {}, text = 'ok' }");
+        try validate(store, lua, idx, "sendMessage");
+        lua.pop(1);
+    }
 
-test "validate rejects an unknown method" {
-    const store = try SchemaStore.fromSlice(testing.allocator, FIXTURE_SCHEMA);
-    defer store.destroy(testing.allocator);
+    // InputFile fields accept a string (file_id or URL) and unclassifiable values.
+    {
+        const schema =
+            \\{"methods":{"sendPhoto":{"fields":[
+            \\  {"name":"chat_id","types":["Integer","String"],"required":true},
+            \\  {"name":"photo","types":["InputFile"],"required":true}
+            \\]}},"types":{}}
+        ;
+        const photo_store = try SchemaStore.fromSlice(testing.allocator, schema);
+        defer photo_store.destroy(testing.allocator);
 
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
+        // String file_id passes — not a TypeMismatch.
+        const idx = try pushParams(lua, "p = { chat_id = 1, photo = 'AgACAgIAAxk' }");
+        try validate(photo_store, lua, idx, "sendPhoto");
+        lua.pop(1);
 
-    const idx = try pushParams(lua, "p = { chat_id = 1 }");
-    try testing.expectError(
-        error.UnknownMethod,
-        validate(store, lua, idx, "sendUnicorn"),
-    );
-    lua.pop(1);
-}
-
-test "validate rejects a primitive type mismatch" {
-    const store = try SchemaStore.fromSlice(testing.allocator, FIXTURE_SCHEMA);
-    defer store.destroy(testing.allocator);
-
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-
-    // `text` is String-only; a table value must be rejected.
-    const idx = try pushParams(lua, "p = { chat_id = 1, text = {} }");
-    try testing.expectError(
-        error.TypeMismatch,
-        validate(store, lua, idx, "sendMessage"),
-    );
-    lua.pop(1);
-
-    // `chat_id` is Integer|String (a mixed union → kind `any`): a table value
-    // for chat_id is NOT type-checked — the validator never rejects what it
-    // cannot unambiguously classify.
-    const idx2 = try pushParams(lua, "p = { chat_id = {}, text = 'ok' }");
-    try validate(store, lua, idx2, "sendMessage");
-    lua.pop(1);
-}
-
-test "InputFile field accepts a Lua string (no false TypeMismatch)" {
-    // InputFile can be passed as a string (file_id or URL) from Lua rules.
-    // The validator must not reject string values for InputFile-typed fields.
-    const schema =
-        \\{"methods":{"sendPhoto":{"fields":[
-        \\  {"name":"chat_id","types":["Integer","String"],"required":true},
-        \\  {"name":"photo","types":["InputFile"],"required":true}
-        \\]}},"types":{}}
-    ;
-    const store = try SchemaStore.fromSlice(testing.allocator, schema);
-    defer store.destroy(testing.allocator);
-
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-
-    // String file_id for photo must pass — not a TypeMismatch.
-    const idx = try pushParams(lua, "p = { chat_id = 1, photo = 'AgACAgIAAxk' }");
-    try validate(store, lua, idx, "sendPhoto");
-    lua.pop(1);
-
-    // Table value for photo also passes (InputFile is .any — unclassifiable).
-    const idx2 = try pushParams(lua, "p = { chat_id = 1, photo = {} }");
-    try validate(store, lua, idx2, "sendPhoto");
-    lua.pop(1);
+        // Table value also passes (InputFile is .any — unclassifiable).
+        const idx2 = try pushParams(lua, "p = { chat_id = 1, photo = {} }");
+        try validate(photo_store, lua, idx2, "sendPhoto");
+        lua.pop(1);
+    }
 }
 
 test "SchemaSlot with no schema → get() is null (Tier-0)" {

@@ -318,27 +318,28 @@ test "4 producers x 1000 items, capacity 64 — no deadlock, completes" {
     for (received) |got| try testing.expect(got);
 }
 
-test "Queue is generic — instantiate with u32 and u8" {
-    // u32 queue
-    var q32 = try Queue(u32).init(testing.allocator, 4);
-    defer q32.deinit(testing.allocator);
-    try q32.push(0xDEAD_BEEF);
-    try testing.expectEqual(@as(u32, 0xDEAD_BEEF), q32.pop());
+test "Queue is generic over item type, including slices" {
+    // Scalar element types: u32 and u8.
+    {
+        var q32 = try Queue(u32).init(testing.allocator, 4);
+        defer q32.deinit(testing.allocator);
+        try q32.push(0xDEAD_BEEF);
+        try testing.expectEqual(@as(u32, 0xDEAD_BEEF), q32.pop());
 
-    // u8 queue
-    var q8 = try Queue(u8).init(testing.allocator, 4);
-    defer q8.deinit(testing.allocator);
-    try q8.push(0xFF);
-    try testing.expectEqual(@as(u8, 0xFF), q8.pop());
-}
-
-test "Queue([]const u8) handles slice items" {
-    var qs = try Queue([]const u8).init(testing.allocator, 4);
-    defer qs.deinit(testing.allocator);
-    try qs.push("hello");
-    try qs.push("world");
-    try testing.expectEqualStrings("hello", qs.pop());
-    try testing.expectEqualStrings("world", qs.pop());
+        var q8 = try Queue(u8).init(testing.allocator, 4);
+        defer q8.deinit(testing.allocator);
+        try q8.push(0xFF);
+        try testing.expectEqual(@as(u8, 0xFF), q8.pop());
+    }
+    // Slice element type.
+    {
+        var qs = try Queue([]const u8).init(testing.allocator, 4);
+        defer qs.deinit(testing.allocator);
+        try qs.push("hello");
+        try qs.push("world");
+        try testing.expectEqualStrings("hello", qs.pop());
+        try testing.expectEqualStrings("world", qs.pop());
+    }
 }
 
 test "tryPop returns null on empty queue" {
@@ -350,14 +351,14 @@ test "tryPop returns null on empty queue" {
     try testing.expectEqual(@as(?u32, null), q.popTimeout(0));
 }
 
-test "QueueKind: @tagName values match expected log labels" {
+test "QueueKind tag names match log labels and default to .worker" {
+    // @tagName values are the labels used in logs.
     try testing.expectEqualStrings("worker",     @tagName(QueueKind.worker));
     try testing.expectEqualStrings("dispatcher", @tagName(QueueKind.dispatcher));
     try testing.expectEqualStrings("io_job",     @tagName(QueueKind.io_job));
     try testing.expectEqualStrings("io_result",  @tagName(QueueKind.io_result));
-}
 
-test "QueueKind: Queue defaults to .worker, field is settable" {
+    // A new Queue defaults to .worker; the field is settable.
     var q = try Queue(u32).init(testing.allocator, 4);
     defer q.deinit(testing.allocator);
     try testing.expectEqual(QueueKind.worker, q.kind);

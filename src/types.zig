@@ -29,6 +29,9 @@ pub const ApiCall = struct {
     },
     /// Non-null for tracked sends only. Value-typed — freeApiCall unchanged.
     tracking: ?struct { worker_id: u8, coro_id: u32 } = null,
+    /// Outbound chat id for the throttle (blocked_until divert + 429 park).
+    /// Null ⇒ no chat target. Value-typed — freeApiCall unchanged.
+    route: ?struct { chat_id: i64 } = null,
 };
 
 pub fn freeApiCall(call: ApiCall, allocator: std.mem.Allocator) void {
@@ -100,6 +103,9 @@ pub const Config = struct {
     max_inflight_per_worker: u16,
     workflow_deadline_ms:    u64,
     metrics_log:             bool,
+    delay_queue_capacity:    u16,
+    retry_after_max_ms:      u64,
+    retry_after_default_ms:  u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -109,82 +115,94 @@ pub const Config = struct {
 // ApiCall lifecycle — no leaks under testing.allocator
 // ---------------------------------------------------------------------------
 
-test "freeApiCall releases method and body" {
-    const call = ApiCall{
-        .method  = try std.testing.allocator.dupe(u8, "sendDice"),
-        .payload = .{ .json = try std.testing.allocator.dupe(u8, "{\"chat_id\":1}") },
-    };
-    freeApiCall(call, std.testing.allocator);
+test "freeApiCall releases json and multipart payloads" {
+    const alloc = std.testing.allocator;
+
+    // json payload: method and body are freed.
+    {
+        const call = ApiCall{
+            .method  = try alloc.dupe(u8, "sendDice"),
+            .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1}") },
+        };
+        freeApiCall(call, alloc);
+    }
+    // multipart payload: every part (name, content, optional filename) is freed.
+    {
+        var parts = try alloc.alloc(MultipartPart, 2);
+        parts[0] = .{
+            .name     = try alloc.dupe(u8, "caption"),
+            .content  = try alloc.dupe(u8, "hello"),
+            .filename = null,
+        };
+        parts[1] = .{
+            .name     = try alloc.dupe(u8, "photo"),
+            .content  = try alloc.dupe(u8, "\xff\xd8\xff"),
+            .filename = try alloc.dupe(u8, "pic.jpg"),
+        };
+        const call = ApiCall{
+            .method  = try alloc.dupe(u8, "sendPhoto"),
+            .payload = .{ .multipart = parts },
+        };
+        freeApiCall(call, alloc);
+    }
 }
 
 test "freeApiCalls releases a slice of ApiCalls" {
-    var calls = try std.testing.allocator.alloc(ApiCall, 3);
+    const alloc = std.testing.allocator;
+    var calls = try alloc.alloc(ApiCall, 3);
     calls[0] = .{
-        .method  = try std.testing.allocator.dupe(u8, "sendMessage"),
-        .payload = .{ .json = try std.testing.allocator.dupe(u8, "{}") },
-    };
-    calls[1] = .{
-        .method  = try std.testing.allocator.dupe(u8, "editMessageText"),
-        .payload = .{ .json = try std.testing.allocator.dupe(u8, "{\"chat_id\":1,\"message_id\":2,\"text\":\"x\"}") },
-    };
-    calls[2] = .{
-        .method  = try std.testing.allocator.dupe(u8, "deleteMessage"),
-        .payload = .{ .json = try std.testing.allocator.dupe(u8, "{\"chat_id\":1,\"message_id\":2}") },
-    };
-    freeApiCalls(calls, std.testing.allocator);
-}
-
-// ---------------------------------------------------------------------------
-// freeApiCall handles multipart payload — no leaks
-// ---------------------------------------------------------------------------
-
-test "freeApiCall on multipart ApiCall releases all parts" {
-    const alloc = std.testing.allocator;
-    var parts = try alloc.alloc(MultipartPart, 2);
-    parts[0] = .{
-        .name     = try alloc.dupe(u8, "caption"),
-        .content  = try alloc.dupe(u8, "hello"),
-        .filename = null,
-    };
-    parts[1] = .{
-        .name     = try alloc.dupe(u8, "photo"),
-        .content  = try alloc.dupe(u8, "\xff\xd8\xff"),
-        .filename = try alloc.dupe(u8, "pic.jpg"),
-    };
-    const call = ApiCall{
-        .method  = try alloc.dupe(u8, "sendPhoto"),
-        .payload = .{ .multipart = parts },
-    };
-    freeApiCall(call, alloc);
-}
-
-test "freeApiCall on json ApiCall releases body" {
-    const alloc = std.testing.allocator;
-    const call = ApiCall{
-        .method  = try alloc.dupe(u8, "sendMessage"),
-        .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1}") },
-    };
-    freeApiCall(call, alloc);
-}
-
-test "ApiCall tracking field defaults null, can be set, freeApiCall unchanged" {
-    const alloc = std.testing.allocator;
-    // tracked call
-    const tracked = ApiCall{
-        .method   = try alloc.dupe(u8, "sendMessage"),
-        .payload  = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1}") },
-        .tracking = .{ .worker_id = 2, .coro_id = 99 },
-    };
-    defer freeApiCall(tracked, alloc);
-    try std.testing.expect(tracked.tracking != null);
-    try std.testing.expectEqual(@as(u8, 2),  tracked.tracking.?.worker_id);
-    try std.testing.expectEqual(@as(u32, 99), tracked.tracking.?.coro_id);
-
-    // untracked call — default null
-    const plain = ApiCall{
         .method  = try alloc.dupe(u8, "sendMessage"),
         .payload = .{ .json = try alloc.dupe(u8, "{}") },
     };
-    defer freeApiCall(plain, alloc);
-    try std.testing.expect(plain.tracking == null);
+    calls[1] = .{
+        .method  = try alloc.dupe(u8, "editMessageText"),
+        .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1,\"message_id\":2,\"text\":\"x\"}") },
+    };
+    calls[2] = .{
+        .method  = try alloc.dupe(u8, "deleteMessage"),
+        .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1,\"message_id\":2}") },
+    };
+    freeApiCalls(calls, alloc);
+}
+
+test "optional ApiCall fields default null and survive free" {
+    const alloc = std.testing.allocator;
+
+    // route: defaults null; when set, holds the chat_id and frees cleanly.
+    {
+        const routed = ApiCall{
+            .method  = try alloc.dupe(u8, "sendMessage"),
+            .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":5}") },
+            .route   = .{ .chat_id = 5 },
+        };
+        defer freeApiCall(routed, alloc);
+        try std.testing.expect(routed.route != null);
+        try std.testing.expectEqual(@as(i64, 5), routed.route.?.chat_id);
+
+        const plain = ApiCall{
+            .method  = try alloc.dupe(u8, "sendMessage"),
+            .payload = .{ .json = try alloc.dupe(u8, "{}") },
+        };
+        defer freeApiCall(plain, alloc);
+        try std.testing.expect(plain.route == null);
+    }
+    // tracking: defaults null; when set, holds worker_id/coro_id and frees cleanly.
+    {
+        const tracked = ApiCall{
+            .method   = try alloc.dupe(u8, "sendMessage"),
+            .payload  = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1}") },
+            .tracking = .{ .worker_id = 2, .coro_id = 99 },
+        };
+        defer freeApiCall(tracked, alloc);
+        try std.testing.expect(tracked.tracking != null);
+        try std.testing.expectEqual(@as(u8, 2),  tracked.tracking.?.worker_id);
+        try std.testing.expectEqual(@as(u32, 99), tracked.tracking.?.coro_id);
+
+        const plain = ApiCall{
+            .method  = try alloc.dupe(u8, "sendMessage"),
+            .payload = .{ .json = try alloc.dupe(u8, "{}") },
+        };
+        defer freeApiCall(plain, alloc);
+        try std.testing.expect(plain.tracking == null);
+    }
 }
