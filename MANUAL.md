@@ -351,8 +351,21 @@ completes.
 ### Yielding functions (park the coroutine, return when I/O completes)
 
 ```lua
--- HTTP request; returns { status: integer, body: string }
-local resp = bot.http_request{ method="GET", url="...", headers={}, body="" }
+-- HTTP request; returns { status: integer, body: string, headers: table }
+-- `headers` in the request is an optional map of name → value (both strings).
+-- A transport error returns status = 0 with an empty headers table, so the
+-- result is always safe to index.
+local resp = bot.http_request{
+    method  = "GET",
+    url     = "https://example.com/api",
+    headers = { Authorization = "Bearer " .. token, Accept = "application/json" },
+    body    = "",
+}
+-- The response headers table keeps each name in the server's original casing.
+-- Indexing is case-insensitive, so all three reads return the same value:
+local ctype = resp.headers["content-type"]   -- or ["Content-Type"], ["CONTENT-TYPE"]
+-- pairs() iterates the original casing.
+for name, value in pairs(resp.headers) do bot.log("info", name .. ": " .. value) end
 
 -- Run a subprocess by argv (no shell — safe for untrusted input)
 -- `domain` comes from the user but is passed as a single argv element,

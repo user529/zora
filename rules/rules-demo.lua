@@ -187,15 +187,37 @@ function on_message(update)
     return {}
 end
 
--- ── ILLUSTRATIONS (documentation only — never executed) ──────────────────────
+-- ── ILLUSTRATIONS ──────────────────────
 -- The engine also provides external I/O and file upload. A self-contained demo
 -- cannot run these safely, so they appear here for reference only. In a real
 -- rule they would sit inside on_message or a handler.
 --
--- HTTP request (parks the coroutine; returns { status = <int>, body = <string> }):
---   local resp = bot.http_request{ method = "GET", url = "https://example.invalid",
---                                  headers = "", body = "" }
---   bot.log("info", "status " .. resp.status)
+-- HTTP request (parks the coroutine while the io_pool runs the call; the worker
+-- keeps processing other updates meanwhile). Returns
+--   { status = <int>, body = <string>, headers = <table> }
+-- on success, and the same shape with status = 0 and an empty headers table on a
+-- transport error — so resp.status and resp.headers are always safe to read.
+--
+-- Request `headers` is an OPTIONAL map of name → value, both strings (the older
+-- single-string form is now rejected). Response `headers` stores each header
+-- under the server's verbatim casing but indexes case-insensitively, so
+-- ["Content-Type"], ["content-type"], and ["CONTENT-TYPE"] all return the same
+-- value; pairs() still iterates the verbatim keys.
+--   local resp = bot.http_request{
+--       method  = "GET",
+--       url     = "https://example.invalid/api",
+--       headers = { Authorization = "Bearer " .. token, Accept = "application/json" },
+--       body    = "",
+--   }
+--   if resp.status == 200 then
+--       local ctype = resp.headers["content-type"] or "?"   -- case-insensitive
+--       bot.log("info", "ok, " .. #resp.body .. " bytes of " .. ctype)
+--       for name, value in pairs(resp.headers) do            -- verbatim casing
+--           bot.log("info", name .. ": " .. value)
+--       end
+--   else
+--       bot.log("warn", "request failed, status " .. resp.status)
+--   end
 --
 -- Run a subprocess by argv — no shell, safe for untrusted args
 -- (returns { exit_code = <int>, stdout = <string> }):
