@@ -212,7 +212,7 @@ fn run(allocator: std.mem.Allocator) !void {
     // g_metrics is module-level, so its lifetime outlives run() and the
     // detached thread safely reads it after run() returns.
     if (cfg.metrics_log) {
-        const metrics_t = try std.Thread.spawn(.{}, metricsLogThread, .{&g_metrics});
+        const metrics_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, metricsLogThread, .{&g_metrics});
         metrics_t.detach();
     }
 
@@ -225,7 +225,7 @@ fn run(allocator: std.mem.Allocator) !void {
     var delay_q = delay_mod.DelayQueue.init(allocator, cfg.delay_queue_capacity);
     var blocked_until = delay_mod.BlockedMap.init(allocator);
 
-    const requeue_t = try std.Thread.spawn(.{}, delay_mod.requeueThread, .{
+    const requeue_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, delay_mod.requeueThread, .{
         delay_mod.RequeueArgs{
             .delay_q = &delay_q, .disp_q = &disp_q, .stop = &stop,
             .metrics = &g_metrics, .allocator = allocator,
@@ -236,7 +236,7 @@ fn run(allocator: std.mem.Allocator) !void {
     defer allocator.free(disp_threads);
 
     for (0..cfg.dispatcher_threads) |i| {
-        disp_threads[i] = try std.Thread.spawn(.{}, disp_mod.dispatcherThread, .{
+        disp_threads[i] = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, disp_mod.dispatcherThread, .{
             disp_mod.DispatcherArgs{
                 .id = @intCast(i),
                 .queue = &disp_q,
@@ -311,7 +311,7 @@ fn run(allocator: std.mem.Allocator) !void {
     for (0..cfg.worker_count) |i| {
         dbs[i] = try state_store.StateStore.open(allocator, cfg.db_path);
         opened_dbs += 1;
-        worker_threads[i] = try std.Thread.spawn(.{}, worker_mod.workerThread, .{
+        worker_threads[i] = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, worker_mod.workerThread, .{
             worker_mod.WorkerArgs{
                 .id = @intCast(i),
                 .rules_path = cfg.rules_file,
@@ -335,7 +335,7 @@ fn run(allocator: std.mem.Allocator) !void {
 
     // ── Hot-reload watcher (detached; no graceful shutdown in prototype) ───────
     {
-        const watcher_t = try std.Thread.spawn(.{}, watcher.watcherThread, .{
+        const watcher_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, watcher.watcherThread, .{
             watcher.WatcherArgs{
                 .rules_path = cfg.rules_file,
                 .allocator = allocator,
@@ -346,7 +346,7 @@ fn run(allocator: std.mem.Allocator) !void {
 
     // ── Schema-file watcher (detached; mirrors the rules watcher) ─────────────
     {
-        const schema_watcher_t = try std.Thread.spawn(.{}, tg_schema.schemaWatcherThread, .{
+        const schema_watcher_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, tg_schema.schemaWatcherThread, .{
             tg_schema.SchemaWatcherArgs{
                 .schema_file = cfg.schema_file,
                 .slot = &g_schema_slot,

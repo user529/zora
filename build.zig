@@ -4,25 +4,20 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // --- release: read from RELEASE file, auto-increment on each build ---
+    // --- release: read from RELEASE file ---
     const release_number: u32 = blk: {
-        const content = b.build_root.handle.readFileAlloc(b.allocator, "RELEASE", 16) catch break :blk 0;
+        const io = b.graph.io;
+        const content = b.build_root.handle.readFileAlloc(io, "RELEASE", b.allocator, .limited(16)) catch break :blk 0;
         defer b.allocator.free(content);
         const n = std.fmt.parseInt(u32, std.mem.trim(u8, content, " \n\r\t"), 10) catch break :blk 0;
-        const f = b.build_root.handle.createFile("RELEASE", .{}) catch break :blk n;
-        defer f.close();
-        var nbuf: [16]u8 = undefined;
-        const next_str = std.fmt.bufPrint(&nbuf, "{d}\n", .{n + 1}) catch break :blk n;
-        f.writeAll(next_str) catch {};
         break :blk n;
     };
 
     // --- git_branch: branch name at build time, falls back to "unknown" ---
     const git_branch: []const u8 = blk: {
-        const result = std.process.Child.run(.{
-            .allocator = b.allocator,
+        const result = std.process.run(b.allocator, b.graph.io, .{
             .argv = &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
-            .cwd = b.build_root.path orelse ".",
+            .cwd = .{ .path = b.build_root.path orelse "." },
         }) catch break :blk "unknown";
         const trimmed = std.mem.trim(u8, result.stdout, " \n\r\t");
         if (trimmed.len == 0) break :blk "unknown";
@@ -69,20 +64,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .link_libc = true,
     });
     exe_mod.addOptions("build_options", options);
     exe_mod.addImport("ziglua", ziglua_mod);
+    exe_mod.addCSourceFile(.{
+        .file = b.path("vendor/sqlite3.c"),
+        .flags = sqlite_flags,
+    });
+    exe_mod.addIncludePath(b.path("vendor"));
 
     const exe = b.addExecutable(.{
         .name = "zora",
         .root_module = exe_mod,
     });
-    exe.addCSourceFile(.{
-        .file = b.path("vendor/sqlite3.c"),
-        .flags = sqlite_flags,
-    });
-    exe.addIncludePath(b.path("vendor"));
-    exe.linkLibC();
 
     // TSan requires the LLVM backend; self-hosted backend silently drops
     // instrumentation.  Forcing use_llvm here makes Debug+TSan work too.
@@ -101,6 +96,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
 
     const src_files = [_][]const u8{
+        "src/rt.zig",
         "src/types.zig",
         "src/config.zig",
         "src/queue.zig",
@@ -112,6 +108,7 @@ pub fn build(b: *std.Build) void {
         "src/lua_api.zig",
         "src/watcher.zig",
         "src/worker.zig",
+        "src/delay.zig",
         "src/dispatcher.zig",
         "src/server.zig",
         "src/main.zig",
@@ -122,21 +119,28 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(src),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         });
         test_mod.addOptions("build_options", options);
         test_mod.addImport("ziglua", ziglua_mod);
+        test_mod.addCSourceFile(.{
+            .file = b.path("vendor/sqlite3.c"),
+            .flags = sqlite_flags,
+        });
+        test_mod.addIncludePath(b.path("vendor"));
 
         const unit_tests = b.addTest(.{
             .root_module = test_mod,
         });
-        unit_tests.addCSourceFile(.{
-            .file = b.path("vendor/sqlite3.c"),
-            .flags = sqlite_flags,
-        });
-        unit_tests.addIncludePath(b.path("vendor"));
-        unit_tests.linkLibC();
 
         const run_tests = b.addRunArtifact(unit_tests);
         test_step.dependOn(&run_tests.step);
+
+        // Per-module step: "test-<basename>" (e.g. src/types.zig -> test-types).
+        // Lets the migration validate one module at a time.
+        const base = std.fs.path.stem(src);
+        const step_name = b.fmt("test-{s}", .{base});
+        const mod_step = b.step(step_name, b.fmt("Run {s} tests", .{src}));
+        mod_step.dependOn(&run_tests.step);
     }
 }

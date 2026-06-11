@@ -49,6 +49,9 @@ pub const ApiCtx = struct {
 
 const REGISTRY_KEY: [:0]const u8 = "_zora_ctx";
 
+/// Registry key for the shared, case-insensitive response-header metatable.
+const HEADER_MT_KEY: [:0]const u8 = "zora.header_mt";
+
 // ---------------------------------------------------------------------------
 // Coroutine I/O types — shared between lua_api, lua_engine, and worker
 // ---------------------------------------------------------------------------
@@ -57,7 +60,7 @@ const REGISTRY_KEY: [:0]const u8 = "_zora_ctx";
 /// The IoJob references these slices — they must outlive the io_pool job.
 /// Free with freeOwnedStrings when the coroutine finishes, errors, or is reaped.
 pub const OwnedStrings = union(enum) {
-    http: struct { method: []u8, url: []u8, headers: []u8, body: []u8 },
+    http: struct { method: []u8, url: []u8, headers: []std.http.Header, body: []u8 },
     exec: struct { argv: [][]u8 },  // each element is a duped arg; the slice itself is also allocated
     shell: struct { command: []u8 },
     none,
@@ -77,6 +80,10 @@ pub fn freeOwnedStrings(strings: OwnedStrings, allocator: std.mem.Allocator) voi
         .http => |h| {
             allocator.free(h.method);
             allocator.free(h.url);
+            for (h.headers) |hdr| {
+                allocator.free(hdr.name);
+                allocator.free(hdr.value);
+            }
             allocator.free(h.headers);
             allocator.free(h.body);
         },
@@ -141,6 +148,9 @@ pub fn register(lua: *Lua, ctx: *ApiCtx, rules_api_version: u32) void {
     // bot.rules_api_version = rules_api_version
     lua.pushInteger(@intCast(rules_api_version));
     lua.setField(-2, "rules_api_version");
+
+    // Stash the shared response-header metatable for pushIoResult to attach.
+    installHeaderMetatable(lua);
 
     // _G.bot = bot_table
     lua.setGlobal("bot");
@@ -665,27 +675,139 @@ fn botShellQuote(state: ?*ziglua.LuaState) callconv(.c) c_int {
 // bot.http_request{ method, url, headers?, body? } — yield-ing HTTP
 // ---------------------------------------------------------------------------
 
+const HeaderError = error{ EmptyName, BadNameByte, BadValueByte };
+
+/// A header name must be a non-empty RFC-7230-ish token: every byte printable
+/// ASCII (0x21..0x7e) and not ':'. Rejects controls, space, CRLF, NUL, DEL,
+/// high bytes — the set std.http would assert on, plus stricter cleanliness.
+/// A plain byte loop avoids relying on std.mem.indexOf* so it is immune to
+/// stdlib naming changes in that family of helpers.
+fn validateHeaderName(name: []const u8) HeaderError!void {
+    if (name.len == 0) return error.EmptyName;
+    for (name) |c| {
+        if (c < 0x21 or c > 0x7e or c == ':') return error.BadNameByte;
+    }
+}
+
+/// A header value may hold most bytes but never CR, LF, or NUL (header
+/// injection / request smuggling).
+fn validateHeaderValue(value: []const u8) HeaderError!void {
+    for (value) |c| {
+        if (c == '\r' or c == '\n' or c == 0) return error.BadValueByte;
+    }
+}
+
+/// Free an owned []http.Header slice (each name+value, then the slice).
+fn freeHeaderSlice(allocator: std.mem.Allocator, headers: []std.http.Header) void {
+    for (headers) |hdr| {
+        allocator.free(hdr.name);
+        allocator.free(hdr.value);
+    }
+    allocator.free(headers);
+}
+
+/// Free a partially-built header list (used on the error unwinding paths).
+fn freeHeaderList(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(std.http.Header)) void {
+    for (list.items) |hdr| {
+        allocator.free(hdr.name);
+        allocator.free(hdr.value);
+    }
+    list.deinit(allocator);
+}
+
 fn botHttpRequest(state: ?*ziglua.LuaState) callconv(.c) c_int {
     const lua: *Lua = @ptrCast(state.?);
     lua.checkType(1, .table);
     const ctx = getCtx(lua);
     const alloc = ctx.allocator;
 
-    // Read fields from the argument table.
+    // Read method and url from the argument table.
     _ = lua.getField(1, "method");
     const method_raw = lua.checkString(-1);
     _ = lua.getField(1, "url");
     const url_raw = lua.checkString(-1);
-    _ = lua.getField(1, "headers");
-    const headers_raw: []const u8 = if (lua.isString(-1)) lua.checkString(-1) else "";
+
     _ = lua.getField(1, "body");
     const body_raw: []const u8 = if (lua.isString(-1)) lua.checkString(-1) else "";
 
-    // Dupe all strings — they must outlive the coroutine yield.
-    const method  = alloc.dupe(u8, method_raw)  catch lua.raiseErrorStr("http_request: OOM", .{});
-    const url     = alloc.dupe(u8, url_raw)     catch { alloc.free(method); lua.raiseErrorStr("http_request: OOM", .{}); };
-    const headers = alloc.dupe(u8, headers_raw) catch { alloc.free(method); alloc.free(url); lua.raiseErrorStr("http_request: OOM", .{}); };
-    const body    = alloc.dupe(u8, body_raw)    catch { alloc.free(method); alloc.free(url); alloc.free(headers); lua.raiseErrorStr("http_request: OOM", .{}); };
+    // Read the optional headers map. A string (the old, dropped form) is now
+    // an error so the new table contract is unambiguous.
+    _ = lua.getField(1, "headers");
+    const headers_idx = lua.getTop();
+    const htype = lua.typeOf(headers_idx);
+    if (htype == .string)
+        lua.raiseErrorStr("http_request: headers must be a table", .{});
+
+    // Validate, cap, and dupe each header into an owned []http.Header.
+    var hdr_list: std.ArrayListUnmanaged(std.http.Header) = .empty;
+    if (htype == .table) {
+        var total_bytes: usize = 0;
+        lua.pushNil();
+        while (lua.next(headers_idx)) {
+            // key at -2, value at -1
+            if (lua.typeOf(-2) != .string or lua.typeOf(-1) != .string) {
+                freeHeaderList(alloc, &hdr_list);
+                lua.raiseErrorStr("http_request: header name and value must be strings", .{});
+            }
+            const nm = lua.toString(-2) catch unreachable;
+            const vl = lua.toString(-1) catch unreachable;
+            validateHeaderName(nm) catch {
+                freeHeaderList(alloc, &hdr_list);
+                lua.raiseErrorStr("http_request: invalid header name", .{});
+            };
+            validateHeaderValue(vl) catch {
+                freeHeaderList(alloc, &hdr_list);
+                lua.raiseErrorStr("http_request: invalid header value", .{});
+            };
+            if (hdr_list.items.len >= 64) {
+                freeHeaderList(alloc, &hdr_list);
+                lua.raiseErrorStr("http_request: too many headers (max 64)", .{});
+            }
+            total_bytes += nm.len + vl.len;
+            if (total_bytes > 16 * 1024) {
+                freeHeaderList(alloc, &hdr_list);
+                lua.raiseErrorStr("http_request: headers too large (max 16 KB)", .{});
+            }
+            const nm_d = alloc.dupe(u8, nm) catch {
+                freeHeaderList(alloc, &hdr_list);
+                lua.raiseErrorStr("http_request: OOM", .{});
+            };
+            const vl_d = alloc.dupe(u8, vl) catch {
+                alloc.free(nm_d);
+                freeHeaderList(alloc, &hdr_list);
+                lua.raiseErrorStr("http_request: OOM", .{});
+            };
+            hdr_list.append(alloc, .{ .name = nm_d, .value = vl_d }) catch {
+                alloc.free(nm_d);
+                alloc.free(vl_d);
+                freeHeaderList(alloc, &hdr_list);
+                lua.raiseErrorStr("http_request: OOM", .{});
+            };
+            lua.pop(1); // pop value, keep key for next()
+        }
+    }
+    // toOwnedSlice failure leaves the list buffer intact, so freeHeaderList here is not a double-free.
+    const headers = hdr_list.toOwnedSlice(alloc) catch {
+        freeHeaderList(alloc, &hdr_list);
+        lua.raiseErrorStr("http_request: OOM", .{});
+    };
+
+    // Dupe the scalar payload strings. On OOM, also free the header slice.
+    const method = alloc.dupe(u8, method_raw) catch {
+        freeHeaderSlice(alloc, headers);
+        lua.raiseErrorStr("http_request: OOM", .{});
+    };
+    const url = alloc.dupe(u8, url_raw) catch {
+        alloc.free(method);
+        freeHeaderSlice(alloc, headers);
+        lua.raiseErrorStr("http_request: OOM", .{});
+    };
+    const body = alloc.dupe(u8, body_raw) catch {
+        alloc.free(method);
+        alloc.free(url);
+        freeHeaderSlice(alloc, headers);
+        lua.raiseErrorStr("http_request: OOM", .{});
+    };
 
     const owned = OwnedStrings{ .http = .{
         .method  = method,
@@ -859,10 +981,113 @@ fn botSendMessageTracked(state: ?*ziglua.LuaState) callconv(.c) c_int {
 }
 
 // ---------------------------------------------------------------------------
+// Response-header table: case-insensitive lookup via a shared __index metatable
+//
+// pushIoResult builds resp.headers with the server's VERBATIM header names as
+// keys. A shared metatable (one per lua_State, stashed in the registry) gives
+// the table an __index that falls back to a case-insensitive scan, so
+// resp.headers["content-type"] finds a "Content-Type" key. Iteration with
+// pairs() still yields the verbatim keys.
+// ---------------------------------------------------------------------------
+
+/// True when `a` equals `b_lower` under ASCII case folding. `b_lower` is
+/// assumed already lower-cased; only `a` is folded. This differs from
+/// `std.ascii.eqlIgnoreCase`, which folds both sides on every call. The
+/// caller lower-cases the query key once, so folding only `a` here avoids
+/// re-folding that key on each `next()` iteration of the header scan.
+fn asciiEqlLowerRhs(a: []const u8, b_lower: []const u8) bool {
+    if (a.len != b_lower.len) return false;
+    for (a, b_lower) |ca, cb| {
+        if (std.ascii.toLower(ca) != cb) return false;
+    }
+    return true;
+}
+
+/// __index(table, key): case-insensitive lookup over the verbatim-keyed
+/// response-header table. Returns the matching value or nil. Always returns
+/// exactly one value. Keys longer than 256 bytes are treated as absent and
+/// never match.
+fn headerIndex(state: ?*ziglua.LuaState) callconv(.c) c_int {
+    const lua: *Lua = @ptrCast(state.?);
+    // table at 1, key at 2.
+    if (lua.typeOf(1) != .table or lua.typeOf(2) != .string) {
+        lua.pushNil();
+        return 1;
+    }
+    const key = lua.toString(2) catch {
+        lua.pushNil();
+        return 1;
+    };
+    var kbuf: [256]u8 = undefined;
+    if (key.len > kbuf.len) {
+        lua.pushNil();
+        return 1;
+    }
+    for (key, 0..) |c, i| kbuf[i] = std.ascii.toLower(c);
+    const kq = kbuf[0..key.len];
+
+    lua.pushNil(); // first key for next()
+    while (lua.next(1)) {
+        // stored key at -2, value at -1
+        if (lua.typeOf(-2) == .string) {
+            const sk = lua.toString(-2) catch {
+                lua.pop(1); // pop value, keep key for next()
+                continue;
+            };
+            if (asciiEqlLowerRhs(sk, kq)) {
+                // Leave the value (-1) on top; Lua takes it as the result.
+                return 1;
+            }
+        }
+        lua.pop(1); // pop value, keep key for next()
+    }
+    lua.pushNil();
+    return 1;
+}
+
+/// Build and stash the shared header metatable in the registry. Called once
+/// per lua_State from register().
+fn installHeaderMetatable(lua: *Lua) void {
+    lua.newTable();                                     // mt
+    lua.pushFunction(headerIndex);
+    lua.setField(-2, "__index");                        // mt.__index = headerIndex
+    lua.setField(ziglua.registry_index, HEADER_MT_KEY); // registry[KEY] = mt (pops mt)
+}
+
+/// Attach the shared header metatable to the table on top of `lua`'s stack.
+/// No-op (leaves the table as-is) if register() never ran on this state.
+pub fn attachHeaderMetatable(lua: *Lua) void {
+    const t = lua.getField(ziglua.registry_index, HEADER_MT_KEY); // pushes mt or nil
+    if (t == .nil) {
+        lua.pop(1);
+        return;
+    }
+    lua.setMetatable(-2); // pops mt, sets it on the table below
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "validateHeaderName accepts tokens, rejects empty/colon/control" {
+    try validateHeaderName("Content-Type");
+    try validateHeaderName("X-Custom_Header.v2");
+    try testing.expectError(error.EmptyName, validateHeaderName(""));
+    try testing.expectError(error.BadNameByte, validateHeaderName("Bad:Name"));
+    try testing.expectError(error.BadNameByte, validateHeaderName("Bad Name"));
+    try testing.expectError(error.BadNameByte, validateHeaderName("Bad\r\n"));
+    try testing.expectError(error.BadNameByte, validateHeaderName("Bad\x7f"));
+}
+
+test "validateHeaderValue accepts text, rejects CR/LF/NUL" {
+    try validateHeaderValue("application/json");
+    try validateHeaderValue("Bearer abc.def-ghi with spaces");
+    try testing.expectError(error.BadValueByte, validateHeaderValue("a\rb"));
+    try testing.expectError(error.BadValueByte, validateHeaderValue("a\nb"));
+    try testing.expectError(error.BadValueByte, validateHeaderValue("a\x00b"));
+}
 
 test "state round-trips through bot.*" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");

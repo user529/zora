@@ -5,6 +5,11 @@
 const std = @import("std");
 const ziglua = @import("ziglua");
 
+/// Stack size for every thread zora spawns. 1 MiB vs. Zig's 16 MiB default —
+/// our deepest stack (depth-8 serializer recursion, TLS handshake) stays well
+/// under this. Cuts ~15 MiB of VSZ reservation per thread (~40+ threads).
+pub const THREAD_STACK_SIZE: usize = 1 << 20; // 1 MiB
+
 // ---------------------------------------------------------------------------
 // ApiCall — generic outgoing Telegram API call.
 //

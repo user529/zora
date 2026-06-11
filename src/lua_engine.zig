@@ -355,11 +355,23 @@ fn pushIoResult(thread: *Lua, result: io_pool.IoResult, allocator: std.mem.Alloc
     _ = allocator;
     switch (result.outcome) {
         .http => |h| {
-            thread.createTable(0, 2);
+            thread.createTable(0, 3);
             thread.pushInteger(@intCast(h.status));
             thread.setField(-2, "status");
             _ = thread.pushString(h.body);
             thread.setField(-2, "body");
+
+            // headers subtable: verbatim server names as keys, case-insensitive
+            // lookup via the shared metatable. setTable (not setField) because
+            // names are not NUL-terminated.
+            thread.createTable(0, @intCast(h.headers.len));
+            for (h.headers) |hdr| {
+                _ = thread.pushString(hdr.name);  // key
+                _ = thread.pushString(hdr.value); // value
+                thread.setTable(-3);
+            }
+            lua_api.attachHeaderMetatable(thread);
+            thread.setField(-2, "headers");
         },
         .proc => |p| {
             thread.createTable(0, 2);
@@ -372,7 +384,7 @@ fn pushIoResult(thread: *Lua, result: io_pool.IoResult, allocator: std.mem.Alloc
             thread.pushInteger(s.message_id);
         },
         .err => |msg| {
-            thread.createTable(0, 4);
+            thread.createTable(0, 5);
             thread.pushInteger(0);
             thread.setField(-2, "status");
             _ = thread.pushString(msg);
@@ -381,6 +393,12 @@ fn pushIoResult(thread: *Lua, result: io_pool.IoResult, allocator: std.mem.Alloc
             thread.setField(-2, "exit_code");
             _ = thread.pushString(msg);
             thread.setField(-2, "stdout");
+
+            // Stable, empty headers table (same shape as the .http arm) so
+            // rules can index resp.headers unconditionally on transport errors.
+            thread.createTable(0, 0);
+            lua_api.attachHeaderMetatable(thread);
+            thread.setField(-2, "headers");
         },
     }
 }

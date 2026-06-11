@@ -78,9 +78,9 @@ pub const Server = struct {
         self.stop   = std.atomic.Value(bool).init(false);
         self.active = std.atomic.Value(u32).init(0);
         // Pool must be ready before the accept loop (which submits to it) starts.
-        try self.pool.init(.{ .allocator = args.allocator, .n_jobs = @as(usize, args.pool_threads) });
+        try self.pool.init(.{ .allocator = args.allocator, .n_jobs = @as(usize, args.pool_threads), .stack_size = types.THREAD_STACK_SIZE });
         errdefer self.pool.deinit();
-        self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+        self.thread = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, acceptLoop, .{self});
         return self;
     }
 

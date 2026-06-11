@@ -985,6 +985,53 @@ test "bot.http_request → coroutine yields, io_pool runs, result resumes, actio
     try testing.expect(std.mem.indexOf(u8, action.payload.json, "\"status\":200") != null);
 }
 
+test "bot.http_request exposes response headers with case-insensitive lookup" {
+    const HTTP_OK =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "X-Trace: xyz\r\n" ++
+        "Content-Length: 2\r\n" ++
+        "Connection: close\r\n" ++
+        "\r\nOK";
+
+    const stub = try spawnStub(HTTP_OK);
+    defer stub.thread.join();
+
+    const lua_src = try std.fmt.allocPrint(testing.allocator,
+        \\function on_message(u)
+        \\  local resp = bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
+        \\  local lower = resp.headers["content-type"]
+        \\  local exact = resp.headers["Content-Type"]
+        \\  local upper = resp.headers["CONTENT-TYPE"]
+        \\  local verbatim = ""
+        \\  for k,_ in pairs(resp.headers) do
+        \\    if k == "Content-Type" then verbatim = "yes" end
+        \\  end
+        \\  return {{ {{ method="reply", params={{ lower=lower, exact=exact, upper=upper, verbatim=verbatim }} }} }}
+        \\end
+    , .{stub.port});
+    defer testing.allocator.free(lua_src);
+
+    var ctx: AsyncTestCtx = undefined;
+    try ctx.init(testing.allocator, lua_src,
+        .{ .thread_count = 2, .queue_capacity = 16, .timeout_ms = 5_000, .proc_max_output = 65_536 });
+    const t = try ctx.spawnWorker(64, 60_000);
+    defer ctx.deinit(t);
+
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+    try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":1}"));
+
+    try testing.expect(waitQueue(&ctx.output_q, 1, 5_000));
+    const action = ctx.output_q.pop();
+    defer types.freeApiCall(action, testing.allocator);
+
+    const j = action.payload.json;
+    try testing.expect(std.mem.indexOf(u8, j, "\"lower\":\"application/json\"") != null);
+    try testing.expect(std.mem.indexOf(u8, j, "\"exact\":\"application/json\"") != null);
+    try testing.expect(std.mem.indexOf(u8, j, "\"upper\":\"application/json\"") != null);
+    try testing.expect(std.mem.indexOf(u8, j, "\"verbatim\":\"yes\"") != null);
+}
+
 test "slow coroutine parked; same worker processes fast update first" {
     const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
     const slow_srv = try testing.allocator.create(std.net.Server);
