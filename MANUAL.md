@@ -29,7 +29,7 @@ the startup log mark the current contracts.
 
 | Requirement | Version |
 |---|---|
-| Zig | 0.15.2 |
+| Zig | 0.16.0 |
 | Linux | x86_64, kernel ≥ 5.x (inotify) |
 | FreeBSD | x86_64, 14+ (kqueue) |
 
@@ -72,30 +72,59 @@ All configuration is read from environment variables. There is no config file
 parser in this release — use a shell wrapper, systemd `EnvironmentFile=`, or
 any secret manager that exports env vars.
 
+The variables are grouped by subsystem in the order an update flows through the
+process: `[bot]`, `[server]`, `[worker]`, `[io]`, `[dispatcher]`.
+
+### `[bot]` — token, rules, and storage
+
 | Variable | Default | Required | Description |
 |---|---|---|---|
 | `BOT_TOKEN` | — | **yes** | Telegram Bot API token from @BotFather |
 | `WEBHOOK_SECRET` | — | **yes** | Arbitrary secret string; Telegram sends it in `X-Telegram-Bot-Api-Secret-Token` on every update |
-| `LISTEN_ADDR` | `0.0.0.0:8443` | no | `host:port` the HTTP server binds to |
+| `BOT_API_BASE` | `https://api.telegram.org` | no | Override the Telegram API base URL (useful for testing with a local mock) |
 | `RULES_FILE` | `rules/rules.lua` | no | Path to the Lua rules file |
 | `DB_PATH` | `state.db` | no | Path to the SQLite database file |
-| `WORKER_COUNT` | `cpu_count` | no | Number of Lua worker threads (minimum 2) |
-| `QUEUE_CAPACITY` | `1024` | no | Bounded queue depth per worker; excess updates are dropped with a warning |
-| `DISPATCHER_THREADS` | `2 * cpu_count` | no | Outbound HTTP threads sending to the Telegram API (minimum 2). Each sends sequentially, so this multiplies outbound throughput; raise it for high send rates (e.g. premium) |
-| `BOT_API_BASE` | `https://api.telegram.org` | no | Override the Telegram API base URL (useful for testing with a local mock) |
 | `SCHEMA_FILE` | `schema/botapi.json` | no | Path to the vendored Telegram Bot API schema used for outgoing-call validation |
 | `API_VALIDATION` | `warn` | no | Outgoing-call validation mode: `off` (disabled), `warn` (log but send), `strict` (drop invalid calls) |
-| `IO_POOL_THREADS` | `8` | no | Number of blocking I/O pool threads (HTTP, exec, shell) |
-| `IO_QUEUE_CAPACITY` | `256` | no | I/O job queue depth shared across all pool threads |
-| `IO_JOB_TIMEOUT_MS` | `30000` | no | Per-job wall-clock timeout in milliseconds; jobs exceeding this are killed |
-| `PROC_MAX_OUTPUT` | `65536` | no | Maximum bytes of stdout captured from child processes; excess is truncated |
-| `MAX_INFLIGHT_PER_WORKER` | `64` | no | Maximum coroutines parked simultaneously per worker thread |
-| `WORKFLOW_DEADLINE_MS` | `60000` | no | Maximum wall-clock lifetime of a single coroutine workflow in milliseconds |
-| `JSON_MAX_BYTES` | `1048576` | no | Maximum input size in bytes accepted by `json.decode`; larger inputs raise a Lua error |
 | `METRICS_LOG` | `true` | no | Emit per-dispatcher stats (sent / discarded / queue depth) every 60 seconds; set to `false` or `0` to suppress |
 
 **`BOT_TOKEN` and `WEBHOOK_SECRET` are mandatory.** The process exits with a
 clear error message if either is absent.
+
+### `[server]` — inbound webhook
+
+| Variable | Default | Description |
+|---|---|---|
+| `LISTEN_ADDR` | `0.0.0.0:8443` | `host:port` the HTTP server binds to |
+| `WEBHOOK_POOL_THREADS` | `cpu_count` | Number of inbound webhook connection-handler threads (minimum 2). One accept thread hands accepted connections to this pool |
+
+### `[worker]` — Lua workers
+
+| Variable | Default | Description |
+|---|---|---|
+| `WORKER_THREADS` | `cpu_count` | Number of Lua worker threads (minimum 2) |
+| `WORKER_QUEUE_CAPACITY` | `1024` | Bounded queue depth per worker; excess updates are dropped with a warning |
+| `WORKER_MAX_INFLIGHT` | `64` | Maximum coroutines parked simultaneously per worker thread |
+| `WORKFLOW_DEADLINE_MS` | `60000` | Maximum wall-clock lifetime of a single coroutine workflow in milliseconds |
+| `JSON_MAX_BYTES` | `1048576` | Maximum input size in bytes accepted by `json.decode`; larger inputs raise a Lua error |
+
+### `[io]` — blocking I/O pool
+
+| Variable | Default | Description |
+|---|---|---|
+| `IO_POOL_THREADS` | `8` | Number of blocking I/O pool threads (HTTP, exec, shell) |
+| `IO_QUEUE_CAPACITY` | `256` | I/O job queue depth shared across all pool threads |
+| `IO_JOB_TIMEOUT_MS` | `30000` | Per-job wall-clock timeout in milliseconds; jobs exceeding this are killed |
+| `PROC_MAX_OUTPUT_BYTES` | `65536` | Maximum bytes of stdout captured from child processes; excess is truncated |
+
+### `[dispatcher]` — outbound Telegram calls
+
+| Variable | Default | Description |
+|---|---|---|
+| `DISPATCHER_THREADS` | `2 * cpu_count` | Outbound HTTP threads sending to the Telegram API (minimum 2). Each sends sequentially, so this multiplies outbound throughput; raise it for high send rates (e.g. premium) |
+| `DELAY_QUEUE_CAPACITY` | `4096` | Capacity of the retry-after delay queue. Calls held back by a Telegram rate limit (HTTP 429) wait here; an overflow drops the call with a warning |
+| `RETRY_AFTER_MAX_MS` | `60000` | Upper bound, in milliseconds, on how long a 429-throttled call waits before retry. Longer `retry_after` values from Telegram are capped to this |
+| `RETRY_AFTER_DEFAULT_MS` | `1000` | Retry-after wait, in milliseconds, used when a Telegram 429 response omits the duration |
 
 ### Example
 
@@ -179,7 +208,7 @@ after shutdown.
 info(main): zora starting (branch=dev release=2 schema=1 rules_api=1 api_validation=warn)
 ```
 
-Five identifiers are printed at startup:
+The banner prints five identifiers:
 
 | Field | Meaning |
 |---|---|
@@ -188,6 +217,30 @@ Five identifiers are printed at startup:
 | `schema` | SQLite schema contract version |
 | `rules_api` | Lua `bot.*` API contract version |
 | `api_validation` | Active outgoing-call validation mode (`off`, `warn`, or `strict`) |
+
+### Effective configuration dump
+
+After the banner, zora prints every effective setting, one line per variable,
+under the `config` scope. The lines are grouped by subsystem — `[bot]`,
+`[server]`, `[worker]`, `[io]`, `[dispatcher]` — in the order an update flows
+through the process. Each value is the one in force after defaults are applied,
+so the dump is the quickest way to confirm what the process actually loaded.
+
+```
+info(config): [bot] BOT_TOKEN=123****wxYZ
+info(config): [bot] WEBHOOK_SECRET=sup****alue
+info(config): [bot] BOT_API_BASE=https://api.telegram.org
+info(config): [server] LISTEN_ADDR=0.0.0.0:8443
+info(config): [worker] WORKER_THREADS=8
+info(config): [io] IO_POOL_THREADS=8
+info(config): [dispatcher] DISPATCHER_THREADS=16
+```
+
+`BOT_TOKEN` and `WEBHOOK_SECRET` are masked: zora prints a short prefix and
+suffix and replaces the rest with `****`. A value of three characters or fewer
+is hidden in full. The mask reveals at most the first three and last four
+characters, never more than half the value, and never its length — so the dump
+is safe to leave in a log. Every other value is printed in full.
 
 ---
 
@@ -400,7 +453,7 @@ bot.shell_quote(str)  -- safe quoting for sh -c command strings; returns string
 
 Coroutines are bounded by two limits:
 
-- `MAX_INFLIGHT_PER_WORKER` — if this many coroutines are already parked, the
+- `WORKER_MAX_INFLIGHT` — if this many coroutines are already parked, the
   worker stops accepting new updates until a slot frees.
 - `WORKFLOW_DEADLINE_MS` — coroutines running longer than this are reaped (Lua
   state discarded, slot freed). Set to the maximum acceptable round-trip time

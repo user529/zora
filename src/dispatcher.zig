@@ -23,6 +23,7 @@ const queue_mod = @import("queue.zig");
 const io_pool = @import("io_pool.zig");
 const metrics_mod = @import("metrics.zig");
 const delay = @import("delay.zig");
+const rt = @import("rt.zig");
 
 const log = std.log.scoped(.dispatcher);
 
@@ -46,6 +47,8 @@ pub const DispatcherArgs = struct {
     /// Tests:      "http://127.0.0.2:{port}"  (plain HTTP, no TLS, to a mock)
     api_base: []const u8,
     allocator: std.mem.Allocator,
+    /// Runtime for the per-thread HTTP client, sleeps, and wall-clock reads.
+    io: std.Io,
     stop: *std.atomic.Value(bool),
     /// Per-worker result queues indexed by worker_id.
     /// Non-null only when tracked sends are expected. Existing tests pass null.
@@ -54,11 +57,11 @@ pub const DispatcherArgs = struct {
     metrics: ?*metrics_mod.Metrics = null,
     /// Park sink for 429'd / blocked-chat calls. Null ⇒ no delayed dispatch
     /// (existing tests default null and keep the single-retry behavior).
-    delay_q:       ?*delay.DelayQueue = null,
+    delay_q: ?*delay.DelayQueue = null,
     /// Shared per-chat block state. Null ⇒ no pre-send divert.
     blocked_until: ?*delay.BlockedMap = null,
     retry_after_default_ms: u64 = 1000,
-    retry_after_max_ms:     u64 = 60000,
+    retry_after_max_ms: u64 = 60000,
 };
 
 // ---------------------------------------------------------------------------
@@ -71,7 +74,7 @@ fn divertIfBlocked(call: types.ApiCall, args: DispatcherArgs) bool {
     const bu = args.blocked_until orelse return false;
     const dq = args.delay_q orelse return false;
     const r = call.route orelse return false;
-    const until = bu.blockedUntil(r.chat_id, std.time.milliTimestamp()) orelse return false;
+    const until = bu.blockedUntil(r.chat_id, rt.nowMs(args.io)) orelse return false;
     parkAt(dq, until, call, args);
     return true;
 }
@@ -79,7 +82,7 @@ fn divertIfBlocked(call: types.ApiCall, args: DispatcherArgs) bool {
 /// Record the block window (if any) and park the 429'd call.
 fn parkRateLimited(call: types.ApiCall, retry_after_ms: u64, args: DispatcherArgs) void {
     if (args.metrics) |m| _ = m.throttle_429_total.fetchAdd(1, .monotonic);
-    const ready = std.time.milliTimestamp() + @as(i64, @intCast(retry_after_ms));
+    const ready = rt.nowMs(args.io) + @as(i64, @intCast(retry_after_ms));
     if (call.route) |r| if (args.blocked_until) |bu| bu.block(r.chat_id, ready);
     const dq = args.delay_q orelse {
         // No delay_q (tests): the single attempt already happened; drop.
@@ -108,7 +111,7 @@ fn parkAt(dq: *delay.DelayQueue, ready: i64, call: types.ApiCall, args: Dispatch
 /// thread, giving each thread its own persistent connection to the API.
 /// Runs until `args.stop` is set to true.
 pub fn dispatcherThread(args: DispatcherArgs) void {
-    var client = std.http.Client{ .allocator = args.allocator };
+    var client = std.http.Client{ .allocator = args.allocator, .io = args.io };
     defer client.deinit();
     const url_prefix = std.fmt.allocPrint(
         args.allocator,
@@ -123,16 +126,16 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
     var resp_buf: [RESPONSE_CEILING]u8 = undefined;
 
     while (!args.stop.load(.acquire)) {
-        const maybe_call = args.queue.popTimeout(10 * std.time.ns_per_ms);
-        if (maybe_call == null) continue;
-        const call = maybe_call.?;
+        // Park indefinitely until a call arrives or the queue is closed at
+        // shutdown — no 10 ms poll, so an idle dispatcher consumes no CPU.
+        const call = args.queue.popBlocking() orelse break;
 
         // If this chat is still inside a 429 window, hold the call instead of
         // sending it.
         if (divertIfBlocked(call, args)) continue;
 
         var retry_after_ms: u64 = args.retry_after_default_ms;
-        if (sendWithRetry(&client, call, url_prefix, args.allocator, args.io_result_queues, args.metrics, &retry_after_ms, args.retry_after_default_ms, args.retry_after_max_ms, &resp_buf)) {
+        if (sendWithRetry(&client, args.io, call, url_prefix, args.allocator, args.io_result_queues, args.metrics, &retry_after_ms, args.retry_after_default_ms, args.retry_after_max_ms, &resp_buf)) {
             types.freeApiCall(call, args.allocator); // sent OK
         } else |err| {
             if (err == error.RateLimited) {
@@ -151,29 +154,30 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
 // ---------------------------------------------------------------------------
 
 fn sendWithRetry(
-    client:          *std.http.Client,
-    call:            types.ApiCall,
-    url_prefix:      []const u8,
-    allocator:       std.mem.Allocator,
-    result_queues:   ?[]*queue_mod.Queue(io_pool.IoResult),
-    metrics:         ?*metrics_mod.Metrics,
+    client: *std.http.Client,
+    io: std.Io,
+    call: types.ApiCall,
+    url_prefix: []const u8,
+    allocator: std.mem.Allocator,
+    result_queues: ?[]*queue_mod.Queue(io_pool.IoResult),
+    metrics: ?*metrics_mod.Metrics,
     retry_after_out: *u64,
-    default_ms:      u64,
-    max_ms:          u64,
-    resp_buf:        []u8,
+    default_ms: u64,
+    max_ms: u64,
+    resp_buf: []u8,
 ) !void {
-    if (send(client, call, url_prefix, allocator, result_queues, metrics, retry_after_out, default_ms, max_ms, resp_buf)) {
+    if (send(client, io, call, url_prefix, allocator, result_queues, metrics, retry_after_out, default_ms, max_ms, resp_buf)) {
         return;
     } else |err| {
         if (err == error.RateLimited) return err; // caller parks; never retry a 429
         log.warn("send failed ({s}), retrying in 200ms", .{@errorName(err)});
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        rt.sleepNs(io, 200 * std.time.ns_per_ms);
         // Reinitialize the client so the retry always opens a fresh TCP
         // connection — any pooled connection from the failed attempt may be
         // broken and would cause a second WriteFailed/ReadFailed.
         client.deinit();
-        client.* = std.http.Client{ .allocator = allocator };
-        send(client, call, url_prefix, allocator, result_queues, metrics, retry_after_out, default_ms, max_ms, resp_buf) catch |retry_err| {
+        client.* = std.http.Client{ .allocator = allocator, .io = io };
+        send(client, io, call, url_prefix, allocator, result_queues, metrics, retry_after_out, default_ms, max_ms, resp_buf) catch |retry_err| {
             if (retry_err == error.RateLimited) return retry_err;
             if (call.tracking) |tracking| {
                 pushTrackedErr(result_queues, tracking.worker_id, tracking.coro_id, @errorName(retry_err), allocator);
@@ -214,16 +218,17 @@ fn fetchErr(err: anyerror, fw: *const std.Io.Writer, method: []const u8, metrics
 }
 
 fn send(
-    client:          *std.http.Client,
-    call:            types.ApiCall,
-    url_prefix:      []const u8,
-    allocator:       std.mem.Allocator,
-    result_queues:   ?[]*queue_mod.Queue(io_pool.IoResult),
-    metrics:         ?*metrics_mod.Metrics,
-    retry_after_out: *u64,   // set only when returning error.RateLimited
-    default_ms:      u64,
-    max_ms:          u64,
-    resp_buf:        []u8,    // caller-owned, reused across sends; ceiling = its len
+    client: *std.http.Client,
+    io: std.Io,
+    call: types.ApiCall,
+    url_prefix: []const u8,
+    allocator: std.mem.Allocator,
+    result_queues: ?[]*queue_mod.Queue(io_pool.IoResult),
+    metrics: ?*metrics_mod.Metrics,
+    retry_after_out: *u64, // set only when returning error.RateLimited
+    default_ms: u64,
+    max_ms: u64,
+    resp_buf: []u8, // caller-owned, reused across sends; ceiling = its len
 ) !void {
     const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ url_prefix, call.method });
     defer allocator.free(url);
@@ -237,33 +242,32 @@ fn send(
         .json => |body| blk: {
             log.debug("→ {s} (json) {s}", .{ call.method, body });
             break :blk client.fetch(.{
-                .location        = .{ .url = url },
-                .payload         = body,
-                .keep_alive      = true,
-                .extra_headers   = &.{.{ .name = "Content-Type", .value = "application/json" }},
+                .location = .{ .url = url },
+                .payload = body,
+                .keep_alive = true,
+                .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
                 // Ask for an uncompressed response. With a response_writer set,
                 // std.http.Client.fetch heap-allocates a 64 KB flate window per
                 // call for any gzip/deflate body and then gunzips it. Telegram's
                 // reply bodies are tiny, so identity encoding skips both the
                 // per-call allocation and the decompression entirely.
-                .headers         = .{ .accept_encoding = .{ .override = "identity" } },
+                .headers = .{ .accept_encoding = .{ .override = "identity" } },
                 .response_writer = &fw,
             }) catch |err| return fetchErr(err, &fw, call.method, metrics);
         },
         .multipart => |parts| blk: {
-            const mb = try buildMultipartBody(parts, allocator);
+            const mb = try buildMultipartBody(io, parts, allocator);
             defer allocator.free(mb.bytes);
             log.debug("→ {s} (multipart, {d} parts)", .{ call.method, parts.len });
-            const ct = try std.fmt.allocPrint(allocator,
-                "multipart/form-data; boundary={s}", .{mb.boundary[0..mb.blen]});
+            const ct = try std.fmt.allocPrint(allocator, "multipart/form-data; boundary={s}", .{mb.boundary[0..mb.blen]});
             defer allocator.free(ct);
             break :blk client.fetch(.{
-                .location        = .{ .url = url },
-                .payload         = mb.bytes,
-                .keep_alive      = true,
-                .extra_headers   = &.{.{ .name = "Content-Type", .value = ct }},
+                .location = .{ .url = url },
+                .payload = mb.bytes,
+                .keep_alive = true,
+                .extra_headers = &.{.{ .name = "Content-Type", .value = ct }},
                 // Identity encoding — see the json branch above for the rationale.
-                .headers         = .{ .accept_encoding = .{ .override = "identity" } },
+                .headers = .{ .accept_encoding = .{ .override = "identity" } },
                 .response_writer = &fw,
             }) catch |err| return fetchErr(err, &fw, call.method, metrics);
         },
@@ -299,9 +303,9 @@ fn send(
 // ---------------------------------------------------------------------------
 
 const MultipartBody = struct {
-    bytes:    []u8,
+    bytes: []u8,
     boundary: [34]u8, // "zB" + 32 hex chars
-    blen:     usize,
+    blen: usize,
 };
 
 /// Reject any string that would break a quoted Content-Disposition value.
@@ -312,16 +316,17 @@ fn validateHeaderValue(s: []const u8) !void {
 }
 
 fn buildMultipartBody(
-    parts:     []types.MultipartPart,
+    io: std.Io,
+    parts: []types.MultipartPart,
     allocator: std.mem.Allocator,
 ) !MultipartBody {
     var mb: MultipartBody = undefined;
     var raw: [16]u8 = undefined;
-    std.crypto.random.bytes(&raw);
+    io.random(&raw);
     var hex: [32]u8 = undefined;
     for (raw, 0..) |byte, i| {
         const digits = "0123456789abcdef";
-        hex[i * 2]     = digits[byte >> 4];
+        hex[i * 2] = digits[byte >> 4];
         hex[i * 2 + 1] = digits[byte & 0xf];
     }
     const b_slice = std.fmt.bufPrint(&mb.boundary, "zB{s}", .{hex}) catch unreachable;
@@ -339,15 +344,15 @@ fn buildMultipartBody(
 
         if (p.filename) |fname| {
             try validateHeaderValue(fname);
-            const hdr = try std.fmt.allocPrint(allocator,
+            const hdr = try std.fmt.allocPrint(
+                allocator,
                 "Content-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: application/octet-stream\r\n",
                 .{ p.name, fname },
             );
             defer allocator.free(hdr);
             try buf.appendSlice(allocator, hdr);
         } else {
-            const hdr = try std.fmt.allocPrint(allocator,
-                "Content-Disposition: form-data; name=\"{s}\"\r\n", .{p.name});
+            const hdr = try std.fmt.allocPrint(allocator, "Content-Disposition: form-data; name=\"{s}\"\r\n", .{p.name});
             defer allocator.free(hdr);
             try buf.appendSlice(allocator, hdr);
         }
@@ -373,17 +378,17 @@ fn parseMessageId(body: []const u8, allocator: std.mem.Allocator) !i64 {
     defer parsed.deinit();
     const root_obj = switch (parsed.value) {
         .object => |o| o,
-        else    => return error.NotFound,
+        else => return error.NotFound,
     };
     const result_val = root_obj.get("result") orelse return error.NotFound;
     const result_obj = switch (result_val) {
         .object => |o| o,
-        else    => return error.NotFound,
+        else => return error.NotFound,
     };
     const mid_val = result_obj.get("message_id") orelse return error.NotFound;
     return switch (mid_val) {
         .integer => |n| n,
-        else     => error.NotFound,
+        else => error.NotFound,
     };
 }
 
@@ -393,14 +398,20 @@ fn parseMessageId(body: []const u8, allocator: std.mem.Allocator) !i64 {
 fn parseRetryAfter(body: []const u8, default_ms: u64, max_ms: u64, allocator: std.mem.Allocator) u64 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return default_ms;
     defer parsed.deinit();
-    const obj = switch (parsed.value) { .object => |o| o, else => return default_ms };
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return default_ms,
+    };
     const params = obj.get("parameters") orelse return default_ms;
-    const pobj = switch (params) { .object => |o| o, else => return default_ms };
+    const pobj = switch (params) {
+        .object => |o| o,
+        else => return default_ms,
+    };
     const ra = pobj.get("retry_after") orelse return default_ms;
     const secs: i64 = switch (ra) {
         .integer => |n| n,
-        .float   => |f| @intFromFloat(f),
-        else     => return default_ms,
+        .float => |f| @intFromFloat(f),
+        else => return default_ms,
     };
     if (secs <= 0) return default_ms;
     const ms: u64 = @as(u64, @intCast(secs)) *| 1000;
@@ -408,9 +419,9 @@ fn parseRetryAfter(body: []const u8, default_ms: u64, max_ms: u64, allocator: st
 }
 
 fn pushTrackedSend(
-    queues:     ?[]*queue_mod.Queue(io_pool.IoResult),
-    worker_id:  u8,
-    coro_id:    u32,
+    queues: ?[]*queue_mod.Queue(io_pool.IoResult),
+    worker_id: u8,
+    coro_id: u32,
     message_id: i64,
 ) void {
     const qs = queues orelse {
@@ -430,10 +441,10 @@ fn pushTrackedSend(
 }
 
 fn pushTrackedErr(
-    queues:    ?[]*queue_mod.Queue(io_pool.IoResult),
+    queues: ?[]*queue_mod.Queue(io_pool.IoResult),
     worker_id: u8,
-    coro_id:   u32,
-    msg:       []const u8,
+    coro_id: u32,
+    msg: []const u8,
     allocator: std.mem.Allocator,
 ) void {
     const qs = queues orelse return;
@@ -454,6 +465,15 @@ fn pushTrackedErr(
 
 const testing = std.testing;
 
+// 0.16's net.Server no longer exposes the bound address; query the socket for
+// the port assigned to a port-0 listen. Returns native byte order.
+fn boundPort(server: *const std.Io.net.Server) u16 {
+    var sa: std.posix.sockaddr.in = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    _ = std.posix.system.getsockname(server.socket.handle, @ptrCast(&sa), &len);
+    return std.mem.bigToNative(u16, sa.port);
+}
+
 // The dispatcher does not build bodies or map method names — body
 // construction lives in lua_engine.  Wire-level coverage is the MockServer
 // integration tests below.
@@ -465,7 +485,7 @@ const testing = std.testing;
 /// {"ok":true}. Closes cleanly when `stop` is set or when `server.deinit()`
 /// is called (which unblocks `accept` with an error).
 pub const MockServer = struct {
-    server: std.net.Server,
+    server: std.Io.net.Server,
     thread: std.Thread,
     received: queue_mod.Queue(MockRequest),
     stop: std.atomic.Value(bool),
@@ -480,10 +500,10 @@ pub const MockServer = struct {
     allocator: std.mem.Allocator,
 
     const MockRequest = struct {
-        path:         []const u8,
-        body:         []const u8,
+        path: []const u8,
+        body: []const u8,
         content_type: []const u8,
-        allocator:    std.mem.Allocator,
+        allocator: std.mem.Allocator,
 
         fn deinit(self: *MockRequest) void {
             self.allocator.free(self.path);
@@ -498,16 +518,16 @@ pub const MockServer = struct {
     pub fn init(allocator: std.mem.Allocator) !*MockServer {
         const self = try allocator.create(MockServer);
         errdefer allocator.destroy(self);
-        const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
-        self.server = try addr.listen(.{ .reuse_address = true });
-        errdefer self.server.deinit();
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+        self.server = try addr.listen(testing.io, .{ .reuse_address = true });
+        errdefer self.server.deinit(testing.io);
         self.allocator = allocator;
         self.call_cnt = std.atomic.Value(u32).init(0);
         self.force_429 = std.atomic.Value(u32).init(0);
         self.retry_after_secs = std.atomic.Value(u32).init(1);
         self.force_big = std.atomic.Value(u32).init(0);
         self.stop = std.atomic.Value(bool).init(false);
-        self.received = try queue_mod.Queue(MockRequest).init(allocator, 512);
+        self.received = try queue_mod.Queue(MockRequest).init(allocator, testing.io, 512);
         errdefer self.received.deinit(allocator);
         self.thread = try std.Thread.spawn(.{}, mockLoop, .{self});
         return self;
@@ -520,7 +540,7 @@ pub const MockServer = struct {
         // The server fd is only closed below, after the thread has exited —
         // so mockLoop never sees a closed fd.
         self.thread.join();
-        self.server.deinit();
+        self.server.deinit(testing.io);
         // Drain any unread requests.
         while (self.received.popTimeout(0)) |req| {
             var r = req;
@@ -530,29 +550,23 @@ pub const MockServer = struct {
         self.allocator.destroy(self);
     }
 
-    fn port(self: *const MockServer) u16 {
-        return self.server.listen_address.in.sa.port;
-    }
-
     pub fn baseUrl(self: *const MockServer, buf: []u8) []u8 {
-        return std.fmt.bufPrint(buf, "http://127.0.0.2:{d}", .{
-            std.mem.bigToNative(u16, self.port()),
-        }) catch unreachable;
+        return std.fmt.bufPrint(buf, "http://127.0.0.2:{d}", .{boundPort(&self.server)}) catch unreachable;
     }
 
     pub fn waitForN(self: *MockServer, n: usize, timeout_ms: u64) bool {
-        const t0 = std.time.milliTimestamp();
+        const t0 = rt.nowMs(testing.io);
         while (self.received.len() < n) {
-            if (@as(u64, @intCast(std.time.milliTimestamp() - t0)) >= timeout_ms)
+            if (@as(u64, @intCast(rt.nowMs(testing.io) - t0)) >= timeout_ms)
                 return false;
-            std.Thread.sleep(5 * std.time.ns_per_ms);
+            rt.sleepNs(testing.io, 5 * std.time.ns_per_ms);
         }
         return true;
     }
 };
 
 fn mockLoop(srv: *MockServer) void {
-    const fd = srv.server.stream.handle;
+    const fd = srv.server.socket.handle;
     while (!srv.stop.load(.acquire)) {
         // Poll with a short timeout to re-check `stop` regularly without
         // ever calling accept() on a closed fd.  The fd is only closed in
@@ -566,20 +580,27 @@ fn mockLoop(srv: *MockServer) void {
         if (n == 0) continue; // timeout — recheck stop
         if (pfd.revents & std.posix.POLL.IN == 0) continue;
 
-        const conn = srv.server.accept() catch return;
-        const t = std.Thread.spawn(.{}, mockHandle, .{ srv, conn }) catch {
-            conn.stream.close();
+        const stream = srv.server.accept(testing.io) catch return;
+        const t = std.Thread.spawn(.{}, mockHandle, .{ srv, stream }) catch {
+            stream.close(testing.io);
             continue;
         };
         t.detach();
     }
 }
 
-fn mockHandle(srv: *MockServer, conn: std.net.Server.Connection) void {
-    defer conn.stream.close();
+fn mockHandle(srv: *MockServer, stream: std.Io.net.Stream) void {
+    const io = testing.io;
+    defer stream.close(io);
+    // One reader and writer per connection — buffered bytes persist across
+    // keep-alive requests on the same stream.
+    var rbuf: [8192]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var wbuf: [4096]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
     // Keep reading requests on the same connection (keep-alive).
     while (!srv.stop.load(.acquire)) {
-        const req = parseHttpRequest(conn.stream, srv.allocator) catch return;
+        const req = parseHttpRequest(&sr.interface, srv.allocator) catch return;
         const r = req orelse return;
 
         srv.received.push(r) catch {
@@ -593,18 +614,17 @@ fn mockHandle(srv: *MockServer, conn: std.net.Server.Connection) void {
             _ = srv.force_big.fetchSub(1, .release);
             const big_len: usize = 70_000; // > 64 KB ceiling
             var hdr_buf: [128]u8 = undefined;
-            const hdr = std.fmt.bufPrint(&hdr_buf,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
-                "Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-                .{big_len}) catch unreachable;
-            conn.stream.writeAll(hdr) catch return;
+            const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{big_len}) catch unreachable;
+            sw.interface.writeAll(hdr) catch return;
             const chunk = [_]u8{'a'} ** 4096;
             var written: usize = 0;
             while (written < big_len) {
                 const n = @min(chunk.len, big_len - written);
-                conn.stream.writeAll(chunk[0..n]) catch return;
+                sw.interface.writeAll(chunk[0..n]) catch return;
                 written += n;
             }
+            sw.interface.flush() catch return;
             _ = srv.call_cnt.fetchAdd(1, .release);
             continue;
         }
@@ -614,15 +634,12 @@ fn mockHandle(srv: *MockServer, conn: std.net.Server.Connection) void {
             _ = srv.force_429.fetchSub(1, .release);
             const secs = srv.retry_after_secs.load(.acquire);
             var body_buf: [96]u8 = undefined;
-            const body = std.fmt.bufPrint(&body_buf,
-                "{{\"ok\":false,\"error_code\":429,\"parameters\":{{\"retry_after\":{d}}}}}",
-                .{secs}) catch unreachable;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"ok\":false,\"error_code\":429,\"parameters\":{{\"retry_after\":{d}}}}}", .{secs}) catch unreachable;
             var resp_buf: [256]u8 = undefined;
-            const resp = std.fmt.bufPrint(&resp_buf,
-                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n" ++
-                "Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
-                .{ body.len, body }) catch unreachable;
-            conn.stream.writeAll(resp) catch return;
+            const resp = std.fmt.bufPrint(&resp_buf, "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+            sw.interface.writeAll(resp) catch return;
+            sw.interface.flush() catch return;
         } else {
             const response =
                 "HTTP/1.1 200 OK\r\n" ++
@@ -631,45 +648,44 @@ fn mockHandle(srv: *MockServer, conn: std.net.Server.Connection) void {
                 "Connection: keep-alive\r\n" ++
                 "\r\n" ++
                 "{\"ok\":true}\r\n\r\n";
-            conn.stream.writeAll(response) catch return;
+            sw.interface.writeAll(response) catch return;
+            sw.interface.flush() catch return;
         }
         _ = srv.call_cnt.fetchAdd(1, .release);
     }
 }
 
-/// Read one HTTP/1.1 request from `stream`.
+/// Read one HTTP/1.1 request from `r`.
 /// Returns null on EOF or connection close.
-fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?MockServer.MockRequest {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(allocator);
+fn parseHttpRequest(r: *std.Io.Reader, allocator: std.mem.Allocator) !?MockServer.MockRequest {
+    var header_section: std.ArrayListUnmanaged(u8) = .empty;
+    defer header_section.deinit(allocator);
 
-    var tmp: [8192]u8 = undefined;
-
-    // Read until the blank line that separates headers from body.
-    while (std.mem.indexOf(u8, buf.items, "\r\n\r\n") == null) {
-        const n = stream.read(&tmp) catch |err| switch (err) {
-            error.ConnectionResetByPeer, error.BrokenPipe => return null,
-            else => return err,
+    // Read the header block line-by-line, stopping at the blank line. A plain
+    // readSliceShort would deadlock against the keep-alive client (it returns
+    // short only on EOF); takeDelimiterInclusive returns each line as soon as
+    // its terminating '\n' arrives.
+    while (true) {
+        const line = r.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream, error.ReadFailed => return null,
+            error.StreamTooLong => return error.StreamTooLong,
         };
-        if (n == 0) return null;
-        try buf.appendSlice(allocator, tmp[0..n]);
+        if (line.len <= 2) break; // "\r\n" (or bare "\n") ends the headers
+        try header_section.appendSlice(allocator, line);
     }
 
-    const he = std.mem.indexOf(u8, buf.items, "\r\n\r\n").?;
-    const header_section = buf.items[0..he];
-
     // Parse request line: "POST /path HTTP/1.1"
-    const rl_end = std.mem.indexOf(u8, header_section, "\r\n") orelse return null;
-    var parts = std.mem.splitScalar(u8, header_section[0..rl_end], ' ');
+    const rl_end = std.mem.indexOf(u8, header_section.items, "\r\n") orelse return null;
+    var parts = std.mem.splitScalar(u8, header_section.items[0..rl_end], ' ');
     _ = parts.next() orelse return null; // skip method
     const raw_path = parts.next() orelse return null;
     const path = try allocator.dupe(u8, raw_path);
     errdefer allocator.free(path);
 
-    // Parse Content-Length and Content-Type.
+    // Parse Content-Length and Content-Type from the remaining header lines.
     var content_length: usize = 0;
     var content_type_raw: []const u8 = "";
-    var lines = std.mem.splitSequence(u8, header_section[rl_end + 2 ..], "\r\n");
+    var lines = std.mem.splitSequence(u8, header_section.items[rl_end + 2 ..], "\r\n");
     while (lines.next()) |line| {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = line[0..colon];
@@ -680,31 +696,22 @@ fn parseHttpRequest(stream: std.net.Stream, allocator: std.mem.Allocator) !?Mock
             content_type_raw = value;
         }
     }
-    // Dupe content_type before the body-reading loop may reallocate buf.
     const content_type = try allocator.dupe(u8, content_type_raw);
     errdefer allocator.free(content_type);
 
-    // Ensure the full body is present.
-    const body_start = he + 4;
-    const needed = body_start + content_length;
-    while (buf.items.len < needed) {
-        const n = stream.read(&tmp) catch |err| switch (err) {
-            error.ConnectionResetByPeer, error.BrokenPipe => break,
-            else => return err,
-        };
-        if (n == 0) break;
-        try buf.appendSlice(allocator, tmp[0..n]);
-    }
-
-    const body_end = @min(needed, buf.items.len);
-    const body = try allocator.dupe(u8, buf.items[body_start..body_end]);
+    // Read exactly content_length body bytes. A buffer sized to content_length
+    // makes readSliceShort stop at the body's end without over-waiting.
+    const raw_body = try allocator.alloc(u8, content_length);
+    defer allocator.free(raw_body);
+    const got = r.readSliceShort(raw_body) catch 0;
+    const body = try allocator.dupe(u8, raw_body[0..got]);
     errdefer allocator.free(body);
 
     return MockServer.MockRequest{
-        .path         = path,
-        .body         = body,
+        .path = path,
+        .body = body,
         .content_type = content_type,
-        .allocator    = allocator,
+        .allocator = allocator,
     };
 }
 
@@ -728,7 +735,7 @@ const TestDispatcher = struct {
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         self.stop = std.atomic.Value(bool).init(false);
-        self.queue = try queue_mod.Queue(types.ApiCall).init(allocator, 256);
+        self.queue = try queue_mod.Queue(types.ApiCall).init(allocator, testing.io, 256);
         errdefer self.queue.deinit(allocator);
         const args = DispatcherArgs{
             .id = 0,
@@ -736,6 +743,7 @@ const TestDispatcher = struct {
             .bot_token = bot_token,
             .api_base = api_base,
             .allocator = allocator,
+            .io = testing.io,
             .stop = &self.stop,
         };
         self.thread = try std.Thread.spawn(.{}, dispatcherThread, .{args});
@@ -744,6 +752,7 @@ const TestDispatcher = struct {
 
     fn deinit(self: *TestDispatcher) void {
         self.stop.store(true, .release);
+        self.queue.close(); // wake the parked dispatcher so it can observe stop
         self.thread.join();
         self.queue.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -756,7 +765,7 @@ const TestDispatcher = struct {
 /// ownership and frees both after sending (ApiCall ownership contract).
 fn pushCall(q: *queue_mod.Queue(types.ApiCall), method: []const u8, body: []const u8) !void {
     try q.push(.{
-        .method  = try testing.allocator.dupe(u8, method),
+        .method = try testing.allocator.dupe(u8, method),
         .payload = .{ .json = try testing.allocator.dupe(u8, body) },
     });
 }
@@ -807,41 +816,45 @@ test "dispatcher retries once after server closes connection; exactly 2 attempts
     // Second connection: answer normally.
     // The dispatcher must have retried exactly once.
 
-    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    var server = try addr.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
 
-    const srv_port = server.listen_address.in.sa.port;
     var url_buf: [64]u8 = undefined;
     const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.2:{d}", .{
-        std.mem.bigToNative(u16, srv_port),
+        boundPort(&server),
     }) catch unreachable;
 
     // Spawn a thread that drops the first connection and serves the second.
     var attempt_count = std.atomic.Value(u32).init(0);
     const Ctx = struct {
-        server: *std.net.Server,
+        server: *std.Io.net.Server,
         attempt_count: *std.atomic.Value(u32),
     };
     const ctx = Ctx{ .server = &server, .attempt_count = &attempt_count };
     const srv_thread = try std.Thread.spawn(.{}, struct {
         fn run(c: Ctx) void {
+            const io = testing.io;
             // First connection: drop immediately.
-            const c1 = c.server.accept() catch return;
+            var c1 = c.server.accept(io) catch return;
             _ = c.attempt_count.fetchAdd(1, .release);
-            c1.stream.close();
+            c1.close(io);
 
             // Second connection: respond normally.
-            const c2 = c.server.accept() catch return;
-            defer c2.stream.close();
+            var c2 = c.server.accept(io) catch return;
+            defer c2.close(io);
             _ = c.attempt_count.fetchAdd(1, .release);
-            // Drain the request.
-            var buf: [4096]u8 = undefined;
-            _ = c2.stream.read(&buf) catch {};
-            c2.stream.writeAll(
+            // Drain the request, then reply.
+            var rbuf: [4096]u8 = undefined;
+            var rd = c2.reader(io, &rbuf);
+            _ = rd.interface.takeDelimiterInclusive('\n') catch {};
+            var wbuf: [256]u8 = undefined;
+            var wr = c2.writer(io, &wbuf);
+            wr.interface.writeAll(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
                     "Content-Length: 15\r\n\r\n{\"ok\":true}\r\n\r\n",
             ) catch {};
+            wr.interface.flush() catch {};
         }
     }.run, .{ctx});
 
@@ -857,18 +870,17 @@ test "dispatcher retries once after server closes connection; exactly 2 attempts
 }
 
 test "both attempts fail — call discarded, no third attempt, no crash" {
-    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    var server = try addr.listen(testing.io, .{ .reuse_address = true });
 
-    const srv_port = server.listen_address.in.sa.port;
     var url_buf: [64]u8 = undefined;
     const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.2:{d}", .{
-        std.mem.bigToNative(u16, srv_port),
+        boundPort(&server),
     }) catch unreachable;
 
     var attempt_count = std.atomic.Value(u32).init(0);
     const Ctx = struct {
-        server: *std.net.Server,
+        server: *std.Io.net.Server,
         attempt_count: *std.atomic.Value(u32),
     };
     const ctx = Ctx{ .server = &server, .attempt_count = &attempt_count };
@@ -876,9 +888,9 @@ test "both attempts fail — call discarded, no third attempt, no crash" {
         fn run(c: Ctx) void {
             // Drop both connections immediately.
             for (0..2) |_| {
-                const conn = c.server.accept() catch break;
+                var conn = c.server.accept(testing.io) catch break;
                 _ = c.attempt_count.fetchAdd(1, .release);
-                conn.stream.close();
+                conn.close(testing.io);
             }
         }
     }.run, .{ctx});
@@ -892,7 +904,7 @@ test "both attempts fail — call discarded, no third attempt, no crash" {
     try pushCall(&d.queue, "sendMessage", "{\"chat_id\":2,\"text\":\"both-fail\"}");
 
     srv_thread.join();
-    server.deinit(); // safe to call after thread exits
+    server.deinit(testing.io); // safe to call after thread exits
 
     // Exactly 2 attempts — no third attempt was made.
     try testing.expectEqual(@as(u32, 2), attempt_count.load(.acquire));
@@ -900,23 +912,18 @@ test "both attempts fail — call discarded, no third attempt, no crash" {
 
 test "parseMessageId reads an id or reports NotFound" {
     // Valid result with an integer message_id.
-    try testing.expectEqual(@as(i64, 42), try parseMessageId(
-        "{\"ok\":true,\"result\":{\"message_id\":42,\"chat\":{\"id\":1}}}", testing.allocator));
+    try testing.expectEqual(@as(i64, 42), try parseMessageId("{\"ok\":true,\"result\":{\"message_id\":42,\"chat\":{\"id\":1}}}", testing.allocator));
     // message_id absent.
-    try testing.expectError(error.NotFound, parseMessageId(
-        "{\"ok\":true,\"result\":{\"chat\":{\"id\":1}}}", testing.allocator));
+    try testing.expectError(error.NotFound, parseMessageId("{\"ok\":true,\"result\":{\"chat\":{\"id\":1}}}", testing.allocator));
     // result absent.
-    try testing.expectError(error.NotFound, parseMessageId(
-        "{\"ok\":true}", testing.allocator));
+    try testing.expectError(error.NotFound, parseMessageId("{\"ok\":true}", testing.allocator));
     // message_id present but not an integer.
-    try testing.expectError(error.NotFound, parseMessageId(
-        "{\"ok\":true,\"result\":{\"message_id\":\"notanint\"}}", testing.allocator));
+    try testing.expectError(error.NotFound, parseMessageId("{\"ok\":true,\"result\":{\"message_id\":\"notanint\"}}", testing.allocator));
 }
 
 test "parseRetryAfter reads, defaults, and clamps" {
     // parameters.retry_after seconds → ms.
-    try testing.expectEqual(@as(u64, 5000), parseRetryAfter(
-        "{\"ok\":false,\"error_code\":429,\"parameters\":{\"retry_after\":5}}", 1000, 60000, testing.allocator));
+    try testing.expectEqual(@as(u64, 5000), parseRetryAfter("{\"ok\":false,\"error_code\":429,\"parameters\":{\"retry_after\":5}}", 1000, 60000, testing.allocator));
     // Absent, unparseable, or zero → the supplied default.
     try testing.expectEqual(@as(u64, 1000), parseRetryAfter("{\"ok\":false}", 1000, 60000, testing.allocator));
     try testing.expectEqual(@as(u64, 1000), parseRetryAfter("not json", 1000, 60000, testing.allocator));
@@ -974,12 +981,12 @@ test "multipart and json bodies are encoded correctly on the wire" {
 
         var parts = try alloc.alloc(types.MultipartPart, 1);
         parts[0] = .{
-            .name     = try alloc.dupe(u8, "photo"),
-            .content  = try alloc.dupe(u8, "\xff\xd8\xff"),
+            .name = try alloc.dupe(u8, "photo"),
+            .content = try alloc.dupe(u8, "\xff\xd8\xff"),
             .filename = try alloc.dupe(u8, "img.jpg"),
         };
         try d.queue.push(.{
-            .method  = try alloc.dupe(u8, "sendPhoto"),
+            .method = try alloc.dupe(u8, "sendPhoto"),
             .payload = .{ .multipart = parts },
         });
 
@@ -1012,7 +1019,7 @@ test "multipart and json bodies are encoded correctly on the wire" {
         defer d.deinit();
 
         try d.queue.push(.{
-            .method  = try alloc.dupe(u8, "sendMessage"),
+            .method = try alloc.dupe(u8, "sendMessage"),
             .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1,\"text\":\"hi\"}") },
         });
 
@@ -1034,7 +1041,7 @@ test "multipart and json bodies are encoded correctly on the wire" {
         parts[0] = .{ .name = try alloc.dupe(u8, "caption"), .content = try alloc.dupe(u8, "My caption"), .filename = null };
         parts[1] = .{ .name = try alloc.dupe(u8, "photo"), .content = try alloc.dupe(u8, "\xff\xd8\xff"), .filename = try alloc.dupe(u8, "pic.jpg") };
         try d.queue.push(.{
-            .method  = try alloc.dupe(u8, "sendPhoto"),
+            .method = try alloc.dupe(u8, "sendPhoto"),
             .payload = .{ .multipart = parts },
         });
 
@@ -1072,19 +1079,19 @@ test "buildMultipartBody rejects CRLF in field name" {
     defer d.deinit();
 
     try d.queue.push(.{
-        .method  = try alloc.dupe(u8, "sendPhoto"),
+        .method = try alloc.dupe(u8, "sendPhoto"),
         .payload = .{ .multipart = blk: {
             var ps = try alloc.alloc(types.MultipartPart, 1);
             ps[0] = .{
-                .name     = try alloc.dupe(u8, "bad\r\nfield"),
-                .content  = try alloc.dupe(u8, "x"),
+                .name = try alloc.dupe(u8, "bad\r\nfield"),
+                .content = try alloc.dupe(u8, "x"),
                 .filename = null,
             };
             break :blk ps;
-        }},
+        } },
     });
 
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 300 * std.time.ns_per_ms);
     try testing.expectEqual(@as(usize, 0), mock.received.len());
 }
 
@@ -1098,27 +1105,27 @@ test "buildMultipartBody rejects CRLF in filename" {
     defer d.deinit();
 
     try d.queue.push(.{
-        .method  = try alloc.dupe(u8, "sendPhoto"),
+        .method = try alloc.dupe(u8, "sendPhoto"),
         .payload = .{ .multipart = blk: {
             var ps = try alloc.alloc(types.MultipartPart, 1);
             ps[0] = .{
-                .name     = try alloc.dupe(u8, "photo"),
-                .content  = try alloc.dupe(u8, "\xff\xd8\xff"),
+                .name = try alloc.dupe(u8, "photo"),
+                .content = try alloc.dupe(u8, "\xff\xd8\xff"),
                 .filename = try alloc.dupe(u8, "img.jpg\r\nContent-Type: text/html"),
             };
             break :blk ps;
-        }},
+        } },
     });
 
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 300 * std.time.ns_per_ms);
     try testing.expectEqual(@as(usize, 0), mock.received.len());
 }
 
 // ── Live integration test ─────────────────────────────────────────────────────
 
 test "send real Telegram message via dispatcher" {
-    const token = std.posix.getenv("TELEGRAM_BOT_TOKEN") orelse return error.SkipZigTest;
-    const chat_id_str = std.posix.getenv("TELEGRAM_CHAT_ID") orelse return error.SkipZigTest;
+    const token = testing.environ.getPosix("TELEGRAM_BOT_TOKEN") orelse return error.SkipZigTest;
+    const chat_id_str = testing.environ.getPosix("TELEGRAM_CHAT_ID") orelse return error.SkipZigTest;
     const chat_id = try std.fmt.parseInt(i64, chat_id_str, 10);
 
     const d = try TestDispatcher.init(testing.allocator, token, "https://api.telegram.org");
@@ -1133,7 +1140,7 @@ test "send real Telegram message via dispatcher" {
     try pushCall(&d.queue, "sendMessage", body);
 
     // Give the dispatcher enough time to send and confirm.
-    std.Thread.sleep(4 * std.time.ns_per_s);
+    rt.sleepNs(testing.io, 4 * std.time.ns_per_s);
 }
 
 // ── tracked_send_failures_total ──────────────────────────────────────────────
@@ -1143,56 +1150,61 @@ test "tracked_send_failures_total increments when message_id absent in response"
 
     // Inline stub: accepts one connection, returns 200 with a JSON body
     // that has no message_id — triggers the parseMessageId catch path.
-    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    var server = try addr.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
 
-    const srv_port = server.listen_address.in.sa.port;
     var url_buf: [64]u8 = undefined;
     const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.2:{d}", .{
-        std.mem.bigToNative(u16, srv_port),
+        boundPort(&server),
     }) catch unreachable;
 
     const srv_thread = try std.Thread.spawn(.{}, struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
-            var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
-            conn.stream.writeAll(
+        fn run(srv: *std.Io.net.Server) void {
+            const io = testing.io;
+            var conn = srv.accept(io) catch return;
+            defer conn.close(io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = conn.reader(io, &rbuf);
+            _ = rd.interface.takeDelimiterInclusive('\n') catch {};
+            var wbuf: [256]u8 = undefined;
+            var wr = conn.writer(io, &wbuf);
+            wr.interface.writeAll(
                 "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: application/json\r\n" ++
-                "Content-Length: 11\r\n" ++
-                "\r\n" ++
-                "{\"ok\":true}",
+                    "Content-Type: application/json\r\n" ++
+                    "Content-Length: 11\r\n" ++
+                    "\r\n" ++
+                    "{\"ok\":true}",
             ) catch {};
+            wr.interface.flush() catch {};
         }
     }.run, .{&server});
 
     var m = metrics_mod.Metrics{};
-    var rq = try queue_mod.Queue(io_pool.IoResult).init(alloc, 8);
+    var rq = try queue_mod.Queue(io_pool.IoResult).init(alloc, testing.io, 8);
     defer rq.deinit(alloc);
     var rq_slice = [1]*queue_mod.Queue(io_pool.IoResult){&rq};
 
     var stop = std.atomic.Value(bool).init(false);
-    var dq = try queue_mod.Queue(types.ApiCall).init(alloc, 16);
+    var dq = try queue_mod.Queue(types.ApiCall).init(alloc, testing.io, 16);
     defer dq.deinit(alloc);
 
     const disp_thread = try std.Thread.spawn(.{}, dispatcherThread, .{DispatcherArgs{
-        .id               = 0,
-        .queue            = &dq,
-        .bot_token        = "TOK",
-        .api_base         = api_base,
-        .allocator        = alloc,
-        .stop             = &stop,
+        .id = 0,
+        .queue = &dq,
+        .bot_token = "TOK",
+        .api_base = api_base,
+        .allocator = alloc,
+        .io = testing.io,
+        .stop = &stop,
         .io_result_queues = &rq_slice,
-        .metrics          = &m,
+        .metrics = &m,
     }});
 
     // Push a tracked sendMessage. Dispatcher owns method+payload after push.
     try dq.push(.{
-        .method   = try alloc.dupe(u8, "sendMessage"),
-        .payload  = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1,\"text\":\"hi\"}") },
+        .method = try alloc.dupe(u8, "sendMessage"),
+        .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1,\"text\":\"hi\"}") },
         .tracking = .{ .worker_id = 0, .coro_id = 7 },
     });
 
@@ -1205,6 +1217,7 @@ test "tracked_send_failures_total increments when message_id absent in response"
     try testing.expectEqual(@as(u64, 1), m.tracked_send_failures_total.load(.monotonic));
 
     stop.store(true, .release);
+    dq.close();
     disp_thread.join();
     srv_thread.join();
 }
@@ -1220,17 +1233,23 @@ test "an oversize response is rejected and counted" {
 
     var m = metrics_mod.Metrics{};
     var stop = std.atomic.Value(bool).init(false);
-    var dq = try queue_mod.Queue(types.ApiCall).init(testing.allocator, 16);
+    var dq = try queue_mod.Queue(types.ApiCall).init(testing.allocator, testing.io, 16);
     defer dq.deinit(testing.allocator);
 
     var url_buf: [64]u8 = undefined;
     const disp = try std.Thread.spawn(.{}, dispatcherThread, .{DispatcherArgs{
-        .id = 0, .queue = &dq, .bot_token = "TOK", .api_base = mock.baseUrl(&url_buf),
-        .allocator = testing.allocator, .stop = &stop, .metrics = &m,
+        .id = 0,
+        .queue = &dq,
+        .bot_token = "TOK",
+        .api_base = mock.baseUrl(&url_buf),
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .stop = &stop,
+        .metrics = &m,
     }});
 
     try dq.push(.{
-        .method  = try testing.allocator.dupe(u8, "sendMessage"),
+        .method = try testing.allocator.dupe(u8, "sendMessage"),
         .payload = .{ .json = try testing.allocator.dupe(u8, "{\"chat_id\":1,\"text\":\"x\"}") },
     });
 
@@ -1239,10 +1258,11 @@ test "an oversize response is rejected and counted" {
     // And the oversize counter is incremented.
     var waited: u64 = 0;
     while (m.response_oversize_total.load(.monotonic) == 0 and waited < 4000) {
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
         waited += 20;
     }
     stop.store(true, .release);
+    dq.close();
     disp.join();
     while (dq.popTimeout(0)) |c| types.freeApiCall(c, testing.allocator);
 
@@ -1253,11 +1273,11 @@ test "an oversize response is rejected and counted" {
 // requeue thread feeding the dispatcher's own queue. Heap-allocated so pointers
 // passed to threads stay valid.
 const ThrottleHarness = struct {
-    stop:      std.atomic.Value(bool),
-    queue:     queue_mod.Queue(types.ApiCall),
-    delay_q:   delay.DelayQueue,
-    blocked:   delay.BlockedMap,
-    disp_t:    std.Thread,
+    stop: std.atomic.Value(bool),
+    queue: queue_mod.Queue(types.ApiCall),
+    delay_q: delay.DelayQueue,
+    blocked: delay.BlockedMap,
+    disp_t: std.Thread,
     requeue_t: std.Thread,
     allocator: std.mem.Allocator,
 
@@ -1266,24 +1286,35 @@ const ThrottleHarness = struct {
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         self.stop = std.atomic.Value(bool).init(false);
-        self.queue = try queue_mod.Queue(types.ApiCall).init(allocator, 64);
-        self.delay_q = delay.DelayQueue.init(allocator, 64);
-        self.blocked = delay.BlockedMap.init(allocator);
+        self.queue = try queue_mod.Queue(types.ApiCall).init(allocator, testing.io, 64);
+        self.delay_q = delay.DelayQueue.init(allocator, testing.io, 64);
+        self.blocked = delay.BlockedMap.init(allocator, testing.io);
         self.disp_t = try std.Thread.spawn(.{}, dispatcherThread, .{DispatcherArgs{
-            .id = 0, .queue = &self.queue, .bot_token = "TOK", .api_base = api_base,
-            .allocator = allocator, .stop = &self.stop,
-            .delay_q = &self.delay_q, .blocked_until = &self.blocked,
-            .retry_after_default_ms = 1000, .retry_after_max_ms = 60000,
+            .id = 0,
+            .queue = &self.queue,
+            .bot_token = "TOK",
+            .api_base = api_base,
+            .allocator = allocator,
+            .io = testing.io,
+            .stop = &self.stop,
+            .delay_q = &self.delay_q,
+            .blocked_until = &self.blocked,
+            .retry_after_default_ms = 1000,
+            .retry_after_max_ms = 60000,
         }});
         self.requeue_t = try std.Thread.spawn(.{}, delay.requeueThread, .{delay.RequeueArgs{
-            .delay_q = &self.delay_q, .disp_q = &self.queue, .stop = &self.stop,
-            .metrics = null, .allocator = allocator,
+            .delay_q = &self.delay_q,
+            .disp_q = &self.queue,
+            .stop = &self.stop,
+            .metrics = null,
+            .allocator = allocator,
         }});
         return self;
     }
 
     fn deinit(self: *ThrottleHarness) void {
         self.stop.store(true, .release);
+        self.queue.close(); // wake the parked dispatcher so it can observe stop
         self.disp_t.join();
         self.requeue_t.join();
         while (self.queue.popTimeout(0)) |c| types.freeApiCall(c, self.allocator);
@@ -1297,9 +1328,9 @@ const ThrottleHarness = struct {
         var body_buf: [64]u8 = undefined;
         const body = try std.fmt.bufPrint(&body_buf, "{{\"chat_id\":{d},\"text\":\"x\"}}", .{chat_id});
         try self.queue.push(.{
-            .method  = try self.allocator.dupe(u8, "sendMessage"),
+            .method = try self.allocator.dupe(u8, "sendMessage"),
             .payload = .{ .json = try self.allocator.dupe(u8, body) },
-            .route   = .{ .chat_id = chat_id },
+            .route = .{ .chat_id = chat_id },
         });
     }
 };
@@ -1310,8 +1341,8 @@ test "429 parks the call and a blocked chat waits for the window" {
     {
         const mock = try MockServer.init(testing.allocator);
         defer mock.deinit();
-        mock.force_429.store(1, .release);          // first response = 429
-        mock.retry_after_secs.store(1, .release);    // wait 1s
+        mock.force_429.store(1, .release); // first response = 429
+        mock.retry_after_secs.store(1, .release); // wait 1s
 
         var url_buf: [64]u8 = undefined;
         const h = try ThrottleHarness.init(testing.allocator, mock.baseUrl(&url_buf));
@@ -1325,21 +1356,21 @@ test "429 parks the call and a blocked chat waits for the window" {
     {
         const mock = try MockServer.init(testing.allocator);
         defer mock.deinit();
-        mock.force_429.store(1, .release);          // only the first send 429s
+        mock.force_429.store(1, .release); // only the first send 429s
         mock.retry_after_secs.store(1, .release);
 
         var url_buf: [64]u8 = undefined;
         const h = try ThrottleHarness.init(testing.allocator, mock.baseUrl(&url_buf));
         defer h.deinit();
 
-        try h.pushMsg(1);                            // → 429 → parks, blocks chat 1
+        try h.pushMsg(1); // → 429 → parks, blocks chat 1
         // Give the dispatcher a moment to process the 429 and set blocked_until.
-        std.Thread.sleep(150 * std.time.ns_per_ms);
-        try h.pushMsg(1);                            // diverted (no wire)
-        try h.pushMsg(1);                            // diverted (no wire)
+        rt.sleepNs(testing.io, 150 * std.time.ns_per_ms);
+        try h.pushMsg(1); // diverted (no wire)
+        try h.pushMsg(1); // diverted (no wire)
 
         // During the ~1s window, only the first (429'd) request reached the mock.
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+        rt.sleepNs(testing.io, 500 * std.time.ns_per_ms);
         try testing.expectEqual(@as(usize, 1), mock.received.len());
 
         // After the window all three are delivered: 1 (429) + 3 (success) = 4 total.

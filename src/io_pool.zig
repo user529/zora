@@ -11,6 +11,7 @@ const std = @import("std");
 const queue_mod = @import("queue.zig");
 const metrics_mod = @import("metrics.zig");
 const types = @import("types.zig");
+const rt = @import("rt.zig");
 
 const log = std.log.scoped(.io_pool);
 
@@ -21,10 +22,6 @@ const log = std.log.scoped(.io_pool);
 pub const IoJob = struct {
     worker_id:   u8,
     coro_id:     u32,
-    /// Absolute wall-clock deadline (std.time.milliTimestamp() units).
-    /// Pass -1 to use the pool's configured IO_JOB_TIMEOUT_MS from the start
-    /// of execution instead of a fixed wall-clock target.
-    deadline_ms: i64,
     payload: union(enum) {
         http_request: struct {
             method:  []const u8,
@@ -71,10 +68,6 @@ pub fn freeIoResult(result: IoResult, allocator: std.mem.Allocator) void {
     }
 }
 
-pub fn freeIoOutcome(outcome: IoOutcome, allocator: std.mem.Allocator) void {
-    freeIoResult(.{ .coro_id = 0, .outcome = outcome }, allocator);
-}
-
 /// Free every duped name and value in a header list, then the list's backing
 /// memory. Used on error paths in executeHttp before the list is handed off.
 fn freeHeaderListItems(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(std.http.Header)) void {
@@ -92,6 +85,7 @@ fn freeHeaderListItems(allocator: std.mem.Allocator, list: *std.ArrayListUnmanag
 const TimerCtx = struct {
     pid:        std.posix.pid_t,
     timeout_ms: u64,
+    io:         std.Io,
     done:       *std.atomic.Value(bool),
 };
 
@@ -99,11 +93,45 @@ fn timerThread(ctx: TimerCtx) void {
     const poll_ms: u64 = 10;
     var waited_ms: u64 = 0;
     while (!ctx.done.load(.acquire) and waited_ms < ctx.timeout_ms) {
-        std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+        rt.sleepNs(ctx.io, poll_ms * std.time.ns_per_ms);
         waited_ms += poll_ms;
     }
     if (!ctx.done.load(.acquire)) {
         std.posix.kill(ctx.pid, std.posix.SIG.KILL) catch {};
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HttpWatchdogCtx — shuts a stalled HTTP connection down after timeout_ms
+// ---------------------------------------------------------------------------
+
+const HttpWatchdogCtx = struct {
+    stream:     std.Io.net.Stream,
+    timeout_ms: u64,
+    io:         std.Io,
+    done:       *std.atomic.Value(bool),
+    timed_out:  *std.atomic.Value(bool),
+};
+
+/// Shut the connection's socket down once timeout_ms elapses, unless the request
+/// finished first (done). 0.16's blocking Io has no socket read timeout, so a
+/// peer that accepts the connection but never replies would otherwise pin the
+/// pool thread in receiveHead/streamRemaining forever. The shutdown turns that
+/// stall into a read error, so executeHttp returns. timed_out is set before the
+/// shutdown so executeHttp reports a timeout rather than a generic read error.
+/// The HTTP counterpart of timerThread; it shuts a socket down instead of
+/// killing a child.
+fn httpWatchdog(ctx: HttpWatchdogCtx) void {
+    const poll_ms: u64 = 10;
+    var waited_ms: u64 = 0;
+    while (!ctx.done.load(.acquire) and waited_ms < ctx.timeout_ms) {
+        rt.sleepNs(ctx.io, poll_ms * std.time.ns_per_ms);
+        waited_ms += poll_ms;
+    }
+    if (!ctx.done.load(.acquire)) {
+        ctx.timed_out.store(true, .release);
+        var s = ctx.stream;
+        s.shutdown(ctx.io, .both) catch {};
     }
 }
 
@@ -121,6 +149,7 @@ pub const IoPoolConfig = struct {
 
 pub const IoPool = struct {
     allocator:       std.mem.Allocator,
+    io:              std.Io,
     job_queue:       queue_mod.Queue(IoJob),
     result_queues:   []const *queue_mod.Queue(IoResult),
     threads:         []std.Thread,
@@ -137,17 +166,19 @@ pub const IoPool = struct {
     pub fn init(
         self:          *IoPool,
         allocator:     std.mem.Allocator,
+        io:            std.Io,
         config:        IoPoolConfig,
         result_queues: []const *queue_mod.Queue(IoResult),
     ) !void {
         self.allocator       = allocator;
+        self.io              = io;
         self.result_queues   = result_queues;
         self.timeout_ms      = config.timeout_ms;
         self.proc_max_output = config.proc_max_output;
         self.metrics         = config.metrics;
         self.stop            = std.atomic.Value(bool).init(false);
 
-        self.job_queue = try queue_mod.Queue(IoJob).init(allocator, config.queue_capacity);
+        self.job_queue = try queue_mod.Queue(IoJob).init(allocator, io, config.queue_capacity);
         errdefer self.job_queue.deinit(allocator);
         self.job_queue.kind = .io_job;
 
@@ -162,6 +193,9 @@ pub const IoPool = struct {
         for (self.threads, 0..) |*t, i| {
             t.* = std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, workerThread, .{ self, @as(u8, @intCast(i)) }) catch |err| {
                 self.stop.store(true, .release);
+                // Wake the already-started threads — they park in popBlocking and
+                // are released only by close(), not by the stop flag.
+                self.job_queue.close();
                 for (self.threads[0..i]) |started| started.join();
                 return err;
             };
@@ -170,6 +204,9 @@ pub const IoPool = struct {
 
     pub fn deinit(self: *IoPool) void {
         self.stop.store(true, .release);
+        // Wake parked pool threads so they drain and exit (replaces the old
+        // 10 ms stop-poll).
+        self.job_queue.close();
         // SIGKILL any in-flight child processes so blocked child.wait() returns.
         for (self.current_pids) |*pv| {
             const pid = pv.load(.acquire);
@@ -227,15 +264,14 @@ pub const IoPool = struct {
     }
 
     fn workerThread(pool: *IoPool, thread_idx: u8) void {
-        var http_client = std.http.Client{ .allocator = pool.allocator };
+        var http_client = std.http.Client{ .allocator = pool.allocator, .io = pool.io };
         defer http_client.deinit();
 
-        while (!pool.stop.load(.acquire)) {
-            const job = pool.job_queue.popTimeout(10 * std.time.ns_per_ms) orelse continue;
-            pool.executeJob(&http_client, thread_idx, job);
-        }
-        // Drain remaining queued jobs before exiting.
-        while (pool.job_queue.popTimeout(0)) |job| {
+        // Park indefinitely until a job arrives or the pool is closed at
+        // shutdown — no 10 ms poll, so an idle pool thread consumes no CPU.
+        // popBlocking drains the queue before reporting null, so jobs queued at
+        // close are still run; no separate drain loop is needed.
+        while (pool.job_queue.popBlocking()) |job| {
             pool.executeJob(&http_client, thread_idx, job);
         }
     }
@@ -287,6 +323,37 @@ pub const IoPool = struct {
         };
         defer request.deinit();
 
+        // Bound the response wait. A peer that accepts the connection but never
+        // replies would otherwise block this pool thread in receiveHead /
+        // streamRemaining forever — 0.16's blocking Io has no socket read
+        // timeout. A watchdog shuts the connection's socket down at timeout_ms,
+        // turning the stall into a read error; this mirrors the child-process
+        // timer in executeProc. Caveat: the connect and TLS handshake run inside
+        // client.request above, before the socket is reachable here, so those
+        // phases are bounded by the kernel connect timeout, not this watchdog.
+        var wd_done = std.atomic.Value(bool).init(false);
+        var wd_timed_out = std.atomic.Value(bool).init(false);
+        const watchdog: ?std.Thread = std.Thread.spawn(
+            .{ .stack_size = types.THREAD_STACK_SIZE },
+            httpWatchdog,
+            .{HttpWatchdogCtx{
+                .stream     = request.connection.?.stream_reader.stream,
+                .timeout_ms = pool.timeout_ms,
+                .io         = pool.io,
+                .done       = &wd_done,
+                .timed_out  = &wd_timed_out,
+            }},
+        ) catch |err| blk: {
+            log.warn("http watchdog spawn failed for coro={d}: {s} — request runs unbounded", .{ job.coro_id, @errorName(err) });
+            break :blk null;
+        };
+        // Stops before request.deinit() (LIFO): the watchdog never touches a
+        // socket the connection is tearing down.
+        defer if (watchdog) |t| {
+            wd_done.store(true, .release);
+            t.join();
+        };
+
         if (has_payload) {
             request.transfer_encoding = .{ .content_length = req_job.body.len };
             var body_writer = request.sendBodyUnflushed(&.{}) catch |err| {
@@ -318,7 +385,7 @@ pub const IoPool = struct {
         const redirect_slice: []u8 = if (redirect_behavior == .unhandled) &.{} else &redirect_buf;
 
         var response = request.receiveHead(redirect_slice) catch |err| {
-            pool.pushErr(job, @errorName(err));
+            pool.pushErr(job, if (wd_timed_out.load(.acquire)) "timeout" else @errorName(err));
             return;
         };
 
@@ -406,7 +473,7 @@ pub const IoPool = struct {
         const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
 
         _ = reader.streamRemaining(&al_writer.writer) catch |err| {
-            const msg = switch (err) {
+            const msg = if (wd_timed_out.load(.acquire)) "timeout" else switch (err) {
                 error.ReadFailed => if (response.bodyErr()) |be| @errorName(be) else "ReadFailed",
                 else => @errorName(err),
             };
@@ -438,28 +505,30 @@ pub const IoPool = struct {
     fn executeProc(pool: *IoPool, thread_idx: u8, job: IoJob, argv: []const []const u8) void {
         const alloc = pool.allocator;
 
-        var child = std.process.Child.init(argv, alloc);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Close;
-
-        child.spawn() catch |err| {
+        var child = std.process.spawn(pool.io, .{
+            .argv   = argv,
+            .stdout = .pipe,
+            .stderr = .close,
+        }) catch |err| {
             pool.pushErr(job, @errorName(err));
             return;
         };
+        const child_pid = child.id.?;
 
         // Publish PID so deinit() can SIGKILL if the pool shuts down mid-run.
-        pool.current_pids[thread_idx].store(child.id, .release);
+        pool.current_pids[thread_idx].store(child_pid, .release);
         defer pool.current_pids[thread_idx].store(0, .release);
 
         // Start timeout timer.
         var timer_done = std.atomic.Value(bool).init(false);
         const timer = std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, timerThread, .{TimerCtx{
-            .pid        = child.id,
+            .pid        = child_pid,
             .timeout_ms = pool.timeout_ms,
+            .io         = pool.io,
             .done       = &timer_done,
         }}) catch |err| {
             log.warn("failed to spawn timer for coro={d}: {s}", .{ job.coro_id, @errorName(err) });
-            _ = child.wait() catch {};
+            _ = child.wait(pool.io) catch {};
             pool.pushErr(job, "timer_spawn_failed");
             return;
         };
@@ -474,9 +543,11 @@ pub const IoPool = struct {
         var truncated = false;
 
         if (child.stdout) |pipe| {
+            var rbuf: [4096]u8 = undefined;
+            var fr = pipe.reader(pool.io, &rbuf);
             var buf: [4096]u8 = undefined;
             read_loop: while (true) {
-                const n = pipe.read(&buf) catch break;
+                const n = fr.interface.readSliceShort(&buf) catch break;
                 if (n == 0) break;
                 const space = pool.proc_max_output -| stdout_buf.items.len;
                 if (n <= space) {
@@ -489,14 +560,14 @@ pub const IoPool = struct {
             }
         }
 
-        const term = child.wait() catch |err| {
+        const term = child.wait(pool.io) catch |err| {
             pool.pushErr(job, @errorName(err));
             return;
         };
 
         // SIGKILL means either timeout (timer) or deinit() killed it.
         switch (term) {
-            .Signal => |sig| if (sig == std.posix.SIG.KILL) {
+            .signal => |sig| if (sig == std.posix.SIG.KILL) {
                 pool.pushErr(job, "timeout");
                 return;
             },
@@ -511,8 +582,8 @@ pub const IoPool = struct {
         };
 
         const exit_code: i32 = switch (term) {
-            .Exited => |code| @as(i32, code),
-            .Signal => |sig|  -@as(i32, @intCast(sig)),
+            .exited => |code| @as(i32, code),
+            .signal => |sig|  -@as(i32, @intCast(@intFromEnum(sig))),
             else    => -1,
         };
 
@@ -528,7 +599,7 @@ const testing = std.testing;
 
 test "IoJob instantiates all payload variants" {
     const j_http = IoJob{
-        .worker_id = 0, .coro_id = 1, .deadline_ms = -1,
+        .worker_id = 0, .coro_id = 1,
         .payload = .{ .http_request = .{
             .method = "GET", .url = "http://x", .headers = &.{}, .body = "",
         }},
@@ -536,13 +607,13 @@ test "IoJob instantiates all payload variants" {
     try testing.expectEqual(@as(u32, 1), j_http.coro_id);
 
     const j_exec = IoJob{
-        .worker_id = 0, .coro_id = 2, .deadline_ms = -1,
+        .worker_id = 0, .coro_id = 2,
         .payload = .{ .exec = .{ .argv = &.{"/bin/true"} } },
     };
     try testing.expectEqual(@as(u32, 2), j_exec.coro_id);
 
     const j_shell = IoJob{
-        .worker_id = 0, .coro_id = 3, .deadline_ms = -1,
+        .worker_id = 0, .coro_id = 3,
         .payload = .{ .shell = .{ .command = "true" } },
     };
     try testing.expectEqual(@as(u32, 3), j_shell.coro_id);
@@ -577,54 +648,168 @@ test "freeIoResult releases all outcome variants — no leaks" {
 /// writes `response`, then closes. Returns the bound port and thread handle.
 const StubServer = struct { port: u16, thread: std.Thread };
 
+// 0.16's net.Server no longer exposes the bound address, so query the socket
+// directly for the port assigned to a port-0 listen.
+fn boundPort(srv: *std.Io.net.Server) u16 {
+    var sa: std.posix.sockaddr.in = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    _ = std.posix.system.getsockname(srv.socket.handle, @ptrCast(&sa), &len);
+    return std.mem.bigToNative(u16, sa.port);
+}
+
 fn spawnStub(response: []const u8) !StubServer {
-    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
-    const srv_ptr = try testing.allocator.create(std.net.Server);
-    srv_ptr.* = try addr.listen(.{ .reuse_address = true });
-    const port = std.mem.bigToNative(u16, srv_ptr.listen_address.in.sa.port);
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    const srv_ptr = try testing.allocator.create(std.Io.net.Server);
+    srv_ptr.* = try addr.listen(testing.io, .{ .reuse_address = true });
+    const port = boundPort(srv_ptr);
     const thread = try std.Thread.spawn(.{}, stubOnce, .{ srv_ptr, response });
     return .{ .port = port, .thread = thread };
 }
 
-fn stubOnce(srv_ptr: *std.net.Server, response: []const u8) void {
+/// A stalled peer: accepts one connection, drains the request head, then holds
+/// the connection open without ever responding. deinit() shuts the listening
+/// socket down (which unblocks the parked accept, so the stub closes its end of
+/// the client connection) and joins the thread. Call deinit() after the IoPool
+/// that submitted the job is torn down.
+const HangStub = struct {
+    server: *std.Io.net.Server,
+    thread: std.Thread,
+    port:   u16,
+    fn deinit(self: *HangStub) void {
+        const io = testing.io;
+        var s = std.Io.net.Stream{ .socket = self.server.socket };
+        s.shutdown(io, .recv) catch {};
+        self.server.deinit(io);
+        self.thread.join();
+        testing.allocator.destroy(self.server);
+    }
+};
+
+fn spawnHangStub() !HangStub {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    const srv = try testing.allocator.create(std.Io.net.Server);
+    srv.* = try addr.listen(testing.io, .{ .reuse_address = true });
+    const port = boundPort(srv);
+    const thread = try std.Thread.spawn(.{}, hangOnce, .{srv});
+    return .{ .server = srv, .thread = thread, .port = port };
+}
+
+fn hangOnce(srv_ptr: *std.Io.net.Server) void {
+    const io = testing.io;
+    var stream = srv_ptr.accept(io) catch return;
+    defer stream.close(io);
+    var rbuf: [8192]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    // Drain the request head so the client's write completes; the client then
+    // blocks waiting for a response that never comes.
+    while (sr.interface.takeDelimiterInclusive('\n')) |line| {
+        if (line.len <= 2) break; // "\r\n" terminates the header block
+    } else |_| {}
+    // Hold the connection open until deinit() shuts the listening socket down.
+    _ = srv_ptr.accept(io) catch {};
+}
+
+fn stubOnce(srv_ptr: *std.Io.net.Server, response: []const u8) void {
+    const io = testing.io;
     defer {
-        srv_ptr.deinit();
+        srv_ptr.deinit(io);
         testing.allocator.destroy(srv_ptr);
     }
-    const conn = srv_ptr.accept() catch return;
-    defer conn.stream.close();
-    var buf: [8192]u8 = undefined;
-    _ = conn.stream.read(&buf) catch {};
-    conn.stream.writeAll(response) catch {};
+    var stream = srv_ptr.accept(io) catch return;
+    defer stream.close(io);
+    var rbuf: [8192]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    // Drain the request head line-by-line, stopping at the blank line that ends
+    // the headers. readSliceShort would deadlock here: it returns short only on
+    // EOF, and the keep-alive client never closes, so it blocks forever trying
+    // to fill the buffer.
+    while (sr.interface.takeDelimiterInclusive('\n')) |line| {
+        if (line.len <= 2) break; // "\r\n" terminates the header block
+    } else |_| {}
+    var wbuf: [4096]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    sw.interface.writeAll(response) catch {};
+    sw.interface.flush() catch {};
 }
 
 /// Like spawnStub but records the bytes the client sent into `req_out`.
 const CaptureStub = struct { port: u16, thread: std.Thread };
 
 fn spawnCaptureStub(req_out: *std.ArrayListUnmanaged(u8), response: []const u8) !CaptureStub {
-    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
-    const srv_ptr = try testing.allocator.create(std.net.Server);
-    srv_ptr.* = try addr.listen(.{ .reuse_address = true });
-    const port = std.mem.bigToNative(u16, srv_ptr.listen_address.in.sa.port);
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    const srv_ptr = try testing.allocator.create(std.Io.net.Server);
+    srv_ptr.* = try addr.listen(testing.io, .{ .reuse_address = true });
+    const port = boundPort(srv_ptr);
     const thread = try std.Thread.spawn(.{}, captureOnce, .{ srv_ptr, req_out, response });
     return .{ .port = port, .thread = thread };
 }
 
-fn captureOnce(srv_ptr: *std.net.Server, req_out: *std.ArrayListUnmanaged(u8), response: []const u8) void {
+fn captureOnce(srv_ptr: *std.Io.net.Server, req_out: *std.ArrayListUnmanaged(u8), response: []const u8) void {
+    const io = testing.io;
     defer {
-        srv_ptr.deinit();
+        srv_ptr.deinit(io);
         testing.allocator.destroy(srv_ptr);
     }
-    const conn = srv_ptr.accept() catch return;
-    defer conn.stream.close();
-    var buf: [8192]u8 = undefined;
-    const n = conn.stream.read(&buf) catch 0;
-    req_out.appendSlice(testing.allocator, buf[0..n]) catch {};
-    conn.stream.writeAll(response) catch {};
+    var stream = srv_ptr.accept(io) catch return;
+    defer stream.close(io);
+    var rbuf: [8192]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    // Capture the request head line-by-line, stopping at the blank line that
+    // ends the headers. A single readSliceShort would deadlock against the
+    // keep-alive client (see stubOnce).
+    while (sr.interface.takeDelimiterInclusive('\n')) |line| {
+        req_out.appendSlice(testing.allocator, line) catch {};
+        if (line.len <= 2) break; // "\r\n" terminates the header block
+    } else |_| {}
+    var wbuf: [4096]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    sw.interface.writeAll(response) catch {};
+    sw.interface.flush() catch {};
+}
+
+test "http_request to a stalled peer times out instead of pinning the pool thread" {
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
+    defer rq.deinit(testing.allocator);
+
+    var hang = try spawnHangStub();
+
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{hang.port});
+    defer testing.allocator.free(url);
+
+    var m = metrics_mod.Metrics{};
+    var pool: IoPool = undefined;
+    // Short timeout so the watchdog fires well within the 3 s poll budget below.
+    try pool.init(testing.allocator, testing.io,
+        .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 200, .proc_max_output = 65_536, .metrics = &m },
+        &.{&rq});
+
+    try pool.submit(.{
+        .worker_id = 0, .coro_id = 11,
+        .payload = .{ .http_request = .{ .method = "GET", .url = url, .headers = &.{}, .body = "" } },
+    });
+
+    // Without the watchdog the pool thread blocks in receiveHead forever and no
+    // result arrives; with it, an err lands shortly after timeout_ms.
+    const result = rq.popTimeout(3 * std.time.ns_per_s);
+    if (result == null) {
+        // Regression: close the stub's end first to unblock the pool thread, so
+        // pool.deinit() can join it, then fail loudly.
+        hang.deinit();
+        pool.deinit();
+        return error.TestTimeout;
+    }
+    const r = result.?;
+    defer freeIoResult(r, testing.allocator);
+    defer hang.deinit();
+    defer pool.deinit();
+
+    try testing.expect(r.outcome == .err);
+    try testing.expectEqualStrings("timeout", r.outcome.err);
+    try testing.expectEqual(@as(u64, 1), m.io_timeouts_total.load(.monotonic));
 }
 
 test "http_request forwards extra headers to the server" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
     defer rq.deinit(testing.allocator);
 
     var req_bytes: std.ArrayListUnmanaged(u8) = .empty;
@@ -638,7 +823,7 @@ test "http_request forwards extra headers to the server" {
     defer testing.allocator.free(url);
 
     var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
+    try pool.init(testing.allocator, testing.io,
         .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 },
         &.{&rq});
     defer pool.deinit();
@@ -648,7 +833,7 @@ test "http_request forwards extra headers to the server" {
         .{ .name = "Authorization", .value = "Bearer tok123" },
     };
     try pool.submit(.{
-        .worker_id = 0, .coro_id = 7, .deadline_ms = -1,
+        .worker_id = 0, .coro_id = 7,
         .payload = .{ .http_request = .{ .method = "GET", .url = url, .headers = &hdrs, .body = "" } },
     });
 
@@ -661,7 +846,7 @@ test "http_request forwards extra headers to the server" {
 }
 
 test "http_request captures response headers, original casing, last-wins dup" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
     defer rq.deinit(testing.allocator);
 
     const stub = try spawnStub(
@@ -678,13 +863,13 @@ test "http_request captures response headers, original casing, last-wins dup" {
     defer testing.allocator.free(url);
 
     var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
+    try pool.init(testing.allocator, testing.io,
         .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 },
         &.{&rq});
     defer pool.deinit();
 
     try pool.submit(.{
-        .worker_id = 0, .coro_id = 9, .deadline_ms = -1,
+        .worker_id = 0, .coro_id = 9,
         .payload = .{ .http_request = .{ .method = "GET", .url = url, .headers = &.{}, .body = "" } },
     });
 
@@ -717,7 +902,7 @@ test "http_request captures response headers, original casing, last-wins dup" {
 }
 
 test "http_request decompresses gzip response body" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
     defer rq.deinit(testing.allocator);
 
     // gzip of "hello gzip world" (mtime=0 for a stable fixture).
@@ -750,13 +935,13 @@ test "http_request decompresses gzip response body" {
     defer testing.allocator.free(url);
 
     var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
+    try pool.init(testing.allocator, testing.io,
         .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 },
         &.{&rq});
     defer pool.deinit();
 
     try pool.submit(.{
-        .worker_id = 0, .coro_id = 11, .deadline_ms = -1,
+        .worker_id = 0, .coro_id = 11,
         .payload = .{ .http_request = .{ .method = "GET", .url = url, .headers = &.{}, .body = "" } },
     });
 
@@ -768,7 +953,7 @@ test "http_request decompresses gzip response body" {
 }
 
 test "http_request GET to local stub → status 200, body matches" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
     defer rq.deinit(testing.allocator);
 
     const stub = try spawnStub(
@@ -783,14 +968,14 @@ test "http_request GET to local stub → status 200, body matches" {
     defer testing.allocator.free(url);
 
     var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
+    try pool.init(testing.allocator, testing.io,
         .{ .thread_count = 1, .queue_capacity = 8,
            .timeout_ms = 5_000, .proc_max_output = 65_536 },
         &.{&rq});
     defer pool.deinit();
 
     try pool.submit(.{
-        .worker_id = 0, .coro_id = 42, .deadline_ms = -1,
+        .worker_id = 0, .coro_id = 42,
         .payload = .{ .http_request = .{
             .method = "GET", .url = url, .headers = &.{}, .body = "",
         }},
@@ -806,11 +991,11 @@ test "http_request GET to local stub → status 200, body matches" {
 }
 
 test "http_request to unreachable address → IoResult.err, thread survives" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
     defer rq.deinit(testing.allocator);
 
     var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
+    try pool.init(testing.allocator, testing.io,
         .{ .thread_count = 1, .queue_capacity = 8,
            .timeout_ms = 5_000, .proc_max_output = 65_536 },
         &.{&rq});
@@ -818,7 +1003,7 @@ test "http_request to unreachable address → IoResult.err, thread survives" {
 
     // Port 1 is almost certainly not listening — ECONNREFUSED expected.
     try pool.submit(.{
-        .worker_id = 0, .coro_id = 1, .deadline_ms = -1,
+        .worker_id = 0, .coro_id = 1,
         .payload = .{ .http_request = .{
             .method = "GET", .url = "http://127.0.0.1:1/",
             .headers = &.{}, .body = "",
@@ -831,7 +1016,7 @@ test "http_request to unreachable address → IoResult.err, thread survives" {
 
     // Confirm the thread survived by processing a second job.
     try pool.submit(.{
-        .worker_id = 0, .coro_id = 2, .deadline_ms = -1,
+        .worker_id = 0, .coro_id = 2,
         .payload = .{ .http_request = .{
             .method = "GET", .url = "http://127.0.0.1:1/",
             .headers = &.{}, .body = "",
@@ -845,16 +1030,16 @@ test "http_request to unreachable address → IoResult.err, thread survives" {
 test "exec and shell run a command and capture output" {
     // exec: the argv form runs /bin/echo and returns its stdout.
     {
-        var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+        var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
         defer rq.deinit(testing.allocator);
         var pool: IoPool = undefined;
-        try pool.init(testing.allocator,
+        try pool.init(testing.allocator, testing.io,
             .{ .thread_count = 1, .queue_capacity = 8,
                .timeout_ms = 5_000, .proc_max_output = 65_536 },
             &.{&rq});
         defer pool.deinit();
 
-        try pool.submit(.{ .worker_id = 0, .coro_id = 10, .deadline_ms = -1,
+        try pool.submit(.{ .worker_id = 0, .coro_id = 10,
             .payload = .{ .exec = .{ .argv = &.{ "/bin/echo", "hello" } } } });
 
         const result = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
@@ -866,16 +1051,16 @@ test "exec and shell run a command and capture output" {
     }
     // shell: the command runs under a shell, so $((...)) is evaluated.
     {
-        var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+        var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
         defer rq.deinit(testing.allocator);
         var pool: IoPool = undefined;
-        try pool.init(testing.allocator,
+        try pool.init(testing.allocator, testing.io,
             .{ .thread_count = 1, .queue_capacity = 8,
                .timeout_ms = 5_000, .proc_max_output = 65_536 },
             &.{&rq});
         defer pool.deinit();
 
-        try pool.submit(.{ .worker_id = 0, .coro_id = 30, .deadline_ms = -1,
+        try pool.submit(.{ .worker_id = 0, .coro_id = 30,
             .payload = .{ .shell = .{ .command = "echo $((1+1))" } } });
 
         const result = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
@@ -888,17 +1073,17 @@ test "exec and shell run a command and capture output" {
 }
 
 test "command exceeding IO_JOB_TIMEOUT_MS → IoResult.err, child killed" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
     defer rq.deinit(testing.allocator);
     // Short timeout so the test completes in ~200 ms.
     var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
+    try pool.init(testing.allocator, testing.io,
         .{ .thread_count = 1, .queue_capacity = 8,
            .timeout_ms = 150, .proc_max_output = 65_536 },
         &.{&rq});
     defer pool.deinit();
 
-    try pool.submit(.{ .worker_id = 0, .coro_id = 20, .deadline_ms = -1,
+    try pool.submit(.{ .worker_id = 0, .coro_id = 20,
         .payload = .{ .exec = .{ .argv = &.{ "/bin/sleep", "60" } } } });
 
     const result = rq.popTimeout(1 * std.time.ns_per_s) orelse return error.TestTimeout;
@@ -907,18 +1092,18 @@ test "command exceeding IO_JOB_TIMEOUT_MS → IoResult.err, child killed" {
     try testing.expect(result.outcome == .err);
 }
 
-test "stdout exceeding PROC_MAX_OUTPUT → truncated and marked" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+test "stdout exceeding PROC_MAX_OUTPUT_BYTES → truncated and marked" {
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
     defer rq.deinit(testing.allocator);
     // proc_max_output = 10 bytes; command produces 22 bytes.
     var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
+    try pool.init(testing.allocator, testing.io,
         .{ .thread_count = 1, .queue_capacity = 8,
            .timeout_ms = 5_000, .proc_max_output = 10 },
         &.{&rq});
     defer pool.deinit();
 
-    try pool.submit(.{ .worker_id = 0, .coro_id = 31, .deadline_ms = -1,
+    try pool.submit(.{ .worker_id = 0, .coro_id = 31,
         .payload = .{ .shell = .{ .command = "printf 'AAAAAAAAAAAAAAAAAAAAAA'" } } });
 
     const result = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
@@ -933,26 +1118,26 @@ test "stdout exceeding PROC_MAX_OUTPUT → truncated and marked" {
 test "io_pool metrics — jobs_total, inflight, errors, timeouts" {
     var m = metrics_mod.Metrics{};
 
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 16);
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 16);
     defer rq.deinit(testing.allocator);
 
     // Short timeout (150 ms) so the timeout job completes quickly.
     var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
+    try pool.init(testing.allocator, testing.io,
         .{ .thread_count = 2, .queue_capacity = 8, .timeout_ms = 150,
            .proc_max_output = 65_536, .metrics = &m },
         &.{&rq});
     defer pool.deinit();
 
     // Job 1: success (exec /bin/echo)
-    try pool.submit(.{ .worker_id = 0, .coro_id = 1, .deadline_ms = -1,
+    try pool.submit(.{ .worker_id = 0, .coro_id = 1,
         .payload = .{ .exec = .{ .argv = &.{ "/bin/echo", "ok" } } } });
     const rs = rq.popTimeout(3 * std.time.ns_per_s) orelse return error.TestTimeout;
     defer freeIoResult(rs, testing.allocator);
     try testing.expect(rs.outcome == .proc);
 
     // Job 2: error (HTTP to port 1 — ECONNREFUSED)
-    try pool.submit(.{ .worker_id = 0, .coro_id = 2, .deadline_ms = -1,
+    try pool.submit(.{ .worker_id = 0, .coro_id = 2,
         .payload = .{ .http_request = .{
             .method = "GET", .url = "http://127.0.0.1:1/", .headers = &.{}, .body = "",
         }}});
@@ -961,11 +1146,11 @@ test "io_pool metrics — jobs_total, inflight, errors, timeouts" {
     try testing.expect(re.outcome == .err);
 
     // Job 3: timeout (exec /bin/sleep 60 with pool timeout_ms = 150)
-    try pool.submit(.{ .worker_id = 0, .coro_id = 3, .deadline_ms = -1,
+    try pool.submit(.{ .worker_id = 0, .coro_id = 3,
         .payload = .{ .exec = .{ .argv = &.{ "/bin/sleep", "60" } } } });
-    const rt = rq.popTimeout(1 * std.time.ns_per_s) orelse return error.TestTimeout;
-    defer freeIoResult(rt, testing.allocator);
-    try testing.expect(rt.outcome == .err);
+    const res = rq.popTimeout(1 * std.time.ns_per_s) orelse return error.TestTimeout;
+    defer freeIoResult(res, testing.allocator);
+    try testing.expect(res.outcome == .err);
 
     try testing.expectEqual(@as(u64, 3), m.io_jobs_total.load(.monotonic));
     try testing.expectEqual(@as(i64, 0), m.io_jobs_inflight.load(.monotonic));
@@ -976,19 +1161,19 @@ test "io_pool metrics — jobs_total, inflight, errors, timeouts" {
 test "submit at capacity returns QueueFull without inflating metrics" {
     var m = metrics_mod.Metrics{};
 
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 4);
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 4);
     defer rq.deinit(testing.allocator);
 
     // thread_count = 0: no consumers, queue fills immediately.
     var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
+    try pool.init(testing.allocator, testing.io,
         .{ .thread_count = 0, .queue_capacity = 1,
            .timeout_ms = 1_000, .proc_max_output = 65_536, .metrics = &m },
         &.{&rq});
     defer pool.deinit();
 
     const job = IoJob{
-        .worker_id = 0, .coro_id = 1, .deadline_ms = -1,
+        .worker_id = 0, .coro_id = 1,
         .payload = .{ .shell = .{ .command = "true" } },
     };
     // First submit succeeds.
@@ -1002,26 +1187,26 @@ test "submit at capacity returns QueueFull without inflating metrics" {
 }
 
 test "graceful stop — joins threads and kills in-flight children" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, 8);
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
     defer rq.deinit(testing.allocator);
 
     // Long timeout so the pool's timer doesn't fire before deinit does.
     var pool: IoPool = undefined;
-    try pool.init(testing.allocator,
+    try pool.init(testing.allocator, testing.io,
         .{ .thread_count = 1, .queue_capacity = 8,
            .timeout_ms = 60_000, .proc_max_output = 65_536 },
         &.{&rq});
 
-    try pool.submit(.{ .worker_id = 0, .coro_id = 40, .deadline_ms = -1,
+    try pool.submit(.{ .worker_id = 0, .coro_id = 40,
         .payload = .{ .exec = .{ .argv = &.{ "/bin/sleep", "60" } } } });
 
     // Give the pool thread time to spawn the child.
-    std.Thread.sleep(80 * std.time.ns_per_ms);
+    rt.sleepNs(rt.io(), 80 * std.time.ns_per_ms);
 
     // deinit must return quickly — it SIGKILLs the child, child.wait() returns.
-    const t0 = std.time.milliTimestamp();
+    const t0 = rt.nowMs(rt.io());
     pool.deinit();
-    const elapsed_ms = std.time.milliTimestamp() - t0;
+    const elapsed_ms = rt.nowMs(rt.io()) - t0;
 
     try testing.expect(elapsed_ms < 1_000);
 

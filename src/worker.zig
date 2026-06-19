@@ -4,21 +4,9 @@
 ///   - a LuaEngine (Lua state + on_message function)
 ///   - a StateStore connection (WAL allows concurrent readers)
 ///
-/// Main loop (pseudo-code):
-///   loop:
-///     item = queue.tryPop()  -- WorkItem{ body, user_id }; check stop flag between polls
-///     if global_reload_version > local_reload_version:
-///         lua_engine.loadFile(rules_path)
-///         local_reload_version = global_reload_version
-///     actions = lua_engine.callOnMessage(item.body) -> []ApiCall
-///     for action in actions: dispatcher_queue.push(action)
-///     free actions slice (string payloads now owned by dispatcher)
-///     free item.body
-///
 /// Routing helper:
 ///   hashUserId(user_id, worker_count) → worker index
 ///   Deterministic, uniform distribution via 64-bit multiplicative hash.
-
 const std = @import("std");
 const ziglua = @import("ziglua");
 const types = @import("types.zig");
@@ -29,8 +17,12 @@ const state_store = @import("state_store.zig");
 const tg_schema = @import("tg_schema.zig");
 const io_pool = @import("io_pool.zig");
 const metrics_mod = @import("metrics.zig");
+const rt = @import("rt.zig");
 
 const log = std.log.scoped(.worker);
+
+/// Maximum file size for multipart uploads — the Telegram bot upload limit.
+const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // WorkerArgs — all parameters for a single worker thread
@@ -43,6 +35,8 @@ pub const WorkerArgs = struct {
     /// Used for Update→JSON conversion, action string allocation, and Lua
     /// engine internals.  Must be thread-safe (e.g., a GPA).
     allocator: std.mem.Allocator,
+    /// Runtime for blocking I/O (Lua file reads), sleeps, and wall-clock reads.
+    io: std.Io,
     /// Input queue: server pushes WorkItem values (raw body + routing user_id).
     /// The worker frees WorkItem.body after callOnMessage returns.
     queue: *queue_mod.Queue(types.WorkItem),
@@ -65,8 +59,6 @@ pub const WorkerArgs = struct {
     schema: ?*tg_schema.SchemaSlot = null,
     /// Validation policy.  `.off` (default) disables validation.
     validation: types.ValidationMode = .off,
-    /// Maximum file size in bytes for multipart upload (from config.multipart_max_file).
-    multipart_max_file: usize = 52428800,
     /// Maximum bytes for json.decode input / json.encode output (from config.json_max_bytes).
     json_max_bytes: usize = 1048576,
     /// The io_pool that executes blocking I/O jobs for parked coroutines.
@@ -88,10 +80,10 @@ pub const WorkerArgs = struct {
 // ---------------------------------------------------------------------------
 
 const InFlightEntry = struct {
-    handle:           lua_engine.CoroHandle,
-    deadline_ms:      i64,
-    owned_strings:    lua_api.OwnedStrings,
-    is_tracked_send:  bool = false,
+    handle: lua_engine.CoroHandle,
+    deadline_ms: i64,
+    owned_strings: lua_api.OwnedStrings,
+    is_tracked_send: bool = false,
 };
 
 const InFlightMap = std.AutoHashMap(u32, InFlightEntry);
@@ -113,11 +105,11 @@ fn decInflight(metrics: ?*metrics_mod.Metrics) void {
 /// coroutine — the three steps that must always happen together when a
 /// still-live coroutine is abandoned.  Returns true if an entry was dropped.
 fn dropInflight(
-    inflight:  *InFlightMap,
-    cid:       u32,
-    main:      *ziglua.Lua,
+    inflight: *InFlightMap,
+    cid: u32,
+    main: *ziglua.Lua,
     allocator: std.mem.Allocator,
-    metrics:   ?*metrics_mod.Metrics,
+    metrics: ?*metrics_mod.Metrics,
 ) bool {
     if (inflight.fetchRemove(cid)) |kv| {
         decInflight(metrics);
@@ -142,9 +134,10 @@ pub fn workerThread(args: WorkerArgs) void {
     std.debug.assert((args.io_pool_ptr == null) == (args.io_result_queue == null));
 
     var api_ctx = lua_api.ApiCtx{
-        .db             = args.db,
-        .allocator      = args.allocator,
-        .max_file_bytes = args.multipart_max_file,
+        .db = args.db,
+        .allocator = args.allocator,
+        .io = args.io,
+        .max_file_bytes = MAX_UPLOAD_BYTES,
         .json_max_bytes = args.json_max_bytes,
     };
 
@@ -192,10 +185,31 @@ pub fn workerThread(args: WorkerArgs) void {
                 const cid = result.coro_id;
                 if (inflight.getPtr(cid)) |entry| {
                     const owned = entry.owned_strings;
+                    // Wrap the resumed segment in its own transaction so its state
+                    // writes are atomic rather than silent per-statement
+                    // autocommits — the resume counterpart of the start path's
+                    // begin/commit. DEFERRED takes the write lock only if the
+                    // segment writes, so a read-only or send-only resume never
+                    // blocks another worker's writer. The transaction is held only
+                    // during synchronous execution — committed before the next
+                    // yield (below) or on .done — so it is never open across I/O.
+                    // A begin failure is non-fatal: the segment then runs in
+                    // autocommit (the prior behavior) rather than abandoning a
+                    // parked coroutine. Segments do not span a yield, so this does
+                    // not make a cross-yield read-modify-write atomic.
+                    var in_txn = true;
+                    args.db.beginDeferred() catch |err| {
+                        log.err("worker {d}: BEGIN before resume failed: {s} — resuming in autocommit", .{ args.id, @errorName(err) });
+                        in_txn = false;
+                    };
                     // resumeHandler always frees `owned` and calls lua.unref
                     // for .done and .err outcomes; for .yielded it does neither.
                     const outcome = engine.resumeHandler(
-                        entry.handle, result, owned, entry.is_tracked_send, args.allocator,
+                        entry.handle,
+                        result,
+                        owned,
+                        entry.is_tracked_send,
+                        args.allocator,
                     ) catch |err| blk: {
                         log.err("worker {d}: resumeHandler OOM: {s}", .{ args.id, @errorName(err) });
                         // resumeHandler freed owned + called unref before returning error.
@@ -208,44 +222,67 @@ pub fn workerThread(args: WorkerArgs) void {
                             // resumeHandler already called lua.unref + freeOwnedStrings.
                             _ = inflight.remove(cid);
                             decInflight(args.metrics);
-                            for (actions) |action| {
-                                args.dispatcher_queue.push(action) catch {
-                                    log.warn("worker {d}: dispatcher queue full", .{args.id});
-                                    types.freeApiCall(action, args.allocator);
+                            // Commit the segment's state writes before emitting its
+                            // actions. If the commit fails the state is gone, so the
+                            // actions (which assume it) are dropped, not sent.
+                            const commit_ok = if (in_txn) blk: {
+                                args.db.commit() catch |err| {
+                                    log.err("worker {d}: COMMIT after resume failed: {s}", .{ args.id, @errorName(err) });
+                                    args.db.rollback();
+                                    break :blk false;
                                 };
+                                break :blk true;
+                            } else true;
+                            if (commit_ok) {
+                                for (actions) |action| {
+                                    args.dispatcher_queue.push(action) catch {
+                                        log.warn("worker {d}: dispatcher queue full", .{args.id});
+                                        types.freeApiCall(action, args.allocator);
+                                    };
+                                }
+                            } else {
+                                for (actions) |action| types.freeApiCall(action, args.allocator);
                             }
                             args.allocator.free(actions);
                         },
                         .yielded => |y| {
+                            // Commit the just-finished segment before re-parking:
+                            // the next I/O wait must not hold a transaction. On
+                            // failure, log and proceed — the next segment opens a
+                            // fresh transaction on resume.
+                            if (in_txn) args.db.commit() catch |err| {
+                                log.err("worker {d}: COMMIT before re-yield failed: {s}", .{ args.id, @errorName(err) });
+                            };
                             // resumeHandler freed old owned_strings; new ones are in y.
                             // Update the inflight entry for the next yield type.
-                            if (inflight.getPtr(cid)) |e| {
-                                switch (y.pending_job) {
-                                    .io => |io| {
-                                        e.owned_strings   = io.owned_strings;
-                                        e.is_tracked_send = false;
-                                        if (args.io_pool_ptr) |pool| {
-                                            pool.submit(io.io_job) catch {
-                                                log.warn("worker {d}: io_pool full; dropping coro {d}", .{ args.id, cid });
-                                                // entry.owned_strings == io.owned_strings — dropInflight frees it.
-                                                _ = dropInflight(&inflight, cid, engine.lua, args.allocator, args.metrics);
-                                            };
-                                        }
-                                    },
-                                    .tracked_send => |api_call| {
-                                        e.owned_strings   = .none;
-                                        e.is_tracked_send = true;
-                                        args.dispatcher_queue.push(api_call) catch {
-                                            log.warn("worker {d}: dispatcher queue full; dropping re-yield coro {d}", .{ args.id, cid });
+                            // `entry` is still valid here: nothing mutates the map
+                            // between the lookup above and this update.
+                            switch (y.pending_job) {
+                                .io => |io| {
+                                    entry.owned_strings = io.owned_strings;
+                                    entry.is_tracked_send = false;
+                                    if (args.io_pool_ptr) |pool| {
+                                        pool.submit(io.io_job) catch {
+                                            log.warn("worker {d}: io_pool full; dropping coro {d}", .{ args.id, cid });
+                                            // entry.owned_strings == io.owned_strings — dropInflight frees it.
                                             _ = dropInflight(&inflight, cid, engine.lua, args.allocator, args.metrics);
-                                            types.freeApiCall(api_call, args.allocator);
                                         };
-                                    },
-                                }
+                                    }
+                                },
+                                .tracked_send => |api_call| {
+                                    entry.owned_strings = .none;
+                                    entry.is_tracked_send = true;
+                                    args.dispatcher_queue.push(api_call) catch {
+                                        log.warn("worker {d}: dispatcher queue full; dropping re-yield coro {d}", .{ args.id, cid });
+                                        _ = dropInflight(&inflight, cid, engine.lua, args.allocator, args.metrics);
+                                        types.freeApiCall(api_call, args.allocator);
+                                    };
+                                },
                             }
                         },
                         .err => {
                             // resumeHandler already called lua.unref + freeOwnedStrings.
+                            if (in_txn) args.db.rollback();
                             _ = inflight.remove(cid);
                             decInflight(args.metrics);
                         },
@@ -258,7 +295,7 @@ pub fn workerThread(args: WorkerArgs) void {
 
         // ── 2. Reap coroutines past their wall-clock deadline ─────────────
         {
-            const now_ms = std.time.milliTimestamp();
+            const now_ms = rt.nowMs(args.io);
             var to_reap: [64]u32 = undefined;
             var n_reap: usize = 0;
             var it = inflight.iterator();
@@ -282,8 +319,7 @@ pub fn workerThread(args: WorkerArgs) void {
         // sleep is needed here — deadline reap (Step 2) fires on every iteration.
         if (stopping) {
             if (inflight.count() > 0 and !drain_logged) {
-                log.info("worker {d}: stopping — draining {d} in-flight coroutine(s)",
-                         .{ args.id, inflight.count() });
+                log.info("worker {d}: stopping — draining {d} in-flight coroutine(s)", .{ args.id, inflight.count() });
                 drain_logged = true;
             }
             continue;
@@ -301,11 +337,20 @@ pub fn workerThread(args: WorkerArgs) void {
                 local_ver = global_ver;
                 log.info("worker {d}: reloaded rules (v{d})", .{ args.id, local_ver });
             }
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            rt.sleepNs(args.io, 1 * std.time.ns_per_ms);
             continue;
         }
         {
-            const maybe_item = args.queue.popTimeout(10 * std.time.ns_per_ms);
+            // With nothing in flight, no io_result or deadline can occur — both
+            // belong to parked coroutines (Steps 1–2) — so park indefinitely on
+            // the update queue rather than polling: an idle worker then consumes
+            // no CPU and is released only by a push or by close() at shutdown.
+            // With work in flight, keep the 10 ms wait so the next iteration
+            // services resumes and deadline reaps promptly.
+            const maybe_item = if (inflight.count() == 0)
+                args.queue.popBlocking()
+            else
+                args.queue.popTimeout(10 * std.time.ns_per_ms);
             if (maybe_item == null) continue;
             const item = maybe_item.?;
             defer args.allocator.free(item.body);
@@ -357,14 +402,14 @@ pub fn workerThread(args: WorkerArgs) void {
                     args.db.commit() catch |err| {
                         log.err("worker {d}: COMMIT before yield failed: {s}", .{ args.id, @errorName(err) });
                     };
-                    const deadline = std.time.milliTimestamp() +
+                    const deadline = rt.nowMs(args.io) +
                         @as(i64, @intCast(args.workflow_deadline_ms));
                     switch (y.pending_job) {
                         .io => |io| {
                             inflight.put(cid, InFlightEntry{
-                                .handle          = y.handle,
-                                .deadline_ms     = deadline,
-                                .owned_strings   = io.owned_strings,
+                                .handle = y.handle,
+                                .deadline_ms = deadline,
+                                .owned_strings = io.owned_strings,
                                 .is_tracked_send = false,
                             }) catch {
                                 log.err("worker {d}: inflight map OOM", .{args.id});
@@ -382,9 +427,9 @@ pub fn workerThread(args: WorkerArgs) void {
                         },
                         .tracked_send => |api_call| {
                             inflight.put(cid, InFlightEntry{
-                                .handle          = y.handle,
-                                .deadline_ms     = deadline,
-                                .owned_strings   = .none,
+                                .handle = y.handle,
+                                .deadline_ms = deadline,
+                                .owned_strings = .none,
                                 .is_tracked_send = true,
                             }) catch {
                                 log.err("worker {d}: inflight map OOM (tracked send)", .{args.id});
@@ -432,10 +477,10 @@ const Queue = queue_mod.Queue;
 
 /// Test helper: spin-wait until `queue.len() >= n` or `timeout_ms` elapses.
 fn waitQueue(q: anytype, n: usize, timeout_ms: u64) bool {
-    const start = std.time.milliTimestamp();
+    const start = rt.nowMs(testing.io);
     while (q.len() < n) {
-        if (@as(u64, @intCast(std.time.milliTimestamp() - start)) >= timeout_ms) return false;
-        std.Thread.sleep(2 * std.time.ns_per_ms);
+        if (@as(u64, @intCast(rt.nowMs(testing.io) - start)) >= timeout_ms) return false;
+        rt.sleepNs(testing.io, 2 * std.time.ns_per_ms);
     }
     return true;
 }
@@ -461,49 +506,115 @@ fn testWorkItem(allocator: std.mem.Allocator, body: []const u8) !types.WorkItem 
 
 const StubServer = struct { port: u16, thread: std.Thread };
 
+// 0.16's net.Server no longer exposes the bound address; query the socket for
+// the port assigned to a port-0 listen. Returns native byte order.
+fn boundPort(server: *const std.Io.net.Server) u16 {
+    var sa: std.posix.sockaddr.in = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    _ = std.posix.system.getsockname(server.socket.handle, @ptrCast(&sa), &len);
+    return std.mem.bigToNative(u16, sa.port);
+}
+
+/// Drain an HTTP request head line-by-line (keep-alive clients never EOF, so a
+/// single readSliceShort would block forever trying to fill its buffer).
+fn drainRequestHead(reader: *std.Io.Reader) void {
+    while (reader.takeDelimiterInclusive('\n')) |line| {
+        if (line.len <= 2) break; // "\r\n" ends the headers
+    } else |_| {}
+}
+
 /// One-shot stub: accepts one connection, responds immediately.
 fn spawnStub(response: []const u8) !StubServer {
-    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
-    const srv = try testing.allocator.create(std.net.Server);
-    srv.* = try addr.listen(.{ .reuse_address = true });
-    const port = srv.listen_address.in.sa.port;
+    const io = testing.io;
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    const srv = try testing.allocator.create(std.Io.net.Server);
+    srv.* = try addr.listen(io, .{ .reuse_address = true });
+    const port = boundPort(srv);
     const t = try std.Thread.spawn(.{}, struct {
-        fn run(s: *std.net.Server, resp: []const u8) void {
-            defer { s.deinit(); testing.allocator.destroy(s); }
-            const conn = s.accept() catch return;
-            defer conn.stream.close();
-            var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
-            conn.stream.writeAll(resp) catch {};
+        fn run(s: *std.Io.net.Server, resp: []const u8) void {
+            const cio = testing.io;
+            defer {
+                s.deinit(cio);
+                testing.allocator.destroy(s);
+            }
+            var stream = s.accept(cio) catch return;
+            defer stream.close(cio);
+            var rbuf: [4096]u8 = undefined;
+            var sr = stream.reader(cio, &rbuf);
+            drainRequestHead(&sr.interface);
+            var wbuf: [4096]u8 = undefined;
+            var sw = stream.writer(cio, &wbuf);
+            sw.interface.writeAll(resp) catch {};
+            sw.interface.flush() catch {};
         }
     }.run, .{ srv, response });
-    return .{ .port = std.mem.bigToNative(u16, port), .thread = t };
+    return .{ .port = port, .thread = t };
+}
+
+/// Multi-shot stub: serves `n` connections one at a time, sleeping `delay_ms`
+/// before each response. The serial accept keeps later coroutines parked while
+/// earlier ones resume, so a worker's inflight map stays populated.
+fn spawnMultiStub(n: usize, delay_ms: u64, response: []const u8) !StubServer {
+    const io = testing.io;
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    const srv = try testing.allocator.create(std.Io.net.Server);
+    srv.* = try addr.listen(io, .{ .reuse_address = true, .kernel_backlog = 64 });
+    const port = boundPort(srv);
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(s: *std.Io.net.Server, count: usize, dms: u64, resp: []const u8) void {
+            const cio = testing.io;
+            defer {
+                s.deinit(cio);
+                testing.allocator.destroy(s);
+            }
+            for (0..count) |_| {
+                var stream = s.accept(cio) catch return;
+                defer stream.close(cio);
+                var rbuf: [4096]u8 = undefined;
+                var sr = stream.reader(cio, &rbuf);
+                drainRequestHead(&sr.interface);
+                if (dms > 0) rt.sleepNs(cio, dms * std.time.ns_per_ms);
+                var wbuf: [4096]u8 = undefined;
+                var sw = stream.writer(cio, &wbuf);
+                sw.interface.writeAll(resp) catch {};
+                sw.interface.flush() catch {};
+            }
+        }
+    }.run, .{ srv, n, delay_ms, response });
+    return .{ .port = port, .thread = t };
 }
 
 /// Silent stub: accepts one connection, never responds.
 const SilentStub = struct {
-    server: *std.net.Server,
+    server: *std.Io.net.Server,
     thread: std.Thread,
     fn deinit(self: *SilentStub) void {
+        const io = testing.io;
         // shutdown(SHUT_RD) reliably unblocks any thread blocked in accept()
-        // on this socket before closing the fd.
-        std.posix.shutdown(self.server.stream.handle, .recv) catch {};
-        self.server.deinit();   // close socket
-        self.thread.join();     // wait for thread to exit before freeing memory
+        // on this socket before closing the fd. 0.16 exposes shutdown on Stream,
+        // so wrap the listening socket to reach it.
+        var s = std.Io.net.Stream{ .socket = self.server.socket };
+        s.shutdown(io, .recv) catch {};
+        self.server.deinit(io); // close socket
+        self.thread.join(); // wait for thread to exit before freeing memory
         testing.allocator.destroy(self.server);
     }
 };
 
 fn spawnSilentStub() !SilentStub {
-    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
-    const srv = try testing.allocator.create(std.net.Server);
-    srv.* = try addr.listen(.{ .reuse_address = true });
+    const io = testing.io;
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    const srv = try testing.allocator.create(std.Io.net.Server);
+    srv.* = try addr.listen(io, .{ .reuse_address = true });
     const t = try std.Thread.spawn(.{}, struct {
-        fn run(s: *std.net.Server) void {
-            const conn = s.accept() catch return;
-            var buf: [1]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
-            conn.stream.close();
+        fn run(s: *std.Io.net.Server) void {
+            const cio = testing.io;
+            var stream = s.accept(cio) catch return;
+            var rbuf: [1]u8 = undefined;
+            var sr = stream.reader(cio, &rbuf);
+            var b: [1]u8 = undefined;
+            _ = sr.interface.readSliceShort(&b) catch {};
+            stream.close(cio);
         }
     }.run, .{srv});
     return .{ .server = srv, .thread = t };
@@ -518,19 +629,22 @@ fn spawnSilentStub() !SilentStub {
 /// the second accept() in the stub thread. That causes the stub to exit and
 /// close the accepted conn, releasing the HTTP client.
 fn spawnHangStub() !SilentStub {
-    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
-    const srv = try testing.allocator.create(std.net.Server);
-    srv.* = try addr.listen(.{ .reuse_address = true });
+    const io = testing.io;
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    const srv = try testing.allocator.create(std.Io.net.Server);
+    srv.* = try addr.listen(io, .{ .reuse_address = true });
     const t = try std.Thread.spawn(.{}, struct {
-        fn run(s: *std.net.Server) void {
-            const conn = s.accept() catch return;
-            defer conn.stream.close();
+        fn run(s: *std.Io.net.Server) void {
+            const cio = testing.io;
+            var stream = s.accept(cio) catch return;
+            defer stream.close(cio);
             // Drain the HTTP request so the client's write completes;
             // the client then blocks waiting for a response.
-            var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
+            var rbuf: [4096]u8 = undefined;
+            var sr = stream.reader(cio, &rbuf);
+            drainRequestHead(&sr.interface);
             // Block until deinit() closes the server socket.
-            _ = s.accept() catch {};
+            _ = s.accept(cio) catch {};
         }
     }.run, .{srv});
     return .{ .server = srv, .thread = t };
@@ -545,87 +659,87 @@ fn spawnHangStub() !SilentStub {
 ///   var ctx: AsyncTestCtx = undefined;
 ///   try ctx.init(allocator, lua_src, pool_cfg);
 const AsyncTestCtx = struct {
-    tmp:        testing.TmpDir,
-    db:         state_store.StateStore,
-    input_q:    Queue(types.WorkItem),
-    output_q:   Queue(types.ApiCall),
-    result_q:   Queue(io_pool.IoResult),
+    tmp: testing.TmpDir,
+    db: state_store.StateStore,
+    input_q: Queue(types.WorkItem),
+    output_q: Queue(types.ApiCall),
+    result_q: Queue(io_pool.IoResult),
     /// Stable single-element slice of result queue pointers passed to pool.init.
     /// Must be a field (not a local) so its address remains valid after init returns.
-    rq_ptrs:    [1]*Queue(io_pool.IoResult),
-    pool:       io_pool.IoPool,
-    stop:       std.atomic.Value(bool),
+    rq_ptrs: [1]*Queue(io_pool.IoResult),
+    pool: io_pool.IoPool,
+    stop: std.atomic.Value(bool),
     reload_ver: std.atomic.Value(u64),
-    path_buf:   [std.fs.max_path_bytes + 1]u8,
+    path_buf: [std.fs.max_path_bytes + 1]u8,
     rules_path: [:0]const u8,
-    allocator:  std.mem.Allocator,
+    allocator: std.mem.Allocator,
 
     /// Initialise in-place.  `self` must already be at its final stack address.
     fn init(
-        self:      *AsyncTestCtx,
+        self: *AsyncTestCtx,
         allocator: std.mem.Allocator,
-        lua_src:   []const u8,
-        pool_cfg:  io_pool.IoPoolConfig,
+        lua_src: []const u8,
+        pool_cfg: io_pool.IoPoolConfig,
     ) !void {
-        self.allocator  = allocator;
-        self.tmp        = testing.tmpDir(.{});
+        self.allocator = allocator;
+        self.tmp = testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
 
-        var f = try self.tmp.dir.createFile("rules.lua", .{});
-        try f.writeAll(lua_src);
-        f.close();
+        try self.tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = lua_src });
 
-        const path_slice = try self.tmp.dir.realpath("rules.lua", self.path_buf[0..std.fs.max_path_bytes]);
-        self.path_buf[path_slice.len] = 0;
-        self.rules_path = self.path_buf[0..path_slice.len :0];
+        const path_len = try self.tmp.dir.realPathFile(testing.io, "rules.lua", self.path_buf[0..std.fs.max_path_bytes]);
+        self.path_buf[path_len] = 0;
+        self.rules_path = self.path_buf[0..path_len :0];
 
         self.db = try state_store.StateStore.open(allocator, ":memory:");
         errdefer self.db.close();
 
-        self.input_q  = try Queue(types.WorkItem).init(allocator, 64);
+        self.input_q = try Queue(types.WorkItem).init(allocator, testing.io, 64);
         errdefer self.input_q.deinit(allocator);
 
-        self.output_q = try Queue(types.ApiCall).init(allocator, 256);
+        self.output_q = try Queue(types.ApiCall).init(allocator, testing.io, 256);
         errdefer self.output_q.deinit(allocator);
 
-        self.result_q = try Queue(io_pool.IoResult).init(allocator, 256);
+        self.result_q = try Queue(io_pool.IoResult).init(allocator, testing.io, 256);
         errdefer self.result_q.deinit(allocator);
         self.result_q.kind = .io_result;
-        self.result_q.id   = 0; // single-worker test context (spawnWorker hardcodes id=0)
+        self.result_q.id = 0; // single-worker test context (spawnWorker hardcodes id=0)
 
         // rq_ptrs[0] points into self.result_q — stable because self is at its
         // final address (pointer receiver, declared before init is called).
         self.rq_ptrs[0] = &self.result_q;
-        try self.pool.init(allocator, pool_cfg, &self.rq_ptrs);
+        try self.pool.init(allocator, testing.io, pool_cfg, &self.rq_ptrs);
         errdefer self.pool.deinit();
 
-        self.stop       = std.atomic.Value(bool).init(false);
+        self.stop = std.atomic.Value(bool).init(false);
         self.reload_ver = std.atomic.Value(u64).init(0);
     }
 
     fn spawnWorker(self: *AsyncTestCtx, max_inflight: u16, workflow_deadline_ms: u64) !std.Thread {
         return std.Thread.spawn(.{}, workerThread, .{WorkerArgs{
-            .id                   = 0,
-            .rules_path           = self.rules_path,
-            .allocator            = self.allocator,
-            .queue                = &self.input_q,
-            .dispatcher_queue     = &self.output_q,
-            .db                   = &self.db,
-            .stop                 = &self.stop,
-            .reload_ver           = &self.reload_ver,
-            .io_pool_ptr          = &self.pool,
-            .io_result_queue      = &self.result_q,
-            .max_inflight         = max_inflight,
+            .id = 0,
+            .rules_path = self.rules_path,
+            .allocator = self.allocator,
+            .io = testing.io,
+            .queue = &self.input_q,
+            .dispatcher_queue = &self.output_q,
+            .db = &self.db,
+            .stop = &self.stop,
+            .reload_ver = &self.reload_ver,
+            .io_pool_ptr = &self.pool,
+            .io_result_queue = &self.result_q,
+            .max_inflight = max_inflight,
             .workflow_deadline_ms = workflow_deadline_ms,
         }});
     }
 
     fn deinit(self: *AsyncTestCtx, t: std.Thread) void {
         self.stop.store(true, .release);
+        self.input_q.close(); // wake the worker if it parked idle in popBlocking
         t.join();
-        while (self.input_q.popTimeout(0))  |item| self.allocator.free(item.body);
+        while (self.input_q.popTimeout(0)) |item| self.allocator.free(item.body);
         while (self.output_q.popTimeout(0)) |call| types.freeApiCall(call, self.allocator);
-        while (self.result_q.popTimeout(0)) |res|  io_pool.freeIoResult(res, self.allocator);
+        while (self.result_q.popTimeout(0)) |res| io_pool.freeIoResult(res, self.allocator);
         self.pool.deinit();
         self.result_q.deinit(self.allocator);
         self.output_q.deinit(self.allocator);
@@ -657,45 +771,45 @@ const TestCtx = struct {
         errdefer self.tmp.cleanup();
 
         // Write initial rules file.
-        var f = try self.tmp.dir.createFile("rules.lua", .{});
-        try f.writeAll(lua_src);
-        f.close();
+        try self.tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = lua_src });
 
         // Resolve absolute path (null-terminated).
-        const path_slice = try self.tmp.dir.realpath("rules.lua", self.path_buf[0..std.fs.max_path_bytes]);
-        self.path_buf[path_slice.len] = 0;
-        self.rules_path = self.path_buf[0..path_slice.len :0];
+        const path_len = try self.tmp.dir.realPathFile(testing.io, "rules.lua", self.path_buf[0..std.fs.max_path_bytes]);
+        self.path_buf[path_len] = 0;
+        self.rules_path = self.path_buf[0..path_len :0];
 
         self.db = try state_store.StateStore.open(allocator, ":memory:");
         errdefer self.db.close();
 
-        self.input_q  = try Queue(types.WorkItem).init(allocator, 64);
+        self.input_q = try Queue(types.WorkItem).init(allocator, testing.io, 64);
         errdefer self.input_q.deinit(allocator);
 
-        self.output_q = try Queue(types.ApiCall).init(allocator, 256);
+        self.output_q = try Queue(types.ApiCall).init(allocator, testing.io, 256);
         errdefer self.output_q.deinit(allocator);
 
-        self.stop       = std.atomic.Value(bool).init(false);
+        self.stop = std.atomic.Value(bool).init(false);
         self.reload_ver = std.atomic.Value(u64).init(0);
         return self;
     }
 
     fn spawnWorker(self: *TestCtx) !std.Thread {
         const args = WorkerArgs{
-            .id               = 0,
-            .rules_path       = self.rules_path,
-            .allocator        = self.allocator,
-            .queue            = &self.input_q,
+            .id = 0,
+            .rules_path = self.rules_path,
+            .allocator = self.allocator,
+            .io = testing.io,
+            .queue = &self.input_q,
             .dispatcher_queue = &self.output_q,
-            .db               = &self.db,
-            .stop             = &self.stop,
-            .reload_ver       = &self.reload_ver,
+            .db = &self.db,
+            .stop = &self.stop,
+            .reload_ver = &self.reload_ver,
         };
         return std.Thread.spawn(.{}, workerThread, .{args});
     }
 
     fn deinit(self: *TestCtx, t: std.Thread) void {
         self.stop.store(true, .release);
+        self.input_q.close(); // wake the worker if it parked idle in popBlocking
         t.join();
         // Drain anything the worker didn't consume before stop, freeing
         // owned payloads so the test runs leak-clean under testing.allocator.
@@ -725,7 +839,7 @@ test "single update → dispatcher receives expected action" {
     defer ctx.deinit(t);
 
     // Give worker time to start and load rules.
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
 
@@ -749,17 +863,15 @@ test "reload_version incremented → worker reloads before on_message" {
     defer ctx.deinit(t);
 
     // Let the worker load initial rules and record local_ver.
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     // Overwrite rules file with v2.
     {
-        var f = try ctx.tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(
+        try ctx.tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data =
             \\function on_message(u)
             \\  return { { method="sendMessage", params={ chat_id=1, text="v2" } } }
             \\end
-        );
+        });
     }
 
     // Signal reload via the isolated per-test counter.
@@ -784,7 +896,7 @@ test "update that triggers reload is still processed (not dropped)" {
     const t = try ctx.spawnWorker();
     defer ctx.deinit(t);
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     // Signal reload via the isolated per-test counter.
     _ = ctx.reload_ver.fetchAdd(1, .release);
@@ -814,7 +926,7 @@ test "Lua error on first update → worker continues; second update succeeds" {
     const t = try ctx.spawnWorker();
     defer ctx.deinit(t);
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     // First update → Lua error, empty slice returned, nothing pushed.
     try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":4}"));
@@ -838,7 +950,7 @@ test "worker thread alive (not exited) after 200ms with empty queue" {
     const t = try ctx.spawnWorker();
     defer ctx.deinit(t);
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 200 * std.time.ns_per_ms);
 
     // If the worker exited, pushing to the queue would still work (queue is
     // independent), so the test verifies the thread is still alive via a liveness probe:
@@ -851,7 +963,7 @@ test "worker thread alive (not exited) after 200ms with empty queue" {
     // The test verifies liveness by observing that the update is consumed.
     var waited: u64 = 0;
     while (ctx.input_q.len() > 0 and waited < 1000) : (waited += 5) {
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        rt.sleepNs(testing.io, 5 * std.time.ns_per_ms);
     }
     try testing.expectEqual(@as(usize, 0), ctx.input_q.len());
 }
@@ -872,51 +984,59 @@ test "schema validation mode drops or keeps a failing call" {
 
     // strict mode: the invalid call is dropped, the dispatcher queue stays empty.
     {
-        var slot = tg_schema.SchemaSlot.init(testing.allocator);
+        var slot = tg_schema.SchemaSlot.init(testing.allocator, testing.io);
         slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA));
         var ctx = try TestCtx.init(testing.allocator, RULE);
         const args = WorkerArgs{
-            .id               = 0,
-            .rules_path       = ctx.rules_path,
-            .allocator        = testing.allocator,
-            .queue            = &ctx.input_q,
+            .id = 0,
+            .rules_path = ctx.rules_path,
+            .allocator = testing.allocator,
+            .io = testing.io,
+            .queue = &ctx.input_q,
             .dispatcher_queue = &ctx.output_q,
-            .db               = &ctx.db,
-            .stop             = &ctx.stop,
-            .reload_ver       = &ctx.reload_ver,
-            .schema           = &slot,
-            .validation       = .strict,
+            .db = &ctx.db,
+            .stop = &ctx.stop,
+            .reload_ver = &ctx.reload_ver,
+            .schema = &slot,
+            .validation = .strict,
         };
         const t = try std.Thread.spawn(.{}, workerThread, .{args});
         // Cleanup order: join worker first, then free slot.
-        defer { ctx.deinit(t); slot.deinit(); }
+        defer {
+            ctx.deinit(t);
+            slot.deinit();
+        }
 
-        std.Thread.sleep(30 * std.time.ns_per_ms);
+        rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
         try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        rt.sleepNs(testing.io, 100 * std.time.ns_per_ms);
         try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
     }
     // warn mode: the same invalid call is kept (logged but forwarded).
     {
-        var slot = tg_schema.SchemaSlot.init(testing.allocator);
+        var slot = tg_schema.SchemaSlot.init(testing.allocator, testing.io);
         slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA));
         var ctx = try TestCtx.init(testing.allocator, RULE);
         const args = WorkerArgs{
-            .id               = 0,
-            .rules_path       = ctx.rules_path,
-            .allocator        = testing.allocator,
-            .queue            = &ctx.input_q,
+            .id = 0,
+            .rules_path = ctx.rules_path,
+            .allocator = testing.allocator,
+            .io = testing.io,
+            .queue = &ctx.input_q,
             .dispatcher_queue = &ctx.output_q,
-            .db               = &ctx.db,
-            .stop             = &ctx.stop,
-            .reload_ver       = &ctx.reload_ver,
-            .schema           = &slot,
-            .validation       = .warn,
+            .db = &ctx.db,
+            .stop = &ctx.stop,
+            .reload_ver = &ctx.reload_ver,
+            .schema = &slot,
+            .validation = .warn,
         };
         const t = try std.Thread.spawn(.{}, workerThread, .{args});
-        defer { ctx.deinit(t); slot.deinit(); }
+        defer {
+            ctx.deinit(t);
+            slot.deinit();
+        }
 
-        std.Thread.sleep(30 * std.time.ns_per_ms);
+        rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
         try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
         try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
 
@@ -968,13 +1088,11 @@ test "bot.http_request → coroutine yields, io_pool runs, result resumes, actio
     defer testing.allocator.free(lua_src);
 
     var ctx: AsyncTestCtx = undefined;
-    try ctx.init(testing.allocator, lua_src,
-        .{ .thread_count = 2, .queue_capacity = 16,
-           .timeout_ms = 5_000, .proc_max_output = 65_536 });
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 2, .queue_capacity = 16, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":1}"));
 
     try testing.expect(waitQueue(&ctx.output_q, 1, 5_000));
@@ -1013,12 +1131,11 @@ test "bot.http_request exposes response headers with case-insensitive lookup" {
     defer testing.allocator.free(lua_src);
 
     var ctx: AsyncTestCtx = undefined;
-    try ctx.init(testing.allocator, lua_src,
-        .{ .thread_count = 2, .queue_capacity = 16, .timeout_ms = 5_000, .proc_max_output = 65_536 });
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 2, .queue_capacity = 16, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":1}"));
 
     try testing.expect(waitQueue(&ctx.output_q, 1, 5_000));
@@ -1033,21 +1150,29 @@ test "bot.http_request exposes response headers with case-insensitive lookup" {
 }
 
 test "slow coroutine parked; same worker processes fast update first" {
-    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
-    const slow_srv = try testing.allocator.create(std.net.Server);
-    slow_srv.* = try addr.listen(.{ .reuse_address = true });
-    const slow_port = std.mem.bigToNative(u16, slow_srv.listen_address.in.sa.port);
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    const slow_srv = try testing.allocator.create(std.Io.net.Server);
+    slow_srv.* = try addr.listen(testing.io, .{ .reuse_address = true });
+    const slow_port = boundPort(slow_srv);
     const slow_thread = try std.Thread.spawn(.{}, struct {
-        fn run(s: *std.net.Server) void {
-            defer { s.deinit(); testing.allocator.destroy(s); }
-            const conn = s.accept() catch return;
-            defer conn.stream.close();
-            var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
-            std.Thread.sleep(300 * std.time.ns_per_ms);
-            conn.stream.writeAll(
-                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow"
+        fn run(s: *std.Io.net.Server) void {
+            const cio = testing.io;
+            defer {
+                s.deinit(cio);
+                testing.allocator.destroy(s);
+            }
+            var stream = s.accept(cio) catch return;
+            defer stream.close(cio);
+            var rbuf: [4096]u8 = undefined;
+            var sr = stream.reader(cio, &rbuf);
+            drainRequestHead(&sr.interface);
+            rt.sleepNs(cio, 300 * std.time.ns_per_ms);
+            var wbuf: [256]u8 = undefined;
+            var sw = stream.writer(cio, &wbuf);
+            sw.interface.writeAll(
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow",
             ) catch {};
+            sw.interface.flush() catch {};
         }
     }.run, .{slow_srv});
     defer slow_thread.join();
@@ -1065,22 +1190,20 @@ test "slow coroutine parked; same worker processes fast update first" {
     defer testing.allocator.free(lua_src);
 
     var ctx: AsyncTestCtx = undefined;
-    try ctx.init(testing.allocator, lua_src,
-        .{ .thread_count = 2, .queue_capacity = 16, .timeout_ms = 5_000, .proc_max_output = 65_536 });
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 2, .queue_capacity = 16, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     const slow_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{slow_port});
     defer testing.allocator.free(slow_url);
-    const slow_body = try std.fmt.allocPrint(testing.allocator,
-        "{{\"slow\":true,\"url\":\"{s}\"}}", .{slow_url});
+    const slow_body = try std.fmt.allocPrint(testing.allocator, "{{\"slow\":true,\"url\":\"{s}\"}}", .{slow_url});
     defer testing.allocator.free(slow_body);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, slow_body));
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"slow\":false}"));
 
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 100 * std.time.ns_per_ms);
     try testing.expectEqual(@as(usize, 1), ctx.output_q.len());
     const fast_action = ctx.output_q.pop();
     defer types.freeApiCall(fast_action, testing.allocator);
@@ -1090,6 +1213,57 @@ test "slow coroutine parked; same worker processes fast update first" {
     const slow_action = ctx.output_q.pop();
     defer types.freeApiCall(slow_action, testing.allocator);
     try testing.expectEqualStrings("slow_done", slow_action.method);
+}
+
+test "state written in a resumed (post-I/O) segment commits and is read by a later update" {
+    // Guards the resume-path transaction: a write made after a bot.http_request
+    // yield must commit (not be lost, and not leave a transaction open that would
+    // break the next update). Update 1 yields, then writes state in its resumed
+    // segment; update 2 (pushed only after update 1 completes, so they cannot
+    // interleave) reads that state back.
+    const HTTP_OK = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+    const stub = try spawnStub(HTTP_OK);
+    defer stub.thread.join();
+
+    const lua_src = try std.fmt.allocPrint(testing.allocator,
+        \\function on_message(u)
+        \\  if u.write then
+        \\    local resp = bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
+        \\    bot.set_user_state(7, {{ status = resp.status }})
+        \\    return {{ {{ method="wrote", params={{}} }} }}
+        \\  else
+        \\    local s = bot.get_user_state(7)
+        \\    return {{ {{ method="read", params={{ status = s.status or 0 }} }} }}
+        \\  end
+        \\end
+    , .{stub.port});
+    defer testing.allocator.free(lua_src);
+
+    var ctx: AsyncTestCtx = undefined;
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 2, .queue_capacity = 16, .timeout_ms = 5_000, .proc_max_output = 65_536 });
+    const t = try ctx.spawnWorker(64, 60_000);
+    defer ctx.deinit(t);
+
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
+
+    // Update 1: yields on http_request, writes user_state in the resumed segment.
+    try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"write\":true}"));
+    try testing.expect(waitQueue(&ctx.output_q, 1, 5_000));
+    {
+        const a = ctx.output_q.pop();
+        defer types.freeApiCall(a, testing.allocator);
+        try testing.expectEqualStrings("wrote", a.method);
+    }
+
+    // Update 2 (sync): reads the state the resumed segment committed.
+    try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"write\":false}"));
+    try testing.expect(waitQueue(&ctx.output_q, 1, 5_000));
+    {
+        const a = ctx.output_q.pop();
+        defer types.freeApiCall(a, testing.allocator);
+        try testing.expectEqualStrings("read", a.method);
+        try testing.expect(std.mem.indexOf(u8, a.payload.json, "\"status\":200") != null);
+    }
 }
 
 test "two sequential bot.http_request calls → two yields, correct order" {
@@ -1111,11 +1285,10 @@ test "two sequential bot.http_request calls → two yields, correct order" {
     defer testing.allocator.free(lua_src);
 
     var ctx: AsyncTestCtx = undefined;
-    try ctx.init(testing.allocator, lua_src,
-        .{ .thread_count = 2, .queue_capacity = 16, .timeout_ms = 5_000, .proc_max_output = 65_536 });
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 2, .queue_capacity = 16, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":1}"));
 
@@ -1128,10 +1301,56 @@ test "two sequential bot.http_request calls → two yields, correct order" {
     try testing.expect(std.mem.indexOf(u8, action.payload.json, "\"s2\":201") != null);
 }
 
+test "re-yield against a populated inflight map — 8 coroutines, two yields each" {
+    // Exercises the entry update on a resume that yields again while the
+    // inflight map holds several other parked coroutines. A wrong-entry update
+    // would corrupt another coroutine's owned_strings (a double-free or leak
+    // that testing.allocator reports) or mix up the returned statuses.
+    const N = 8;
+    const HTTP_A = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nA";
+    const HTTP_B = "HTTP/1.1 201 Created\r\nContent-Length: 1\r\nConnection: close\r\n\r\nB";
+
+    // Stub A answers the first yield of every coroutine, serially with a
+    // delay: all N coroutines park before the first resume arrives, and each
+    // re-yield happens with the other entries still in the map.
+    const stub_a = try spawnMultiStub(N, 30, HTTP_A);
+    const stub_b = try spawnMultiStub(N, 0, HTTP_B);
+    defer stub_a.thread.join();
+    defer stub_b.thread.join();
+
+    const lua_src = try std.fmt.allocPrint(testing.allocator,
+        \\function on_message(u)
+        \\  local a = bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
+        \\  local b = bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
+        \\  return {{ {{ method="done", params={{ s1=a.status, s2=b.status }} }} }}
+        \\end
+    , .{ stub_a.port, stub_b.port });
+    defer testing.allocator.free(lua_src);
+
+    var ctx: AsyncTestCtx = undefined;
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 4, .queue_capacity = 32, .timeout_ms = 10_000, .proc_max_output = 65_536 });
+    const t = try ctx.spawnWorker(64, 60_000);
+    defer ctx.deinit(t);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
+
+    for (0..N) |_| {
+        try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":1}"));
+    }
+
+    try testing.expect(waitQueue(&ctx.output_q, N, 10_000));
+    for (0..N) |_| {
+        const action = ctx.output_q.pop();
+        defer types.freeApiCall(action, testing.allocator);
+        try testing.expectEqualStrings("done", action.method);
+        try testing.expect(std.mem.indexOf(u8, action.payload.json, "\"s1\":200") != null);
+        try testing.expect(std.mem.indexOf(u8, action.payload.json, "\"s2\":201") != null);
+    }
+}
+
 test "coroutine past WORKFLOW_DEADLINE_MS is reaped; worker continues" {
     var silent = try spawnSilentStub();
     defer silent.deinit();
-    const port = std.mem.bigToNative(u16, silent.server.listen_address.in.sa.port);
+    const port = boundPort(silent.server);
 
     const lua_src = try std.fmt.allocPrint(testing.allocator,
         \\function on_message(u)
@@ -1146,19 +1365,17 @@ test "coroutine past WORKFLOW_DEADLINE_MS is reaped; worker continues" {
 
     const hang_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
     defer testing.allocator.free(hang_url);
-    const hang_body = try std.fmt.allocPrint(testing.allocator,
-        "{{\"hang\":true,\"url\":\"{s}\"}}", .{hang_url});
+    const hang_body = try std.fmt.allocPrint(testing.allocator, "{{\"hang\":true,\"url\":\"{s}\"}}", .{hang_url});
     defer testing.allocator.free(hang_body);
 
     var ctx: AsyncTestCtx = undefined;
-    try ctx.init(testing.allocator, lua_src,
-        .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 60_000, .proc_max_output = 65_536 });
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 60_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 200); // 200ms deadline
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, hang_body));
-    std.Thread.sleep(400 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 400 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"hang\":false}"));
     try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
@@ -1171,19 +1388,27 @@ test "coroutine past WORKFLOW_DEADLINE_MS is reaped; worker continues" {
 test "at inflight ceiling new updates are not dequeued until a slot frees" {
     const HTTP_OK = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
 
-    const addr = try std.net.Address.parseIp4("127.0.0.2", 0);
-    const srv = try testing.allocator.create(std.net.Server);
-    srv.* = try addr.listen(.{ .reuse_address = true });
-    const port = std.mem.bigToNative(u16, srv.listen_address.in.sa.port);
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    const srv = try testing.allocator.create(std.Io.net.Server);
+    srv.* = try addr.listen(testing.io, .{ .reuse_address = true });
+    const port = boundPort(srv);
     const slow_t = try std.Thread.spawn(.{}, struct {
-        fn run(s: *std.net.Server, resp: []const u8) void {
-            defer { s.deinit(); testing.allocator.destroy(s); }
-            const conn = s.accept() catch return;
-            defer conn.stream.close();
-            var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
-            std.Thread.sleep(300 * std.time.ns_per_ms);
-            conn.stream.writeAll(resp) catch {};
+        fn run(s: *std.Io.net.Server, resp: []const u8) void {
+            const cio = testing.io;
+            defer {
+                s.deinit(cio);
+                testing.allocator.destroy(s);
+            }
+            var stream = s.accept(cio) catch return;
+            defer stream.close(cio);
+            var rbuf: [4096]u8 = undefined;
+            var sr = stream.reader(cio, &rbuf);
+            drainRequestHead(&sr.interface);
+            rt.sleepNs(cio, 300 * std.time.ns_per_ms);
+            var wbuf: [256]u8 = undefined;
+            var sw = stream.writer(cio, &wbuf);
+            sw.interface.writeAll(resp) catch {};
+            sw.interface.flush() catch {};
         }
     }.run, .{ srv, HTTP_OK });
     defer slow_t.join();
@@ -1200,22 +1425,20 @@ test "at inflight ceiling new updates are not dequeued until a slot frees" {
     defer testing.allocator.free(lua_src);
 
     var ctx: AsyncTestCtx = undefined;
-    try ctx.init(testing.allocator, lua_src,
-        .{ .thread_count = 2, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 2, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(1, 60_000); // max_inflight = 1
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     const block_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
     defer testing.allocator.free(block_url);
-    const block_body = try std.fmt.allocPrint(testing.allocator,
-        "{{\"block\":true,\"url\":\"{s}\"}}", .{block_url});
+    const block_body = try std.fmt.allocPrint(testing.allocator, "{{\"block\":true,\"url\":\"{s}\"}}", .{block_url});
     defer testing.allocator.free(block_body);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, block_body));
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"block\":false}"));
 
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 100 * std.time.ns_per_ms);
     try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
 
     try testing.expect(waitQueue(&ctx.output_q, 2, 2_000));
@@ -1238,7 +1461,7 @@ test "bot.exec and bot.shell deliver results to coroutine" {
     , .{ .thread_count = 2, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"kind\":\"exec\"}"));
     try testing.expect(waitQueue(&ctx.output_q, 1, 3_000));
@@ -1274,29 +1497,25 @@ test "hot-reload while coroutine is parked; parked completes on old rules; next 
     defer testing.allocator.free(lua_src);
 
     var ctx: AsyncTestCtx = undefined;
-    try ctx.init(testing.allocator, lua_src,
-        .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
     defer testing.allocator.free(url);
-    const fetch_body = try std.fmt.allocPrint(testing.allocator,
-        "{{\"fetch\":true,\"url\":\"{s}\"}}", .{url});
+    const fetch_body = try std.fmt.allocPrint(testing.allocator, "{{\"fetch\":true,\"url\":\"{s}\"}}", .{url});
     defer testing.allocator.free(fetch_body);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, fetch_body));
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     {
-        var f = try ctx.tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(
+        try ctx.tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data =
             \\function on_message(u)
             \\  return { { method="new_rules", params={} } }
             \\end
-        );
+        });
     }
     _ = ctx.reload_ver.fetchAdd(1, .release);
 
@@ -1329,20 +1548,18 @@ test "Lua error in resumed step → workflow aborted, slot freed, worker continu
     defer testing.allocator.free(lua_src);
 
     var ctx: AsyncTestCtx = undefined;
-    try ctx.init(testing.allocator, lua_src,
-        .{ .thread_count = 2, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 2, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
     defer testing.allocator.free(url);
-    const crash_body = try std.fmt.allocPrint(testing.allocator,
-        "{{\"crash\":true,\"url\":\"{s}\"}}", .{url});
+    const crash_body = try std.fmt.allocPrint(testing.allocator, "{{\"crash\":true,\"url\":\"{s}\"}}", .{url});
     defer testing.allocator.free(crash_body);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, crash_body));
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 500 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"crash\":false}"));
     try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
@@ -1365,7 +1582,7 @@ test "bot.send_message → worker parks, dispatcher result → coroutine gets me
     , .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":1}"));
 
@@ -1405,7 +1622,7 @@ test "bot.send_message mid used in editMessageText — end-to-end chain" {
     , .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":2}"));
 
@@ -1441,7 +1658,7 @@ test "tracked send failure → Lua error raised; pcall catches; worker continues
     , .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":3}"));
 
@@ -1484,7 +1701,7 @@ test "bot.emit send_message (fire-and-forget) does not park coroutine" {
     , .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":5}"));
 
@@ -1507,7 +1724,7 @@ test "sync rule (no bot.send_message) completes in one resume — no regression"
     , .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 });
     const t = try ctx.spawnWorker(64, 60_000);
     defer ctx.deinit(t);
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":6}"));
 
@@ -1525,7 +1742,7 @@ test "coroutines_inflight / coroutines_reaped_total metrics" {
     // so the coroutine stays parked long enough to verify the metrics, and it
     // is safe to deinit() before ctx.deinit() to unblock the io_pool thread.
     var silent = try spawnHangStub();
-    const port = std.mem.bigToNative(u16, silent.server.listen_address.in.sa.port);
+    const port = boundPort(silent.server);
 
     const lua_src = try std.fmt.allocPrint(testing.allocator,
         \\function on_message(u)
@@ -1535,43 +1752,40 @@ test "coroutines_inflight / coroutines_reaped_total metrics" {
     , .{});
     defer testing.allocator.free(lua_src);
 
-    const hang_url = try std.fmt.allocPrint(testing.allocator,
-        "http://127.0.0.2:{d}/", .{port});
+    const hang_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
     defer testing.allocator.free(hang_url);
-    const body = try std.fmt.allocPrint(testing.allocator,
-        "{{\"url\":\"{s}\"}}", .{hang_url});
+    const body = try std.fmt.allocPrint(testing.allocator, "{{\"url\":\"{s}\"}}", .{hang_url});
     defer testing.allocator.free(body);
 
     var ctx: AsyncTestCtx = undefined;
-    try ctx.init(testing.allocator, lua_src,
-        .{ .thread_count = 1, .queue_capacity = 8,
-           .timeout_ms = 60_000, .proc_max_output = 65_536 });
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 60_000, .proc_max_output = 65_536 });
 
     const t = try std.Thread.spawn(.{}, workerThread, .{WorkerArgs{
-        .id                   = 0,
-        .rules_path           = ctx.rules_path,
-        .allocator            = ctx.allocator,
-        .queue                = &ctx.input_q,
-        .dispatcher_queue     = &ctx.output_q,
-        .db                   = &ctx.db,
-        .stop                 = &ctx.stop,
-        .reload_ver           = &ctx.reload_ver,
-        .io_pool_ptr          = &ctx.pool,
-        .io_result_queue      = &ctx.result_q,
-        .max_inflight         = 64,
+        .id = 0,
+        .rules_path = ctx.rules_path,
+        .allocator = ctx.allocator,
+        .io = testing.io,
+        .queue = &ctx.input_q,
+        .dispatcher_queue = &ctx.output_q,
+        .db = &ctx.db,
+        .stop = &ctx.stop,
+        .reload_ver = &ctx.reload_ver,
+        .io_pool_ptr = &ctx.pool,
+        .io_result_queue = &ctx.result_q,
+        .max_inflight = 64,
         .workflow_deadline_ms = 200, // short deadline for test speed
-        .metrics              = &m,
+        .metrics = &m,
     }});
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, body));
 
     // Give the worker time to park the coroutine.
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 100 * std.time.ns_per_ms);
     const inflight_while_parked = m.coroutines_inflight.load(.monotonic);
 
     // Wait for deadline reap (200ms deadline + 100ms margin).
-    std.Thread.sleep(400 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 400 * std.time.ns_per_ms);
     const reaped = m.coroutines_reaped_total.load(.monotonic);
     const inflight_after_reap = m.coroutines_inflight.load(.monotonic);
 
@@ -1589,7 +1803,7 @@ test "coroutines_inflight / coroutines_reaped_total metrics" {
 
 test "worker drains in-flight coroutines on stop; exits cleanly" {
     var silent = try spawnHangStub();
-    const port = std.mem.bigToNative(u16, silent.server.listen_address.in.sa.port);
+    const port = boundPort(silent.server);
 
     const lua_src = try std.fmt.allocPrint(testing.allocator,
         \\function on_message(u)
@@ -1599,38 +1813,35 @@ test "worker drains in-flight coroutines on stop; exits cleanly" {
     , .{});
     defer testing.allocator.free(lua_src);
 
-    const hang_url = try std.fmt.allocPrint(testing.allocator,
-        "http://127.0.0.2:{d}/", .{port});
+    const hang_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
     defer testing.allocator.free(hang_url);
-    const body = try std.fmt.allocPrint(testing.allocator,
-        "{{\"url\":\"{s}\"}}", .{hang_url});
+    const body = try std.fmt.allocPrint(testing.allocator, "{{\"url\":\"{s}\"}}", .{hang_url});
     defer testing.allocator.free(body);
 
     var ctx: AsyncTestCtx = undefined;
-    try ctx.init(testing.allocator, lua_src,
-        .{ .thread_count = 1, .queue_capacity = 8,
-           .timeout_ms = 60_000, .proc_max_output = 65_536 });
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 60_000, .proc_max_output = 65_536 });
 
     const t = try std.Thread.spawn(.{}, workerThread, .{WorkerArgs{
-        .id                   = 0,
-        .rules_path           = ctx.rules_path,
-        .allocator            = ctx.allocator,
-        .queue                = &ctx.input_q,
-        .dispatcher_queue     = &ctx.output_q,
-        .db                   = &ctx.db,
-        .stop                 = &ctx.stop,
-        .reload_ver           = &ctx.reload_ver,
-        .io_pool_ptr          = &ctx.pool,
-        .io_result_queue      = &ctx.result_q,
-        .max_inflight         = 64,
+        .id = 0,
+        .rules_path = ctx.rules_path,
+        .allocator = ctx.allocator,
+        .io = testing.io,
+        .queue = &ctx.input_q,
+        .dispatcher_queue = &ctx.output_q,
+        .db = &ctx.db,
+        .stop = &ctx.stop,
+        .reload_ver = &ctx.reload_ver,
+        .io_pool_ptr = &ctx.pool,
+        .io_result_queue = &ctx.result_q,
+        .max_inflight = 64,
         .workflow_deadline_ms = 5_000,
     }});
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, body));
 
     // Let the coroutine park on the hang stub.
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 100 * std.time.ns_per_ms);
 
     // Signal stop while coroutine is in-flight — the worker emits the drain log.
     ctx.stop.store(true, .release);
@@ -1657,7 +1868,7 @@ test "state commits after .done and rolls back on Lua error" {
         const t = try ctx.spawnWorker();
         defer ctx.deinit(t);
 
-        std.Thread.sleep(30 * std.time.ns_per_ms);
+        rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
         try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
 
         // Wait for the dispatched action — proves the .done path completed.
@@ -1683,11 +1894,11 @@ test "state commits after .done and rolls back on Lua error" {
         // Set initial committed state before pushing the message.
         try ctx.db.setUserState(1, "{\"x\":0}");
 
-        std.Thread.sleep(30 * std.time.ns_per_ms);
+        rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
         try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
 
         // No output is dispatched on Lua error — wait long enough for processing.
-        std.Thread.sleep(150 * std.time.ns_per_ms);
+        rt.sleepNs(testing.io, 150 * std.time.ns_per_ms);
 
         const data = try ctx.db.getUserState(1);
         defer testing.allocator.free(data);
@@ -1699,7 +1910,7 @@ test "state commits after .done and rolls back on Lua error" {
 
 test "worker exits within WORKFLOW_DEADLINE_MS + 200ms with non-responding stub" {
     var silent = try spawnHangStub();
-    const port = std.mem.bigToNative(u16, silent.server.listen_address.in.sa.port);
+    const port = boundPort(silent.server);
 
     const lua_src = try std.fmt.allocPrint(testing.allocator,
         \\function on_message(u)
@@ -1709,44 +1920,41 @@ test "worker exits within WORKFLOW_DEADLINE_MS + 200ms with non-responding stub"
     , .{});
     defer testing.allocator.free(lua_src);
 
-    const hang_url = try std.fmt.allocPrint(testing.allocator,
-        "http://127.0.0.2:{d}/", .{port});
+    const hang_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
     defer testing.allocator.free(hang_url);
-    const body = try std.fmt.allocPrint(testing.allocator,
-        "{{\"url\":\"{s}\"}}", .{hang_url});
+    const body = try std.fmt.allocPrint(testing.allocator, "{{\"url\":\"{s}\"}}", .{hang_url});
     defer testing.allocator.free(body);
 
     var ctx: AsyncTestCtx = undefined;
-    try ctx.init(testing.allocator, lua_src,
-        .{ .thread_count = 1, .queue_capacity = 8,
-           .timeout_ms = 60_000, .proc_max_output = 65_536 });
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 60_000, .proc_max_output = 65_536 });
 
     const t = try std.Thread.spawn(.{}, workerThread, .{WorkerArgs{
-        .id                   = 0,
-        .rules_path           = ctx.rules_path,
-        .allocator            = ctx.allocator,
-        .queue                = &ctx.input_q,
-        .dispatcher_queue     = &ctx.output_q,
-        .db                   = &ctx.db,
-        .stop                 = &ctx.stop,
-        .reload_ver           = &ctx.reload_ver,
-        .io_pool_ptr          = &ctx.pool,
-        .io_result_queue      = &ctx.result_q,
-        .max_inflight         = 64,
+        .id = 0,
+        .rules_path = ctx.rules_path,
+        .allocator = ctx.allocator,
+        .io = testing.io,
+        .queue = &ctx.input_q,
+        .dispatcher_queue = &ctx.output_q,
+        .db = &ctx.db,
+        .stop = &ctx.stop,
+        .reload_ver = &ctx.reload_ver,
+        .io_pool_ptr = &ctx.pool,
+        .io_result_queue = &ctx.result_q,
+        .max_inflight = 64,
         .workflow_deadline_ms = 200, // short deadline for this test
     }});
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, body));
 
     // Let the coroutine park on the hang stub.
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    rt.sleepNs(testing.io, 100 * std.time.ns_per_ms);
 
     // Signal stop WITHOUT closing the stub. The worker must drain via deadline reap.
     ctx.stop.store(true, .release);
-    const t0 = std.time.milliTimestamp();
+    const t0 = rt.nowMs(testing.io);
     t.join();
-    const elapsed_ms = std.time.milliTimestamp() - t0;
+    const elapsed_ms = rt.nowMs(testing.io) - t0;
 
     // Close stub after worker exits to unblock the io_pool thread.
     silent.deinit();
@@ -1755,9 +1963,9 @@ test "worker exits within WORKFLOW_DEADLINE_MS + 200ms with non-responding stub"
     // pool.deinit() joins the pool thread first so all pushErr calls complete
     // before result_q is drained — avoids a race with popTimeout(0).
     ctx.pool.deinit();
-    while (ctx.input_q.popTimeout(0))  |item| ctx.allocator.free(item.body);
+    while (ctx.input_q.popTimeout(0)) |item| ctx.allocator.free(item.body);
     while (ctx.output_q.popTimeout(0)) |call| types.freeApiCall(call, ctx.allocator);
-    while (ctx.result_q.popTimeout(0)) |res|  io_pool.freeIoResult(res, ctx.allocator);
+    while (ctx.result_q.popTimeout(0)) |res| io_pool.freeIoResult(res, ctx.allocator);
     ctx.result_q.deinit(ctx.allocator);
     ctx.output_q.deinit(ctx.allocator);
     ctx.input_q.deinit(ctx.allocator);

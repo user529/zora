@@ -71,9 +71,9 @@ pub fn teardownCoro(main: *Lua, handle: CoroHandle) void {
     // Retrieve the thread object via its integer ref and use it as a key to
     // clear registry[thread_obj] from the main state — safe even for dead
     // (errored) coroutines whose internal call-info stack is unwound.
-    _ = main.rawGetIndex(ziglua.registry_index, @as(ziglua.Integer, handle.lua_ref));
+    _ = main.getIndexRaw(ziglua.registry_index, @as(ziglua.Integer, handle.lua_ref));
     main.pushNil();
-    main.rawSetTable(ziglua.registry_index); // registry[thread_obj] = nil
+    main.setTableRaw(ziglua.registry_index); // registry[thread_obj] = nil
     main.unref(ziglua.registry_index, handle.lua_ref);
 }
 
@@ -189,7 +189,7 @@ pub const LuaEngine = struct {
 
         // Create child thread and pin it in the registry so GC can't collect it.
         const thread = main.newThread();    // pushes thread on main stack
-        const lua_ref = try main.ref(ziglua.registry_index); // pops, stores, returns ref
+        const lua_ref = main.ref(ziglua.registry_index); // pops, stores, returns ref
 
         const handle = CoroHandle{
             .thread    = thread,
@@ -201,15 +201,17 @@ pub const LuaEngine = struct {
         // Initialise per-coroutine emit accumulator (registry[thread] = {}).
         lua_api.beginEmitBatch(thread);
 
-        // Push on_message function onto the thread's stack.
-        const fn_type = thread.getGlobal("on_message") catch {
-            log.warn("on_message not found", .{});
-            teardownCoro(main, handle);
-            return .err;
-        };
+        // Push on_message function onto the thread's stack. getGlobal pushes the
+        // value (nil when absent) and returns its type; a missing or non-function
+        // on_message is handled the same way.
+        const fn_type = thread.getGlobal("on_message");
         if (fn_type != .function) {
             thread.pop(1);
-            log.warn("on_message is not a function", .{});
+            if (fn_type == .nil) {
+                log.warn("on_message not found", .{});
+            } else {
+                log.warn("on_message is not a function", .{});
+            }
             teardownCoro(main, handle);
             return .err;
         }
@@ -255,7 +257,7 @@ pub const LuaEngine = struct {
         if (is_tracked_send) {
             pushTrackedSendResult(thread, result);
         } else {
-            pushIoResult(thread, result, allocator);
+            pushIoResult(thread, result);
         }
 
         // Reset instruction cap for this resume.
@@ -351,8 +353,7 @@ pub const LuaEngine = struct {
 /// For http: pushes {status=N, body="..."}
 /// For proc: pushes {exit_code=N, stdout="..."}
 /// For err:  pushes a combined table {status=0, body=msg, exit_code=-1, stdout=msg}
-fn pushIoResult(thread: *Lua, result: io_pool.IoResult, allocator: std.mem.Allocator) void {
-    _ = allocator;
+fn pushIoResult(thread: *Lua, result: io_pool.IoResult) void {
     switch (result.outcome) {
         .http => |h| {
             thread.createTable(0, 3);
@@ -422,20 +423,15 @@ fn pushTrackedSendResult(thread: *Lua, result: io_pool.IoResult) void {
 fn parseOneApiCall(
     lua:       *Lua,
     table_idx: i32,
-    allocator: std.mem.Allocator,
     schema:    ?*const tg_schema.SchemaStore,
     mode:      types.ValidationMode,
 ) !types.ApiCall {
-    _ = allocator; // buildApiCall uses ctx.allocator internally
-
     // ── method (required string) ──────────────────────────────────────────
     _ = lua.getField(table_idx, "method");
-    const method_z = lua.toString(-1) catch {
+    const method_tmp = lua.toString(-1) catch {
         lua.pop(1);
         return error.InvalidApiCall;
     };
-    // Borrow the string temporarily; buildApiCall dupes it.
-    const method_tmp = method_z;
     lua.pop(1);
 
     // ── params value on the stack ─────────────────────────────────────────
@@ -481,14 +477,14 @@ fn appendApiCalls(
 ) !void {
     if (!lua.isTable(table_idx)) return;
 
-    const n = lua.rawLen(table_idx);
+    const n = lua.lenRaw(table_idx);
     var i: ziglua.Integer = 1;
     while (i <= @as(ziglua.Integer, @intCast(n))) : (i += 1) {
         const pre = lua.getTop();
-        _ = lua.rawGetIndex(table_idx, i);
+        _ = lua.getIndexRaw(table_idx, i);
         if (lua.isTable(-1)) {
             const abs = lua.getTop();
-            if (parseOneApiCall(lua, abs, allocator, schema, mode)) |call| {
+            if (parseOneApiCall(lua, abs, schema, mode)) |call| {
                 list.append(allocator, call) catch {
                     types.freeApiCall(call, allocator);
                     lua.setTop(pre);
@@ -513,7 +509,7 @@ const state_store = @import("state_store.zig");
 
 /// Default test ApiCtx for `db`: 50 MB file cap, 1 MB JSON cap, testing allocator.
 fn testCtx(db: *state_store.StateStore) lua_api.ApiCtx {
-    return .{ .db = db, .allocator = testing.allocator, .max_file_bytes = 52428800, .json_max_bytes = 1048576 };
+    return .{ .db = db, .allocator = testing.allocator, .io = testing.io, .max_file_bytes = 52428800, .json_max_bytes = 1048576 };
 }
 
 test "io.open / os.execute / require raise errors; math/string/table/utf8 work" {
@@ -730,7 +726,7 @@ test "validation mode governs both bot.emit and the return-list" {
     defer db.close();
     var ctx = testCtx(&db);
 
-    var slot = tg_schema.SchemaSlot.init(testing.allocator);
+    var slot = tg_schema.SchemaSlot.init(testing.allocator, testing.io);
     defer slot.deinit();
     slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
 
@@ -784,7 +780,7 @@ test "schema slot is shared by pointer and an empty slot validates nothing" {
     // never enters a lua_State, so adding engines (workers) never multiplies its
     // memory.
     {
-        var slot = tg_schema.SchemaSlot.init(testing.allocator);
+        var slot = tg_schema.SchemaSlot.init(testing.allocator, testing.io);
         defer slot.deinit();
         slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
 
@@ -800,7 +796,7 @@ test "schema slot is shared by pointer and an empty slot validates nothing" {
     }
     // An empty slot under strict mode is a no-op: nothing is dropped (Tier-0).
     {
-        var slot = tg_schema.SchemaSlot.init(testing.allocator); // never installed
+        var slot = tg_schema.SchemaSlot.init(testing.allocator, testing.io); // never installed
         defer slot.deinit();
 
         var engine = try LuaEngine.init(testing.allocator, &ctx);
@@ -826,7 +822,7 @@ test "shipped rules/rules.lua produces sendMessage calls (generic form)" {
 
     // Load the actual shipped rules file (cwd is the project root under
     // `zig build test`).
-    const raw = try std.fs.cwd().readFileAlloc(testing.allocator, "rules/rules.lua", 64 * 1024);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(testing.io, "rules/rules.lua", testing.allocator, .limited(64 * 1024));
     defer testing.allocator.free(raw);
     const src = try testing.allocator.dupeZ(u8, raw);
     defer testing.allocator.free(src);

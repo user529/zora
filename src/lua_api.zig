@@ -37,6 +37,8 @@ pub const ApiCtx = struct {
     /// (e.g., JSON intermediate buffers).  Must be an arena or GPA —
     /// every allocation is freed before the C function returns.
     allocator:      std.mem.Allocator,
+    /// Runtime for blocking I/O (reading file-upload descriptors).
+    io:             std.Io,
     /// Maximum file size in bytes for multipart upload descriptors.
     max_file_bytes: usize,
     /// Maximum bytes for json.decode input / json.encode output.
@@ -178,7 +180,7 @@ pub fn register(lua: *Lua, ctx: *ApiCtx, rules_api_version: u32) void {
 
 pub fn getCtx(lua: *Lua) *ApiCtx {
     _ = lua.getField(ziglua.registry_index, REGISTRY_KEY);
-    const ptr = lua.toPointer(-1) catch unreachable; // always a light userdata
+    const ptr = lua.toPointer(-1) orelse unreachable; // always a light userdata
     lua.pop(1);
     return @constCast(@alignCast(@ptrCast(ptr)));
 }
@@ -263,10 +265,10 @@ pub fn buildApiCall(
                 };
                 lua.pop(1); // pop __file value
 
-                const bytes = std.fs.cwd().readFileAlloc(
-                    alloc, path_z, ctx.max_file_bytes +| 1,
+                const bytes = std.Io.Dir.cwd().readFileAlloc(
+                    ctx.io, path_z, alloc, .limited(ctx.max_file_bytes +| 1),
                 ) catch |err| {
-                    return if (err == error.FileTooBig) error.FileTooLarge else err; // defer frees key
+                    return if (err == error.StreamTooLong) error.FileTooLarge else err; // defer frees key
                 };
                 if (bytes.len > ctx.max_file_bytes) {
                     alloc.free(bytes);
@@ -468,7 +470,6 @@ fn botSetChatState(state: ?*ziglua.LuaState) callconv(.c) c_int {
     const lua: *Lua = @ptrCast(state.?);
     const ctx = getCtx(lua);
     const chat_id = lua.checkInteger(1);
-    lua.checkType(2, .table);
 
     return setStateImpl(lua, ctx, chat_id, state_store.StateStore.setChatState, "setChatState");
 }
@@ -550,18 +551,18 @@ fn botLog(state: ?*ziglua.LuaState) callconv(.c) c_int {
 pub fn beginEmitBatch(lua: *Lua) void {
     _ = lua.pushThread();                       // key = this thread
     lua.newTable();                             // value = {}
-    lua.rawSetTable(ziglua.registry_index);     // registry[thread] = {}
+    lua.setTableRaw(ziglua.registry_index);     // registry[thread] = {}
 }
 
 /// Push the emit accumulator onto the stack and clear the registry entry.
 /// After this call: stack has the accumulator table on top; registry entry is nil.
 pub fn pushEmitBatch(lua: *Lua) void {
     _ = lua.pushThread();
-    _ = lua.rawGetTable(ziglua.registry_index); // stack: [..., accum_table]
+    _ = lua.getTableRaw(ziglua.registry_index); // stack: [..., accum_table]
     // Clear the registry entry.
     _ = lua.pushThread();
     lua.pushNil();
-    lua.rawSetTable(ziglua.registry_index);     // registry[thread] = nil
+    lua.setTableRaw(ziglua.registry_index);     // registry[thread] = nil
     // accum_table remains on stack for caller
 }
 
@@ -570,10 +571,10 @@ fn botEmit(state: ?*ziglua.LuaState) callconv(.c) c_int {
     lua.checkType(1, .table);
 
     _ = lua.pushThread();
-    _ = lua.rawGetTable(ziglua.registry_index); // [arg1, batch]
-    const next: ziglua.Integer = @intCast(lua.rawLen(-1) + 1);
+    _ = lua.getTableRaw(ziglua.registry_index); // [arg1, batch]
+    const next: ziglua.Integer = @intCast(lua.lenRaw(-1) + 1);
     lua.pushValue(1);           // [arg1, batch, arg1]
-    lua.rawSetIndex(-2, next);  // batch[next] = arg1 → [arg1, batch]
+    lua.setIndexRaw(-2, next);  // batch[next] = arg1 → [arg1, batch]
     lua.pop(1);                 // [arg1]
     return 0;
 }
@@ -820,7 +821,6 @@ fn botHttpRequest(state: ?*ziglua.LuaState) callconv(.c) c_int {
         .io_job = io_pool.IoJob{
             .worker_id   = 0,   // filled in by lua_engine.startHandler/resumeHandler
             .coro_id     = 0,   // filled in by lua_engine.startHandler/resumeHandler
-            .deadline_ms = -1,
             .payload = .{ .http_request = .{
                 .method  = method,
                 .url     = url,
@@ -846,14 +846,14 @@ fn botExec(state: ?*ziglua.LuaState) callconv(.c) c_int {
 
     _ = lua.getField(1, "argv");
     lua.checkType(-1, .table);
-    const argc: usize = @intCast(lua.rawLen(-1));
+    const argc: usize = @intCast(lua.lenRaw(-1));
     if (argc == 0) lua.raiseErrorStr("bot.exec: argv must be non-empty", .{});
 
     // Dupe each argv element.
     const argv = alloc.alloc([]u8, argc) catch lua.raiseErrorStr("exec: OOM", .{});
     var n_duped: usize = 0;
     for (argv, 0..) |*slot, i| {
-        _ = lua.rawGetIndex(-1, @intCast(i + 1));
+        _ = lua.getIndexRaw(-1, @intCast(i + 1));
         const arg = lua.checkString(-1);
         slot.* = alloc.dupe(u8, arg) catch {
             for (argv[0..n_duped]) |a| alloc.free(a);
@@ -869,7 +869,7 @@ fn botExec(state: ?*ziglua.LuaState) callconv(.c) c_int {
 
     ctx.pending_job = .{ .io = .{
         .io_job = io_pool.IoJob{
-            .worker_id = 0, .coro_id = 0, .deadline_ms = -1,
+            .worker_id = 0, .coro_id = 0,
             .payload = .{ .exec = .{ .argv = argv_const } },
         },
         .owned_strings = OwnedStrings{ .exec = .{ .argv = argv } },
@@ -894,7 +894,7 @@ fn botShell(state: ?*ziglua.LuaState) callconv(.c) c_int {
 
     ctx.pending_job = .{ .io = .{
         .io_job = io_pool.IoJob{
-            .worker_id = 0, .coro_id = 0, .deadline_ms = -1,
+            .worker_id = 0, .coro_id = 0,
             .payload = .{ .shell = .{ .command = command } },
         },
         .owned_strings = OwnedStrings{ .shell = .{ .command = command } },
@@ -951,7 +951,7 @@ fn botSendMessageTracked(state: ?*ziglua.LuaState) callconv(.c) c_int {
             // stack: [arg(1), params(2), opts(3), key(-2), value(-1)]
             lua.pushValue(-2); // dup key
             lua.pushValue(-2); // dup value
-            lua.rawSetTable(2);
+            lua.setTableRaw(2);
             lua.pop(1); // pop value, keep key for next()
         }
     }
@@ -1162,7 +1162,7 @@ test "bot.rules_api_version matches Zig constant" {
         \\       "rules_api_version should be a number")
     );
 
-    _ = try lua.getGlobal("bot");
+    _ = lua.getGlobal("bot");
     _ = lua.getField(-1, "rules_api_version");
     const ver = try lua.toInteger(-1);
     lua.pop(2);
@@ -1267,11 +1267,12 @@ test "buildApiCall builds multipart and enforces the file limit" {
 
     // A __file descriptor under the limit becomes a multipart part.
     {
-        try tmp.dir.writeFile(.{ .sub_path = "img.jpg", .data = "\xff\xd8\xff" });
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "img.jpg", .data = "\xff\xd8\xff" });
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const path = try tmp.dir.realpath("img.jpg", &path_buf);
+        const path_len = try tmp.dir.realPathFile(testing.io, "img.jpg", &path_buf);
+        const path = path_buf[0..path_len];
 
-        var ctx = ApiCtx{ .db = &db, .allocator = alloc, .max_file_bytes = 1024, .json_max_bytes = 1048576 };
+        var ctx = ApiCtx{ .db = &db, .allocator = alloc, .io = testing.io, .max_file_bytes = 1024, .json_max_bytes = 1048576 };
         register(lua, &ctx, 1);
 
         // Build params table: { photo = { __file = path } }
@@ -1299,11 +1300,12 @@ test "buildApiCall builds multipart and enforces the file limit" {
     }
     // A file larger than the limit → FileTooLarge (11 bytes, limit 10).
     {
-        try tmp.dir.writeFile(.{ .sub_path = "big.bin", .data = "hello world" });
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "big.bin", .data = "hello world" });
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const path = try tmp.dir.realpath("big.bin", &path_buf);
+        const path_len = try tmp.dir.realPathFile(testing.io, "big.bin", &path_buf);
+        const path = path_buf[0..path_len];
 
-        var ctx = ApiCtx{ .db = &db, .allocator = alloc, .max_file_bytes = 10, .json_max_bytes = 1048576 };
+        var ctx = ApiCtx{ .db = &db, .allocator = alloc, .io = testing.io, .max_file_bytes = 10, .json_max_bytes = 1048576 };
         register(lua, &ctx, 1);
 
         lua.newTable();
@@ -1327,6 +1329,7 @@ fn testCtxCap(db: *state_store.StateStore, json_max: usize) ApiCtx {
     return .{
         .db             = db,
         .allocator      = testing.allocator,
+        .io             = testing.io,
         .max_file_bytes = 52428800,
         .json_max_bytes = json_max,
     };

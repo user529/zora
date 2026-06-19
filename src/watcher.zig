@@ -21,6 +21,7 @@
 
 const std     = @import("std");
 const builtin = @import("builtin");
+const rt      = @import("rt.zig");
 
 const log = std.log.scoped(.reload);
 
@@ -42,6 +43,9 @@ pub const WatcherArgs = struct {
     /// Allocator used by the watcher thread.
     /// Must remain valid for the lifetime of the watcher thread.
     allocator: std.mem.Allocator,
+    /// Runtime for the poll fallback's sleep and stat (unused on Linux/FreeBSD,
+    /// which use kernel watchers).
+    io: std.Io,
 };
 
 // ---------------------------------------------------------------------------
@@ -76,7 +80,7 @@ pub fn watcherThread(args: WatcherArgs) void {
     switch (builtin.os.tag) {
         .linux   => watcherInotify(owned, &reload_version),
         .freebsd => watcherKqueue(owned, &reload_version),
-        else     => watcherPoll(owned, &reload_version, 500, null),
+        else     => watcherPoll(owned, &reload_version, args.io, 500, null),
     }
 }
 
@@ -113,21 +117,38 @@ pub fn watchInotify(t: WatchTarget) void {
     const dir_path = std.fs.path.dirname(t.path) orelse ".";
     const basename = std.fs.path.basename(t.path);
 
-    const ifd = posix.inotify_init1(linux.IN.CLOEXEC) catch |err| {
-        log.err("inotify_init1: {s}", .{@errorName(err)});
+    // 0.16 removed the medium-level posix inotify wrappers; call the raw Linux
+    // syscalls and check errno directly.
+    const init_rc = linux.inotify_init1(linux.IN.CLOEXEC);
+    switch (linux.errno(init_rc)) {
+        .SUCCESS => {},
+        else => |e| {
+            log.err("inotify_init1: {s}", .{@tagName(e)});
+            return;
+        },
+    }
+    const ifd: i32 = @intCast(init_rc);
+    defer _ = linux.close(ifd);
+
+    // inotify_add_watch needs a null-terminated path.
+    var dirz_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dirz = std.fmt.bufPrintZ(&dirz_buf, "{s}", .{dir_path}) catch {
+        log.err("inotify watch path too long: '{s}'", .{dir_path});
         return;
     };
-    defer posix.close(ifd);
-
-    _ = posix.inotify_add_watch(
+    const add_rc = linux.inotify_add_watch(
         ifd,
-        dir_path,
+        dirz.ptr,
         linux.IN.CLOSE_WRITE | linux.IN.MOVED_TO |
             linux.IN.DELETE | linux.IN.MOVED_FROM,
-    ) catch |err| {
-        log.err("inotify_add_watch '{s}': {s}", .{ dir_path, @errorName(err) });
-        return;
-    };
+    );
+    switch (linux.errno(add_rc)) {
+        .SUCCESS => {},
+        else => |e| {
+            log.err("inotify_add_watch '{s}': {s}", .{ dir_path, @tagName(e) });
+            return;
+        },
+    }
 
     var buf: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined;
     while (true) {
@@ -173,54 +194,73 @@ fn watcherInotify(rules_path: []const u8, counter: *std.atomic.Value(u64)) void 
 // FreeBSD: kqueue / EVFILT_VNODE
 // ---------------------------------------------------------------------------
 
-// Raw constants from sys/event.h — not exposed in Zig's posix module.
-const EVFILT_VNODE: i16 = -4;
-const EV_ADD:       u16 = 0x0001;
-const EV_CLEAR:     u16 = 0x0020;
-const NOTE_DELETE:  u32 = 0x0001;
-const NOTE_WRITE:   u32 = 0x0002;
-const NOTE_RENAME:  u32 = 0x0020;
-
 /// Generic kqueue watcher (FreeBSD). Never returns.
 pub fn watchKqueue(t: WatchTarget) void {
     if (comptime builtin.os.tag != .freebsd) {
         unreachable;
     }
-    const posix = std.posix;
+    const c = std.c;
 
-    const kq = posix.kqueue() catch |err| {
-        log.err("kqueue: {s}", .{@errorName(err)});
+    // 0.16 removed the medium-level posix kqueue wrappers; call libc directly
+    // and check errno. The EVFILT/EV/NOTE constants now live in std.c.
+    const kq = c.kqueue();
+    switch (c.errno(kq)) {
+        .SUCCESS => {},
+        else => |e| {
+            log.err("kqueue: {s}", .{@tagName(e)});
+            return;
+        },
+    }
+    defer _ = c.close(kq);
+
+    // open needs a null-terminated path.
+    var pathz_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const pathz = std.fmt.bufPrintZ(&pathz_buf, "{s}", .{t.path}) catch {
+        log.err("kqueue watch path too long: '{s}'", .{t.path});
         return;
     };
-    defer posix.close(kq);
+    const fd = c.open(pathz.ptr, .{ .ACCMODE = .RDONLY });
+    switch (c.errno(fd)) {
+        .SUCCESS => {},
+        else => |e| {
+            log.err("open '{s}': {s}", .{ t.path, @tagName(e) });
+            return;
+        },
+    }
+    defer _ = c.close(fd);
 
-    const fd = posix.open(t.path, .{ .ACCMODE = .RDONLY }, 0) catch |err| {
-        log.err("open '{s}': {s}", .{ t.path, @errorName(err) });
-        return;
+    const change: c.Kevent = .{
+        .ident = @intCast(fd),
+        .filter = c.EVFILT.VNODE,
+        .flags = c.EV.ADD | c.EV.CLEAR,
+        .fflags = c.NOTE.WRITE | c.NOTE.RENAME | c.NOTE.DELETE,
+        .data = 0,
+        .udata = 0,
     };
-    defer posix.close(fd);
 
-    var change = std.mem.zeroes(posix.Kevent);
-    change.ident  = @intCast(fd);
-    change.filter = EVFILT_VNODE;
-    change.flags  = EV_ADD | EV_CLEAR;
-    change.fflags = NOTE_WRITE | NOTE_RENAME | NOTE_DELETE;
+    var events: [1]c.Kevent = undefined;
+    const reg_rc = c.kevent(kq, &[_]c.Kevent{change}, 1, &events, 0, null);
+    switch (c.errno(reg_rc)) {
+        .SUCCESS => {},
+        else => |e| {
+            log.err("kevent register: {s}", .{@tagName(e)});
+            return;
+        },
+    }
 
-    _ = posix.kevent(kq, &.{change}, &.{}, null) catch |err| {
-        log.err("kevent register: {s}", .{@errorName(err)});
-        return;
-    };
-
-    var events: [1]posix.Kevent = undefined;
     while (true) {
-        const ev_count = posix.kevent(kq, &.{}, &events, null) catch |err| {
-            if (err == error.Interrupted) continue;
-            log.err("kevent wait: {s} — hot-reload permanently disabled, aborting", .{@errorName(err)});
-            std.process.abort();
-        };
-        if (ev_count == 0) continue;
+        const n = c.kevent(kq, &events, 0, &events, events.len, null);
+        switch (c.errno(n)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => |e| {
+                log.err("kevent wait: {s} — hot-reload permanently disabled, aborting", .{@tagName(e)});
+                std.process.abort();
+            },
+        }
+        if (n == 0) continue;
         const fflags = events[0].fflags;
-        if (fflags & (NOTE_DELETE | NOTE_RENAME) != 0) {
+        if (fflags & (c.NOTE.DELETE | c.NOTE.RENAME) != 0) {
             if (t.on_delete) |d| d(t.context);
         } else {
             t.on_write(t.context);
@@ -245,20 +285,21 @@ fn watcherKqueue(rules_path: []const u8, counter: *std.atomic.Value(u64)) void {
 /// for platforms without a kernel watcher; also used directly by tests.
 pub fn watchPoll(
     t: WatchTarget,
+    io: std.Io,
     poll_ms: u64,
     stop: ?*const std.atomic.Value(bool),
 ) void {
     var last_mtime: i128 = 0;
     while (stop == null or !stop.?.load(.acquire)) {
-        std.Thread.sleep(poll_ms * std.time.ns_per_ms);
-        const stat = std.fs.cwd().statFile(t.path) catch {
+        rt.sleepNs(io, poll_ms * std.time.ns_per_ms);
+        const stat = std.Io.Dir.cwd().statFile(io, t.path, .{}) catch {
             if (last_mtime != 0) {
                 if (t.on_delete) |d| d(t.context);
                 last_mtime = 0;
             }
             continue;
         };
-        const mtime = stat.mtime;
+        const mtime: i128 = stat.mtime.nanoseconds;
         if (last_mtime != 0 and mtime != last_mtime) {
             t.on_write(t.context);
         }
@@ -270,11 +311,13 @@ pub fn watchPoll(
 fn watcherPoll(
     rules_path: []const u8,
     counter: *std.atomic.Value(u64),
+    io: std.Io,
     poll_ms: u64,
     stop: ?*const std.atomic.Value(bool),
 ) void {
     watchPoll(
         .{ .path = rules_path, .context = counter, .on_write = bumpReloadCounter },
+        io,
         poll_ms,
         stop,
     );
@@ -287,10 +330,10 @@ fn watcherPoll(
 /// Spin-wait until `counter >= expected` or `timeout_ms` elapses.
 /// Returns true if the condition was satisfied in time.
 fn waitForCount(counter: *const std.atomic.Value(u64), expected: u64, timeout_ms: u64) bool {
-    const start = std.time.milliTimestamp();
+    const start = rt.nowMs(rt.io());
     while (counter.load(.acquire) < expected) {
-        if (@as(u64, @intCast(std.time.milliTimestamp() - start)) >= timeout_ms) return false;
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        if (@as(u64, @intCast(rt.nowMs(rt.io()) - start)) >= timeout_ms) return false;
+        rt.sleepNs(rt.io(), 5 * std.time.ns_per_ms);
     }
     return true;
 }
@@ -330,13 +373,12 @@ test "watcherPoll detects file write within 1500ms" {
 
     // Create initial file so the watcher can stat it on its first cycle.
     {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_V0);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V0 });
     }
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("rules.lua", &path_buf);
+    const path_len = try tmp.dir.realPathFile(testing.io, "rules.lua", &path_buf);
+    const path = path_buf[0..path_len];
 
     var counter = std.atomic.Value(u64).init(0);
     var stop    = std.atomic.Value(bool).init(false);
@@ -349,19 +391,17 @@ test "watcherPoll detects file write within 1500ms" {
     const ctx = Ctx{ .path = path, .ctr = &counter, .stp = &stop };
     const t = try std.Thread.spawn(.{}, struct {
         fn run(c: Ctx) void {
-            watcherPoll(c.path, c.ctr, 50, c.stp);
+            watcherPoll(c.path, c.ctr, testing.io, 50, c.stp);
         }
     }.run, .{ctx});
     defer { stop.store(true, .release); t.join(); }
 
     // Let the watcher record the initial mtime (two poll cycles = 100ms).
-    std.Thread.sleep(110 * std.time.ns_per_ms);
+    rt.sleepNs(rt.io(), 110 * std.time.ns_per_ms);
 
     // Write new content → changes mtime.
     {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_V1);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V1 });
     }
 
     // Watcher should detect within 1500ms total budget.
@@ -375,13 +415,12 @@ test "(Linux) inotify detects CLOSE_WRITE within 1000ms" {
     defer tmp.cleanup();
 
     {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_V0);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V0 });
     }
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("rules.lua", &path_buf);
+    const path_len = try tmp.dir.realPathFile(testing.io, "rules.lua", &path_buf);
+    const path = path_buf[0..path_len];
 
     var counter = std.atomic.Value(u64).init(0);
 
@@ -396,13 +435,11 @@ test "(Linux) inotify detects CLOSE_WRITE within 1000ms" {
     t.detach();
 
     // Give the watcher time to set up the watch descriptor.
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    rt.sleepNs(rt.io(), 20 * std.time.ns_per_ms);
 
     // Write valid Lua (CLOSE_WRITE fires on close).
     {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_V1);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V1 });
     }
 
     try testing.expect(waitForCount(&counter, 1, 1000));
@@ -415,13 +452,12 @@ test "(Linux) 3 writes 200ms apart → counter >= 3 within 2s of last write" {
     defer tmp.cleanup();
 
     {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_V0);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V0 });
     }
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("rules.lua", &path_buf);
+    const path_len = try tmp.dir.realPathFile(testing.io, "rules.lua", &path_buf);
+    const path = path_buf[0..path_len];
 
     var counter = std.atomic.Value(u64).init(0);
 
@@ -435,14 +471,12 @@ test "(Linux) 3 writes 200ms apart → counter >= 3 within 2s of last write" {
     }.run, .{ctx});
     t.detach();
 
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    rt.sleepNs(rt.io(), 20 * std.time.ns_per_ms);
 
     const versions = [_][]const u8{ LUA_V1, LUA_V2, LUA_V0 };
     for (versions, 0..) |ver, n| {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        try f.writeAll(ver);
-        f.close();
-        if (n < 2) std.Thread.sleep(200 * std.time.ns_per_ms);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = ver });
+        if (n < 2) rt.sleepNs(rt.io(), 200 * std.time.ns_per_ms);
     }
 
     try testing.expect(waitForCount(&counter, 3, 2000));
@@ -455,13 +489,12 @@ test "(Linux) atomic rename (tmp → rules.lua) → counter incremented within 1
     defer tmp.cleanup();
 
     {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_V0);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V0 });
     }
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("rules.lua", &path_buf);
+    const path_len = try tmp.dir.realPathFile(testing.io, "rules.lua", &path_buf);
+    const path = path_buf[0..path_len];
 
     var counter = std.atomic.Value(u64).init(0);
 
@@ -475,15 +508,13 @@ test "(Linux) atomic rename (tmp → rules.lua) → counter incremented within 1
     }.run, .{ctx});
     t.detach();
 
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    rt.sleepNs(rt.io(), 20 * std.time.ns_per_ms);
 
     // Atomic write: write to tmp then rename.
     {
-        var f = try tmp.dir.createFile("rules.lua.tmp", .{});
-        defer f.close();
-        try f.writeAll(LUA_V1);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua.tmp", .data = LUA_V1 });
     }
-    try tmp.dir.rename("rules.lua.tmp", "rules.lua");
+    try tmp.dir.rename("rules.lua.tmp", tmp.dir, "rules.lua", testing.io);
 
     try testing.expect(waitForCount(&counter, 1, 1000));
 }
@@ -495,13 +526,12 @@ test "(Linux) file deleted and recreated — watcher does not panic" {
     defer tmp.cleanup();
 
     {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_V0);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V0 });
     }
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("rules.lua", &path_buf);
+    const path_len = try tmp.dir.realPathFile(testing.io, "rules.lua", &path_buf);
+    const path = path_buf[0..path_len];
 
     var counter = std.atomic.Value(u64).init(0);
 
@@ -515,18 +545,16 @@ test "(Linux) file deleted and recreated — watcher does not panic" {
     }.run, .{ctx});
     t.detach();
 
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    rt.sleepNs(rt.io(), 20 * std.time.ns_per_ms);
 
     // Delete the file.
-    try tmp.dir.deleteFile("rules.lua");
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try tmp.dir.deleteFile(testing.io, "rules.lua");
+    rt.sleepNs(rt.io(), 50 * std.time.ns_per_ms);
 
     // Recreate it (watcher may or may not pick this up, but must not panic).
     {
-        var f = try tmp.dir.createFile("rules.lua", .{});
-        defer f.close();
-        try f.writeAll(LUA_V1);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V1 });
     }
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    rt.sleepNs(rt.io(), 100 * std.time.ns_per_ms);
     // The test passes if execution reaches here without panic.
 }

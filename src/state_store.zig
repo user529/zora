@@ -106,6 +106,14 @@ pub const StateStore = struct {
         try sqliteOk(c.sqlite3_exec(self.db, "BEGIN IMMEDIATE", null, null, null));
     }
 
+    /// Begin a deferred transaction: the write lock is taken lazily, on the
+    /// first write. A read-only or send-only transaction therefore never blocks
+    /// another worker's writer. Used to wrap a resumed coroutine segment, which
+    /// is frequently read-only.
+    pub fn beginDeferred(self: *StateStore) !void {
+        try sqliteOk(c.sqlite3_exec(self.db, "BEGIN DEFERRED", null, null, null));
+    }
+
     pub fn commit(self: *StateStore) !void {
         try sqliteOk(c.sqlite3_exec(self.db, "COMMIT", null, null, null));
     }
@@ -341,7 +349,8 @@ test "schema_version is seeded, matched on open, and mismatch is rejected" {
         var tmp = testing.tmpDir(.{});
         defer tmp.cleanup();
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const dir_path = try tmp.dir.realpath(".", &path_buf);
+        const dir_path_len = try tmp.dir.realPath(testing.io, &path_buf);
+        const dir_path = path_buf[0..dir_path_len];
         var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
         const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/v.db", .{dir_path});
 
@@ -404,7 +413,8 @@ test "3 connections on same file-based DB, concurrent reads, WAL confirmed" {
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const dir_path_len = try tmp.dir.realPath(testing.io, &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
     const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/wal.db", .{dir_path});
 
@@ -614,7 +624,8 @@ test "busy_timeout set — concurrent writers complete without BUSY error" {
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const dir_path_len = try tmp.dir.realPath(testing.io, &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
     const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/busy.db", .{dir_path});
 

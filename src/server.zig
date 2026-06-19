@@ -2,7 +2,7 @@
 ///
 /// Architecture:
 ///   - One accept thread (poll-based, honours stop flag with 10ms timeout)
-///   - One detached thread per connection
+///   - A fixed pool of handler threads draining a connection hand-off queue
 ///   - Validates method, path, and X-Telegram-Bot-Api-Secret-Token header
 ///   - Point-extracts user_id from the raw JSON body (no full parse),
 ///     routes by hashUserId % len(queues)
@@ -12,11 +12,12 @@
 ///   The raw webhook body is duplicated into a heap-allocated WorkItem and
 ///   pushed to a worker queue.  The worker frees WorkItem.body after
 ///   callOnMessage returns.  No arena is leaked.
-
-const std    = @import("std");
-const types  = @import("types.zig");
-const q_mod  = @import("queue.zig");
+const std = @import("std");
+const types = @import("types.zig");
+const q_mod = @import("queue.zig");
 const worker = @import("worker.zig");
+const metrics_mod = @import("metrics.zig");
+const rt = @import("rt.zig");
 
 const log = std.log.scoped(.server);
 
@@ -28,9 +29,10 @@ pub const MAX_BODY_BYTES: usize = 1 * 1024 * 1024;
 /// Connections beyond this limit are dropped at the accept level.
 pub const MAX_CONNECTIONS: u32 = 1024;
 
-/// Per-recv idle read timeout for accepted connections (SO_RCVTIMEO).
-/// Idle, not total: each blocking recv resets the window, so a body that keeps
-/// streaming is never cut regardless of size; only a stalled peer trips it.
+/// Idle timeout (ms) to wait for a connected client's first byte before giving
+/// up, so a peer that connects and sends nothing cannot pin a handler thread.
+/// Implemented with poll() — see waitReadable for why SO_RCVTIMEO is unusable
+/// under 0.16's blocking-Io read path. 0 disables the guard.
 pub const DEFAULT_READ_IDLE_TIMEOUT_MS: u32 = 15_000;
 
 // ---------------------------------------------------------------------------
@@ -38,67 +40,107 @@ pub const DEFAULT_READ_IDLE_TIMEOUT_MS: u32 = 15_000;
 // ---------------------------------------------------------------------------
 
 pub const ServerArgs = struct {
-    listen_addr:    std.net.Address,
+    listen_addr: std.Io.net.IpAddress,
     webhook_secret: []const u8,
     /// Slice of worker input queues.  Server routes updates by
     /// hashUserId(user_id, queues.len).  Must remain valid for the Server lifetime.
-    queues:         []*q_mod.Queue(types.WorkItem),
-    allocator:      std.mem.Allocator,
-    /// Number of reusable connection-handler threads (std.Thread.Pool).
-    pool_threads:   u8,
+    queues: []*q_mod.Queue(types.WorkItem),
+    allocator: std.mem.Allocator,
+    /// Runtime for the listener, accepted streams, sleeps, and time reads.
+    io: std.Io,
+    /// Number of reusable connection-handler threads.
+    pool_threads: u8,
     /// Per-recv idle read timeout (SO_RCVTIMEO) for accepted connections.
     /// 0 disables. Defaulted so callers need not set it.
     read_idle_timeout_ms: u32 = DEFAULT_READ_IDLE_TIMEOUT_MS,
+    /// Optional metrics sink. Null means "don't count" (tests default to null).
+    metrics: ?*metrics_mod.Metrics = null,
 };
 
 pub const Server = struct {
-    allocator:      std.mem.Allocator,
+    allocator: std.mem.Allocator,
+    io: std.Io,
     webhook_secret: []const u8,
-    queues:         []*q_mod.Queue(types.WorkItem),
-    listener:       std.net.Server,
-    stop:           std.atomic.Value(bool),
-    thread:         std.Thread,
-    active:         std.atomic.Value(u32),
-    pool:           std.Thread.Pool,
+    queues: []*q_mod.Queue(types.WorkItem),
+    listener: std.Io.net.Server,
+    stop: std.atomic.Value(bool),
+    accept_thread: std.Thread,
+    active: std.atomic.Value(u32),
+    /// Fixed handler-thread pool (std.Thread.Pool was removed in 0.16). The
+    /// accept thread pushes accepted streams to conn_queue; these threads pop
+    /// and serve them, so threads are reused rather than spawned per connection.
+    handler_threads: []std.Thread,
+    conn_queue: q_mod.Queue(std.Io.net.Stream),
     read_idle_timeout_ms: u32,
+    metrics: ?*metrics_mod.Metrics,
 
     /// Start the server.  Returns a heap-allocated Server.  Call deinit() to
     /// stop the accept loop, close the socket, and free the allocation.
     pub fn init(args: ServerArgs) !*Server {
         const self = try args.allocator.create(Server);
         errdefer args.allocator.destroy(self);
-        self.allocator      = args.allocator;
+        self.allocator = args.allocator;
+        self.io = args.io;
         self.webhook_secret = args.webhook_secret;
-        self.queues         = args.queues;
+        self.queues = args.queues;
         self.read_idle_timeout_ms = args.read_idle_timeout_ms;
+        self.metrics = args.metrics;
         // kernel_backlog 4096 matches somaxconn; default 128 caused SYN-queue
         // exhaustion warnings under burst load.
-        self.listener       = try args.listen_addr.listen(.{ .reuse_address = true, .kernel_backlog = 4096 });
-        errdefer self.listener.deinit();
-        self.stop   = std.atomic.Value(bool).init(false);
+        self.listener = try args.listen_addr.listen(args.io, .{ .reuse_address = true, .kernel_backlog = 4096 });
+        errdefer self.listener.deinit(args.io);
+        self.stop = std.atomic.Value(bool).init(false);
         self.active = std.atomic.Value(u32).init(0);
-        // Pool must be ready before the accept loop (which submits to it) starts.
-        try self.pool.init(.{ .allocator = args.allocator, .n_jobs = @as(usize, args.pool_threads), .stack_size = types.THREAD_STACK_SIZE });
-        errdefer self.pool.deinit();
-        self.thread = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, acceptLoop, .{self});
+
+        // Connection hand-off queue: accept thread pushes, handlers pop.
+        self.conn_queue = try q_mod.Queue(std.Io.net.Stream).init(args.allocator, args.io, MAX_CONNECTIONS);
+        errdefer self.conn_queue.deinit(args.allocator);
+
+        // Handler pool must be running before the accept loop (which feeds it).
+        const n_handlers = @max(@as(usize, args.pool_threads), 1);
+        self.handler_threads = try args.allocator.alloc(std.Thread, n_handlers);
+        errdefer args.allocator.free(self.handler_threads);
+        var spawned: usize = 0;
+        errdefer {
+            self.stop.store(true, .release);
+            for (self.handler_threads[0..spawned]) |t| t.join();
+        }
+        for (self.handler_threads) |*t| {
+            t.* = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, handlerLoop, .{self});
+            spawned += 1;
+        }
+
+        self.accept_thread = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, acceptLoop, .{self});
         return self;
     }
 
-    /// Signal the accept loop to exit, wait for it, drain the connection pool,
+    /// Signal the accept loop to exit, wait for it, drain the handler pool,
     /// then release resources.  Order matters: stop accepting before draining
-    /// (no new tasks), drain before freeing (tasks hold *Server).
+    /// (no new tasks), drain before freeing (handlers hold *Server).
     pub fn deinit(self: *Server) void {
         self.stop.store(true, .release);
-        self.thread.join();
-        self.pool.deinit(); // joins workers after draining the run-queue
-        self.listener.deinit();
+        self.accept_thread.join();
+        for (self.handler_threads) |t| t.join();
+        self.allocator.free(self.handler_threads);
+        // Close any streams accepted but not yet served (handlers drain first,
+        // so this is normally empty; the close keeps fds from leaking on a race).
+        while (self.conn_queue.popTimeout(0)) |stream| stream.close(self.io);
+        self.conn_queue.deinit(self.allocator);
+        self.listener.deinit(self.io);
         self.allocator.destroy(self);
     }
 
     /// The address the listening socket is actually bound to.
     /// Useful when port 0 was requested (OS assigns an ephemeral port).
-    pub fn listenAddress(self: *const Server) std.net.Address {
-        return self.listener.listen_address;
+    /// 0.16's net.Server drops listen_address, so query the socket directly.
+    pub fn listenAddress(self: *const Server) std.Io.net.IpAddress {
+        var sa: std.posix.sockaddr.in = undefined;
+        var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+        _ = std.posix.system.getsockname(self.listener.socket.handle, @ptrCast(&sa), &len);
+        return .{ .ip4 = .{
+            .bytes = @bitCast(sa.addr),
+            .port = std.mem.bigToNative(u16, sa.port),
+        } };
     }
 };
 
@@ -107,24 +149,24 @@ pub const Server = struct {
 // ---------------------------------------------------------------------------
 
 fn acceptLoop(srv: *Server) void {
-    const fd = srv.listener.stream.handle;
+    const fd = srv.listener.socket.handle;
     while (!srv.stop.load(.acquire)) {
         var pfd = std.posix.pollfd{
-            .fd      = fd,
-            .events  = std.posix.POLL.IN,
+            .fd = fd,
+            .events = std.posix.POLL.IN,
             .revents = 0,
         };
         const n = std.posix.poll(@as(*[1]std.posix.pollfd, &pfd)[0..1], 10) catch return;
         if (n == 0) continue;
         if (pfd.revents & std.posix.POLL.IN == 0) continue;
 
-        const conn = srv.listener.accept() catch |err| {
+        const stream = srv.listener.accept(srv.io) catch |err| {
             log.warn("accept: {s}", .{@errorName(err)});
             continue;
         };
         if (srv.active.load(.acquire) >= MAX_CONNECTIONS) {
             log.warn("connection limit ({d}) reached — dropping", .{MAX_CONNECTIONS});
-            conn.stream.close();
+            stream.close(srv.io);
             continue;
         }
         // Drop connections when every worker queue is at capacity to prevent
@@ -137,17 +179,17 @@ fn acceptLoop(srv: *Server) void {
         };
         if (all_saturated) {
             log.warn("all worker queues saturated — dropping connection", .{});
-            sendStatus(conn.stream, "503 Service Unavailable") catch {};
-            conn.stream.close();
+            sendStatus(srv.io, stream, "503 Service Unavailable") catch {};
+            stream.close(srv.io);
             continue;
         }
         // active is incremented here and decremented in handleConnection's defer;
-        // it bounds both concurrent handlers and the pool run-queue depth.
+        // it bounds both concurrent handlers and the conn_queue backlog.
         _ = srv.active.fetchAdd(1, .acquire);
-        srv.pool.spawn(handleConnection, .{ srv, conn }) catch |err| {
+        srv.conn_queue.push(stream) catch |err| {
             _ = srv.active.fetchSub(1, .release);
-            log.warn("connection task submit: {s}", .{@errorName(err)});
-            conn.stream.close();
+            log.warn("connection enqueue: {s}", .{@errorName(err)});
+            stream.close(srv.io);
             continue;
         };
     }
@@ -157,38 +199,53 @@ fn acceptLoop(srv: *Server) void {
 // Per-connection handler
 // ---------------------------------------------------------------------------
 
-fn handleConnection(srv: *Server, conn: std.net.Server.Connection) void {
+/// One fixed pool thread: pull accepted streams off conn_queue and serve them.
+/// After stop, drain the queue so every accepted connection is answered and its
+/// fd released before the thread exits.
+fn handlerLoop(srv: *Server) void {
+    while (!srv.stop.load(.acquire)) {
+        const stream = srv.conn_queue.popTimeout(10 * std.time.ns_per_ms) orelse continue;
+        handleConnection(srv, stream);
+    }
+    while (srv.conn_queue.popTimeout(0)) |stream| handleConnection(srv, stream);
+}
+
+fn handleConnection(srv: *Server, stream: std.Io.net.Stream) void {
     defer _ = srv.active.fetchSub(1, .release);
-    defer conn.stream.close();
-    setReadTimeout(conn.stream.handle, srv.read_idle_timeout_ms);
-    handleRequest(srv, conn.stream) catch |err| {
+    defer stream.close(srv.io);
+    handleRequest(srv, stream) catch |err| {
         log.warn("request error: {s}", .{@errorName(err)});
     };
 }
 
-/// Apply a per-recv idle timeout (SO_RCVTIMEO) so a stalled client cannot hold a
-/// pool thread indefinitely. Best-effort: a failure to set it is logged, not fatal.
-fn setReadTimeout(fd: std.posix.socket_t, timeout_ms: u32) void {
-    if (timeout_ms == 0) return;
-    const tv = std.posix.timeval{
-        .sec  = @intCast(timeout_ms / 1000),
-        .usec = @intCast((timeout_ms % 1000) * 1000),
-    };
-    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch |err| {
-        log.warn("setsockopt SO_RCVTIMEO failed: {s}", .{@errorName(err)});
-    };
+/// Wait up to `timeout_ms` for the socket to become readable, so a client that
+/// connects and sends nothing cannot hold a handler thread indefinitely.
+/// Returns true if data is ready, false on timeout/error. timeout_ms == 0 means
+/// "no idle limit" (wait forever — caller skips the gate).
+///
+/// 0.16 note: this replaces SO_RCVTIMEO. The Threaded Io does blocking recv on
+/// its worker threads and treats an EAGAIN timeout as a programmer bug (panics),
+/// so a socket read timeout cannot be set via setsockopt; poll() is the portable
+/// idle guard that works with the blocking-Io read path.
+fn waitReadable(fd: std.posix.socket_t, timeout_ms: u32) bool {
+    var pfd = std.posix.pollfd{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
+    const n = std.posix.poll(@as(*[1]std.posix.pollfd, &pfd)[0..1], @intCast(timeout_ms)) catch return false;
+    return n > 0 and (pfd.revents & std.posix.POLL.IN) != 0;
 }
 
-fn sendStatus(stream: std.net.Stream, comptime status: []const u8) !void {
-    try stream.writeAll(
+fn sendStatus(io: std.Io, stream: std.Io.net.Stream, comptime status: []const u8) !void {
+    var wbuf: [128]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll(
         "HTTP/1.1 " ++ status ++ "\r\n" ++
-        "Content-Length: 0\r\n" ++
-        "Connection: close\r\n" ++
-        "\r\n",
+            "Content-Length: 0\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
     );
+    try sw.interface.flush();
 }
 
-fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
+fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
     // Arena for the HTTP line/header scratch space, body buffer, and the
     // user_id extraction scanner.  Freed at end of function.  The body copy
     // handed to the worker is allocated separately from srv.allocator.
@@ -196,48 +253,56 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
     defer line_arena.deinit();
     const la = line_arena.allocator();
 
+    // ── Idle guard ─────────────────────────────────────────────────────────────
+    // A client that opens a connection and sends nothing must not pin a handler
+    // thread. Wait for the first byte before the (blocking) read below.
+    if (srv.read_idle_timeout_ms > 0 and !waitReadable(stream.socket.handle, srv.read_idle_timeout_ms)) {
+        try sendStatus(srv.io, stream, "400 Bad Request");
+        return;
+    }
+
     // Reader buffer.  8 KiB is enough for any well-formed HTTP request header.
     var read_buf: [8192]u8 = undefined;
-    var net_rdr = stream.reader(&read_buf);
-    const rdr   = net_rdr.interface(); // *std.io.Reader
+    var net_rdr = stream.reader(srv.io, &read_buf);
+    const rdr = &net_rdr.interface; // *std.Io.Reader
 
     // ── Request line ─────────────────────────────────────────────────────────
     // Use takeDelimiter (not takeDelimiterExclusive) so the '\n' itself is
     // consumed; takeDelimiterExclusive leaves it in the buffer, causing the
     // header loop to see an empty first line and exit immediately.
     const req_raw_opt = rdr.takeDelimiter('\n') catch {
-        sendStatus(stream, "400 Bad Request") catch {};
+        sendStatus(srv.io, stream, "400 Bad Request") catch {};
         return;
     };
     const req_raw = req_raw_opt orelse {
-        sendStatus(stream, "400 Bad Request") catch {};
+        sendStatus(srv.io, stream, "400 Bad Request") catch {};
         return;
     };
-    const req = std.mem.trimRight(u8, req_raw, "\r");
+    const req = std.mem.trimEnd(u8, req_raw, "\r");
 
     var req_parts = std.mem.splitScalar(u8, req, ' ');
-    const method  = req_parts.next() orelse "";
-    const path    = req_parts.next() orelse "";
+    const method = req_parts.next() orelse "";
+    const path = req_parts.next() orelse "";
 
     // Evaluate method/path BEFORE reading any more data (slices point into
     // read_buf; safe until the next takeDelimiter call).
     const method_ok = std.mem.eql(u8, method, "POST");
-    const path_ok   = std.mem.eql(u8, path, "/webhook");
+    const path_ok = std.mem.eql(u8, path, "/webhook");
 
     if (!method_ok or !path_ok) {
-        try sendStatus(stream, "403 Forbidden");
+        try sendStatus(srv.io, stream, "403 Forbidden");
         return;
     }
 
     // ── Headers ──────────────────────────────────────────────────────────────
     var content_length: usize = 0;
-    var secret_valid   = false;
+    var secret_valid = false;
 
     while (true) {
         // takeDelimiter returns null on clean EOF; errors break the loop.
         const maybe_raw = rdr.takeDelimiter('\n') catch break;
         const h_raw = maybe_raw orelse break;
-        const h = std.mem.trimRight(u8, h_raw, "\r");
+        const h = std.mem.trimEnd(u8, h_raw, "\r");
         if (h.len == 0) break; // blank line = end of headers
 
         if (std.ascii.startsWithIgnoreCase(h, "content-length:")) {
@@ -252,21 +317,21 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
     }
 
     if (!secret_valid) {
-        try sendStatus(stream, "403 Forbidden");
+        try sendStatus(srv.io, stream, "403 Forbidden");
         return;
     }
 
     // ── Body ─────────────────────────────────────────────────────────────────
     if (content_length > MAX_BODY_BYTES) {
         log.warn("rejected oversized body: Content-Length={d} > {d}", .{ content_length, MAX_BODY_BYTES });
-        try sendStatus(stream, "413 Request Entity Too Large");
+        try sendStatus(srv.io, stream, "413 Request Entity Too Large");
         return;
     }
 
     const body = try la.alloc(u8, content_length);
     rdr.readSliceAll(body) catch {
         log.warn("rejected request: failed to read body", .{});
-        try sendStatus(stream, "400 Bad Request");
+        try sendStatus(srv.io, stream, "400 Bad Request");
         return;
     };
 
@@ -275,7 +340,7 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
     // no identifiable sender routes to worker 0 (user_id 0).
     const user_id = extractUserId(la, body) catch {
         log.warn("rejected request: malformed JSON body", .{});
-        try sendStatus(stream, "400 Bad Request");
+        try sendStatus(srv.io, stream, "400 Bad Request");
         return;
     };
 
@@ -283,29 +348,35 @@ fn handleRequest(srv: *Server, stream: std.net.Stream) !void {
     // The WorkItem owns its body; the worker frees it after callOnMessage.
     const owned_body = srv.allocator.dupe(u8, body) catch {
         log.warn("rejected request: out of memory copying body", .{});
-        try sendStatus(stream, "500 Internal Server Error");
+        try sendStatus(srv.io, stream, "500 Internal Server Error");
         return;
     };
-    const item    = types.WorkItem{ .body = owned_body, .user_id = user_id };
-    const n       = srv.queues.len;
+    const item = types.WorkItem{ .body = owned_body, .user_id = user_id };
+    const n = srv.queues.len;
     const primary = worker.hashUserId(user_id orelse 0, @intCast(n));
-    var pushed    = false;
+    var pushed = false;
     for (0..n) |i| {
         const idx = (primary + i) % n;
         srv.queues[idx].push(item) catch continue;
-        if (i > 0) log.debug("worker {d} full — overflowed update to worker {d}", .{ primary, idx });
+        if (i > 0) {
+            // Overflow placement relaxes per-user affinity; count it so the
+            // relaxation is measurable, not silent.
+            if (srv.metrics) |m| _ = m.route_overflow_total.fetchAdd(1, .monotonic);
+            log.debug("worker {d} full — overflowed update to worker {d}", .{ primary, idx });
+        }
         pushed = true;
         break;
     }
     if (!pushed) {
+        if (srv.metrics) |m| _ = m.route_drop_total.fetchAdd(1, .monotonic);
         log.warn("all queues full — update dropped (primary={d})", .{primary});
         srv.allocator.free(owned_body);
-        try sendStatus(stream, "503 Service Unavailable");
+        try sendStatus(srv.io, stream, "503 Service Unavailable");
         return;
     }
 
     // ── Respond 200 immediately ───────────────────────────────────────────────
-    try sendStatus(stream, "200 OK");
+    try sendStatus(srv.io, stream, "200 OK");
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +497,7 @@ fn scanIdField(allocator: std.mem.Allocator, scanner: *std.json.Scanner) Extract
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const Queue   = q_mod.Queue;
+const Queue = q_mod.Queue;
 
 const TEST_SECRET = "test-webhook-secret";
 
@@ -447,9 +518,9 @@ const TestSetup = struct {
     const MAX_Q = 8;
 
     q_store: [MAX_Q]Queue(types.WorkItem),
-    q_ptrs:  [MAX_Q]*Queue(types.WorkItem),
+    q_ptrs: [MAX_Q]*Queue(types.WorkItem),
     q_count: usize,
-    srv:     *Server,
+    srv: *Server,
 
     fn init(n: usize, secret: []const u8) !*TestSetup {
         return initTimeout(n, secret, DEFAULT_READ_IDLE_TIMEOUT_MS);
@@ -461,16 +532,17 @@ const TestSetup = struct {
         errdefer testing.allocator.destroy(self);
         self.q_count = n;
         for (0..n) |i| {
-            self.q_store[i] = try Queue(types.WorkItem).init(testing.allocator, 512);
-            self.q_ptrs[i]  = &self.q_store[i];
+            self.q_store[i] = try Queue(types.WorkItem).init(testing.allocator, testing.io, 512);
+            self.q_ptrs[i] = &self.q_store[i];
         }
-        const bind_addr = try std.net.Address.parseIp4("127.0.0.2", 0);
+        const bind_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
         self.srv = try Server.init(.{
-            .listen_addr    = bind_addr,
+            .listen_addr = bind_addr,
             .webhook_secret = secret,
-            .queues         = self.q_ptrs[0..n],
-            .allocator      = testing.allocator,
-            .pool_threads   = 2,
+            .queues = self.q_ptrs[0..n],
+            .allocator = testing.allocator,
+            .io = testing.io,
+            .pool_threads = 2,
             .read_idle_timeout_ms = read_idle_timeout_ms,
         });
         return self;
@@ -486,7 +558,7 @@ const TestSetup = struct {
         testing.allocator.destroy(self);
     }
 
-    fn serverAddr(self: *const TestSetup) std.net.Address {
+    fn serverAddr(self: *const TestSetup) std.Io.net.IpAddress {
         return self.srv.listenAddress();
     }
 
@@ -497,32 +569,32 @@ const TestSetup = struct {
 
 /// Send an HTTP request and return the response status code.
 fn httpReq(
-    method:  []const u8,
-    address: std.net.Address,
-    path:    []const u8,
-    secret:  ?[]const u8,
-    body:    []const u8,
+    method: []const u8,
+    address: std.Io.net.IpAddress,
+    path: []const u8,
+    secret: ?[]const u8,
+    body: []const u8,
 ) !u16 {
-    const stream = try std.net.tcpConnectToAddress(address);
-    defer stream.close();
+    const io = testing.io;
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
 
-    // Build request headers using FixedBufferStream + GenericWriter.
-    var hdr_buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&hdr_buf);
-    const w = fbs.writer();
+    // Write the request straight to the socket's buffered writer, then flush.
+    var wbuf: [1536]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    const w = &sw.interface;
     try w.print("{s} {s} HTTP/1.1\r\nHost: localhost\r\n", .{ method, path });
     if (secret) |s| try w.print("X-Telegram-Bot-Api-Secret-Token: {s}\r\n", .{s});
     try w.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len});
-
-    try stream.writeAll(fbs.getWritten());
-    try stream.writeAll(body);
+    try w.writeAll(body);
+    try w.flush();
 
     // Read status line from response.
     var read_buf: [512]u8 = undefined;
-    var net_rdr = stream.reader(&read_buf);
-    const rdr  = net_rdr.interface();
+    var net_rdr = stream.reader(io, &read_buf);
+    const rdr = &net_rdr.interface;
     const raw_line = (try rdr.takeDelimiter('\n')) orelse return error.BadResponse;
-    const trimmed = std.mem.trimRight(u8, raw_line, "\r");
+    const trimmed = std.mem.trimEnd(u8, raw_line, "\r");
     var it = std.mem.splitScalar(u8, trimmed, ' ');
     _ = it.next(); // "HTTP/1.1"
     const code = it.next() orelse return error.BadResponse;
@@ -531,28 +603,29 @@ fn httpReq(
 
 /// Send a POST /webhook with Content-Length > MAX_BODY_BYTES but no body.
 /// Server must reject based on the header alone.
-fn httpOversizeBody(address: std.net.Address, secret: []const u8) !u16 {
-    const stream = try std.net.tcpConnectToAddress(address);
-    defer stream.close();
+fn httpOversizeBody(address: std.Io.net.IpAddress, secret: []const u8) !u16 {
+    const io = testing.io;
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
 
-    var hdr_buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&hdr_buf);
-    const w = fbs.writer();
+    var wbuf: [512]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    const w = &sw.interface;
     try w.print(
         "POST /webhook HTTP/1.1\r\n" ++
-        "X-Telegram-Bot-Api-Secret-Token: {s}\r\n" ++
-        "Content-Length: {d}\r\n" ++
-        "Connection: close\r\n\r\n",
+            "X-Telegram-Bot-Api-Secret-Token: {s}\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n\r\n",
         .{ secret, MAX_BODY_BYTES + 1 },
     );
-    try stream.writeAll(fbs.getWritten());
+    try w.flush();
     // Intentionally omit the body — server must reject before reading it.
 
     var read_buf: [512]u8 = undefined;
-    var net_rdr = stream.reader(&read_buf);
-    const rdr  = net_rdr.interface();
+    var net_rdr = stream.reader(io, &read_buf);
+    const rdr = &net_rdr.interface;
     const raw_line2 = (try rdr.takeDelimiter('\n')) orelse return error.BadResponse;
-    const trimmed2 = std.mem.trimRight(u8, raw_line2, "\r");
+    const trimmed2 = std.mem.trimEnd(u8, raw_line2, "\r");
     var it2 = std.mem.splitScalar(u8, trimmed2, ' ');
     _ = it2.next();
     const code2 = it2.next() orelse return error.BadResponse;
@@ -602,9 +675,9 @@ test "200 OK arrives within 50ms" {
     const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
-    const t0 = std.time.milliTimestamp();
+    const t0 = rt.nowMs(testing.io);
     const status = try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, VALID_UPDATE);
-    const elapsed = std.time.milliTimestamp() - t0;
+    const elapsed = rt.nowMs(testing.io) - t0;
 
     try testing.expectEqual(@as(u16, 200), status);
     try testing.expect(elapsed < 50);
@@ -638,12 +711,12 @@ test "10 simultaneous connections → all 200 OK, all updates enqueued" {
     defer ts.deinit();
 
     const ThreadCtx = struct {
-        address: std.net.Address,
-        status:  u16  = 0,
-        err:     bool = false,
+        address: std.Io.net.IpAddress,
+        status: u16 = 0,
+        err: bool = false,
     };
 
-    var ctxs:    [N]ThreadCtx  = undefined;
+    var ctxs: [N]ThreadCtx = undefined;
     var threads: [N]std.Thread = undefined;
 
     for (0..N) |i| {
@@ -755,8 +828,7 @@ test "extractUserId — message / callback_query / edge cases" {
     try testing.expectError(error.InvalidJson, extractUserId(A, "[1,2,3]"));
     // early exit: the id is found before the trailing invalid JSON is reached,
     // so the scan stops and returns the id rather than raising InvalidJson.
-    try testing.expectEqual(@as(?i64, 777), try extractUserId(A,
-        "{\"message\":{\"from\":{\"id\":777,\"junk\":NOTVALID}}}"));
+    try testing.expectEqual(@as(?i64, 777), try extractUserId(A, "{\"message\":{\"from\":{\"id\":777,\"junk\":NOTVALID}}}"));
 }
 
 test "server→worker WorkItem handoff leaks nothing under testing.allocator" {
@@ -771,8 +843,7 @@ test "server→worker WorkItem handoff leaks nothing under testing.allocator" {
         const body = try std.fmt.bufPrint(&buf,
             \\{{"update_id":{d},"message":{{"from":{{"id":{d}}}}}}}
         , .{ i + 1, i + 1 });
-        try testing.expectEqual(@as(u16, 200),
-            try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, body));
+        try testing.expectEqual(@as(u16, 200), try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, body));
     }
 
     var drained: usize = 0;
@@ -790,8 +861,7 @@ test "pool-backed server: 50 sequential connections all 200, deinit drains clean
     defer ts.deinit();
 
     for (0..50) |_| {
-        try testing.expectEqual(@as(u16, 200),
-            try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, VALID_UPDATE));
+        try testing.expectEqual(@as(u16, 200), try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, VALID_UPDATE));
     }
 
     // Reaching here (and ts.deinit returning) proves pool.deinit() drains the
@@ -803,18 +873,22 @@ test "stalled client (sends nothing) is reclaimed by the read timeout" {
     const ts = try TestSetup.initTimeout(1, TEST_SECRET, 200);
     defer ts.deinit();
 
-    // Open a connection and send nothing. The server's first recv must time
-    // out (SO_RCVTIMEO), and handleRequest's read-failure path closes the conn.
-    const stream = try std.net.tcpConnectToAddress(ts.serverAddr());
-    defer stream.close();
+    // Open a connection and send nothing.
+    // handleRequest's read-failure path closes the conn.
+    const io = testing.io;
+    var stream = try ts.serverAddr().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
 
     // Read the response: the server sends "400 Bad Request" then closes, OR the
     // peer closes (EOF). Either proves the stalled connection was reclaimed
-    // rather than held open indefinitely.
-    var read_buf: [128]u8 = undefined;
-    const t0 = std.time.milliTimestamp();
-    const n = stream.read(&read_buf) catch 0; // closed/reset counts as reclaimed
-    const elapsed = std.time.milliTimestamp() - t0;
+    // rather than held open indefinitely. readSliceShort returns short on EOF,
+    // so it unblocks as soon as the server closes the stalled connection.
+    var rbuf: [128]u8 = undefined;
+    var net_rdr = stream.reader(io, &rbuf);
+    var dest: [128]u8 = undefined;
+    const t0 = rt.nowMs(io);
+    const n = net_rdr.interface.readSliceShort(&dest) catch 0; // closed/reset counts as reclaimed
+    const elapsed = rt.nowMs(io) - t0;
 
     try testing.expect(elapsed < 5_000); // reclaimed well within the 15 s default
     _ = n;

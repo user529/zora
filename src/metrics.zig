@@ -18,6 +18,13 @@ pub const Metrics = struct {
     tracked_send_failures_total: std.atomic.Value(u64) = .init(0),
     response_oversize_total:     std.atomic.Value(u64) = .init(0), // replies over the response ceiling, dropped
 
+    // Server routing (webhook → worker-queue placement). Both counters record a
+    // relaxation of the hash(user_id)%N affinity: overflow places a user's update
+    // on a non-primary worker, drop sheds it when every queue is full. The
+    // affinity is best-effort, not a hard single-writer invariant.
+    route_overflow_total: std.atomic.Value(u64) = .init(0), // placed on a non-primary worker (primary queue full)
+    route_drop_total:     std.atomic.Value(u64) = .init(0), // dropped — all worker queues full
+
     // Throttle / reactive rate limiting
     throttle_429_total:     std.atomic.Value(u64) = .init(0), // 429s observed
     throttle_delayed_total: std.atomic.Value(u64) = .init(0), // calls parked in delay_q

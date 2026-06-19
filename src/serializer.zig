@@ -96,10 +96,12 @@ fn serializeValue(
 
         .number => {
             if (lua.isInteger(index)) {
-                const n = try lua.toInteger(index);
+                // isInteger is true here, so toInteger cannot fail.
+                const n = lua.toInteger(index) catch unreachable;
                 try appendFmtChecked(buf, allocator, "{d}", .{n}, max_size);
             } else {
-                const n = try lua.toNumber(index);
+                // The value is a number but not an integer, so toNumber cannot fail.
+                const n = lua.toNumber(index) catch unreachable;
                 if (!std.math.isFinite(n)) {
                     // NaN / ±Inf are not valid JSON — emit null
                     try appendChecked(buf, allocator, "null", max_size);
@@ -110,7 +112,8 @@ fn serializeValue(
         },
 
         .string => {
-            const s = try lua.toString(index);
+            // The switch guarantees a string value, so toString cannot fail.
+            const s = lua.toString(index) catch unreachable;
             try appendChecked(buf, allocator, "\"", max_size);
             try serializeStringContent(buf, allocator, s, max_size);
             try appendChecked(buf, allocator, "\"", max_size);
@@ -137,11 +140,11 @@ fn serializeTable(
 ) SerializeError!void {
     if (tableIsArray(lua, abs_index)) {
         try appendChecked(buf, allocator, "[", max_size);
-        const n = lua.rawLen(abs_index);
+        const n = lua.lenRaw(abs_index);
         var i: ziglua.Integer = 1;
         while (i <= @as(ziglua.Integer, @intCast(n))) : (i += 1) {
             if (i > 1) try appendChecked(buf, allocator, ",", max_size);
-            _ = lua.rawGetIndex(abs_index, i);
+            _ = lua.getIndexRaw(abs_index, i);
             try serializeValue(lua, -1, allocator, buf, depth + 1, max_size);
             lua.pop(1);
         }
@@ -157,7 +160,8 @@ fn serializeTable(
                 .string => {
                     if (!first) try appendChecked(buf, allocator, ",", max_size);
                     first = false;
-                    const k = try lua.toString(-2);
+                    // key_type is .string, so toString cannot fail.
+                    const k = lua.toString(-2) catch unreachable;
                     try appendChecked(buf, allocator, "\"", max_size);
                     try serializeStringContent(buf, allocator, k, max_size);
                     try appendChecked(buf, allocator, "\":", max_size);
@@ -169,10 +173,12 @@ fn serializeTable(
                     // Numeric key → quoted string representation in JSON
                     try appendChecked(buf, allocator, "\"", max_size);
                     if (lua.isInteger(-2)) {
-                        const k = try lua.toInteger(-2);
+                        // Guarded by isInteger; toInteger cannot fail.
+                        const k = lua.toInteger(-2) catch unreachable;
                         try appendFmtChecked(buf, allocator, "{d}", .{k}, max_size);
                     } else {
-                        const k = try lua.toNumber(-2);
+                        // A non-integer number key; toNumber cannot fail.
+                        const k = lua.toNumber(-2) catch unreachable;
                         try appendFloat(buf, allocator, k, max_size);
                     }
                     try appendChecked(buf, allocator, "\":", max_size);
@@ -193,7 +199,7 @@ fn serializeTable(
 /// Returns true iff the table at `abs_index` looks like a Lua sequence:
 /// all keys are integers in [1, rawLen] with no gaps or extras.
 fn tableIsArray(lua: *Lua, abs_index: i32) bool {
-    const n = lua.rawLen(abs_index);
+    const n = lua.lenRaw(abs_index);
     if (n == 0) return false;
 
     var count: usize = 0;
@@ -308,7 +314,7 @@ fn pushJsonValue(lua: *Lua, value: std.json.Value, depth: u32) DeserializeError!
             lua.createTable(@intCast(arr.items.len), 0);
             for (arr.items, 1..) |item, i| {
                 try pushJsonValue(lua, item, depth + 1);
-                lua.rawSetIndex(-2, @intCast(i));
+                lua.setIndexRaw(-2, @intCast(i));
             }
         },
 
@@ -319,7 +325,7 @@ fn pushJsonValue(lua: *Lua, value: std.json.Value, depth: u32) DeserializeError!
             while (it.next()) |entry| {
                 _ = lua.pushString(entry.key_ptr.*);
                 try pushJsonValue(lua, entry.value_ptr.*, depth + 1);
-                lua.rawSetTable(-3);
+                lua.setTableRaw(-3);
             }
         },
     }
@@ -346,7 +352,7 @@ fn pushNested(lua: *Lua, levels: u32) void {
         lua.createTable(0, 1);
         _ = lua.pushString("inner");
         lua.pushValue(inner);
-        lua.rawSetTable(-3);
+        lua.setTableRaw(-3);
         lua.remove(inner);
     }
 }
@@ -484,9 +490,9 @@ test "table shape maps to a JSON array or object" {
     // Sequence {10,20,30} → JSON array.
     {
         lua.createTable(3, 0);
-        lua.pushInteger(10); lua.rawSetIndex(-2, 1);
-        lua.pushInteger(20); lua.rawSetIndex(-2, 2);
-        lua.pushInteger(30); lua.rawSetIndex(-2, 3);
+        lua.pushInteger(10); lua.setIndexRaw(-2, 1);
+        lua.pushInteger(20); lua.setIndexRaw(-2, 2);
+        lua.pushInteger(30); lua.setIndexRaw(-2, 3);
         const json = try luaTableToJson(lua, -1, testing.allocator);
         defer testing.allocator.free(json);
         lua.pop(1);
@@ -498,7 +504,7 @@ test "table shape maps to a JSON array or object" {
         try testing.expect(lua.isTable(-1));
         var i: ziglua.Integer = 1;
         while (i <= 3) : (i += 1) {
-            _ = lua.rawGetIndex(-1, i);
+            _ = lua.getIndexRaw(-1, i);
             try testing.expectEqual(i, try lua.toInteger(-1));
             lua.pop(1);
         }
@@ -509,7 +515,7 @@ test "table shape maps to a JSON array or object" {
         lua.createTable(0, 1);
         _ = lua.pushString("name");
         _ = lua.pushString("bob");
-        lua.rawSetTable(-3);
+        lua.setTableRaw(-3);
         const json = try luaTableToJson(lua, -1, testing.allocator);
         defer testing.allocator.free(json);
         lua.pop(1);
@@ -518,8 +524,8 @@ test "table shape maps to a JSON array or object" {
     // Non-consecutive integer keys {[1],[3]} → object, not array.
     {
         lua.createTable(0, 2);
-        lua.pushInteger(1); _ = lua.pushString("a"); lua.rawSetTable(-3);
-        lua.pushInteger(3); _ = lua.pushString("c"); lua.rawSetTable(-3);
+        lua.pushInteger(1); _ = lua.pushString("a"); lua.setTableRaw(-3);
+        lua.pushInteger(3); _ = lua.pushString("c"); lua.setTableRaw(-3);
         const json = try luaTableToJson(lua, -1, testing.allocator);
         defer testing.allocator.free(json);
         lua.pop(1);
@@ -528,8 +534,8 @@ test "table shape maps to a JSON array or object" {
     // Mixed integer and string keys → object.
     {
         lua.createTable(0, 2);
-        lua.pushInteger(1); _ = lua.pushString("a"); lua.rawSetTable(-3);
-        _ = lua.pushString("name"); _ = lua.pushString("b"); lua.rawSetTable(-3);
+        lua.pushInteger(1); _ = lua.pushString("a"); lua.setTableRaw(-3);
+        _ = lua.pushString("name"); _ = lua.pushString("b"); lua.setTableRaw(-3);
         const json = try luaTableToJson(lua, -1, testing.allocator);
         defer testing.allocator.free(json);
         lua.pop(1);
@@ -618,7 +624,7 @@ test "enforces the size cap" {
         var i: ziglua.Integer = 1;
         while (i <= 10) : (i += 1) {
             _ = lua.pushString(&buf); // 8000 bytes each → 80 KiB total
-            lua.rawSetIndex(-2, i);
+            lua.setIndexRaw(-2, i);
         }
         try testing.expectError(error.MaxSizeExceeded, luaTableToJson(lua, -1, testing.allocator));
         lua.pop(1);
@@ -684,7 +690,7 @@ test "stack stays balanced across success and error" {
         lua.createTable(0, 1);
         _ = lua.pushString("k");
         lua.pushInteger(1);
-        lua.rawSetTable(-3);
+        lua.setTableRaw(-3);
 
         const top_before = lua.getTop();
         const json = try luaTableToJson(lua, -1, testing.allocator);
@@ -724,7 +730,7 @@ test "boolean key returns error.UnsupportedKeyType" {
     lua.createTable(0, 1);
     lua.pushBoolean(true);
     lua.pushInteger(1);
-    lua.rawSetTable(-3);
+    lua.setTableRaw(-3);
 
     try testing.expectError(error.UnsupportedKeyType, luaTableToJson(lua, -1, testing.allocator));
     lua.pop(1);

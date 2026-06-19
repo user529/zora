@@ -12,6 +12,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const queue_mod = @import("queue.zig");
 const metrics_mod = @import("metrics.zig");
+const rt = @import("rt.zig");
 
 const log = std.log.scoped(.delay);
 
@@ -30,74 +31,82 @@ fn earlier(_: void, a: DelayedCall, b: DelayedCall) std.math.Order {
 pub const DelayQueue = struct {
     const PQ = std.PriorityQueue(DelayedCall, void, earlier);
 
-    pq:       PQ,
-    mutex:    std.Thread.Mutex = .{},
-    cond:     std.Thread.Condition = .{},
-    capacity: usize,
-    seq:      u64 = 0,
+    pq:        PQ,
+    allocator: std.mem.Allocator, // 0.16 PriorityQueue is unmanaged
+    mutex:     std.Io.Mutex = .init,
+    // Bumped on every push; waiters block on it with a timeout. Replaces the
+    // 0.16-removed Condition.timedWait — same futex primitive, with a deadline.
+    wake:      std.atomic.Value(u32) = .init(0),
+    io:        std.Io,
+    capacity:  usize,
+    seq:       u64 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, capacity: usize) DelayQueue {
-        return .{ .pq = PQ.init(allocator, {}), .capacity = capacity };
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, capacity: usize) DelayQueue {
+        return .{ .pq = .empty, .allocator = allocator, .io = io, .capacity = capacity };
     }
 
     /// Free any held ApiCalls, then release the heap. Call on shutdown only.
     pub fn deinitDrain(self: *DelayQueue, allocator: std.mem.Allocator) void {
-        while (self.pq.removeOrNull()) |dc| types.freeApiCall(dc.call, allocator);
-        self.pq.deinit();
+        while (self.pq.pop()) |dc| types.freeApiCall(dc.call, allocator);
+        self.pq.deinit(allocator);
     }
 
     /// Park `call` until `ready_at_ms`. error.Full when at capacity (caller
     /// then logs + frees). Assigns a monotonic seq for stable FIFO.
     pub fn push(self: *DelayQueue, ready_at_ms: i64, call: types.ApiCall) error{Full}!void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.pq.count() >= self.capacity) return error.Full;
-        self.pq.add(.{ .ready_at_ms = ready_at_ms, .seq = self.seq, .call = call }) catch
+        self.pq.push(self.allocator, .{ .ready_at_ms = ready_at_ms, .seq = self.seq, .call = call }) catch
             return error.Full; // OOM ⇒ treat as full
         self.seq += 1;
-        self.cond.signal();
+        // Wake the consumer; bump first so an about-to-wait consumer skips it.
+        _ = self.wake.fetchAdd(1, .release);
+        self.io.futexWake(u32, &self.wake.raw, 1);
     }
 
     /// Pop the earliest call if it is due at `now_ms`, else null.
     pub fn popReady(self: *DelayQueue, now_ms: i64) ?types.ApiCall {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const top = self.pq.peek() orelse return null;
         if (top.ready_at_ms > now_ms) return null;
-        return self.pq.remove().call;
+        return self.pq.pop().?.call;
     }
 
     /// Block until the next call is due, a new earlier call is pushed, or
     /// `max_ns` elapses (so the caller can re-check a stop flag).
     pub fn waitNext(self: *DelayQueue, now_ms: i64, max_ns: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
         var wait_ns: u64 = max_ns;
         if (self.pq.peek()) |top| {
-            if (top.ready_at_ms <= now_ms) return; // due now — don't sleep
+            if (top.ready_at_ms <= now_ms) {
+                self.mutex.unlock(self.io);
+                return; // due now — don't sleep
+            }
             // Guarded above (top is strictly in the future); both are epoch-ms, so the
             // difference is positive and the cast is safe.
             const diff_ms: u64 = @intCast(top.ready_at_ms - now_ms);
             wait_ns = @min(max_ns, diff_ms *| std.time.ns_per_ms);
         }
-        self.cond.timedWait(&self.mutex, wait_ns) catch {};
-    }
-
-    /// Current number of items in the delay heap (snapshot, may be stale).
-    pub fn count(self: *DelayQueue) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.pq.count();
+        // Snapshot the wake counter under the lock, release, then wait for a
+        // push (counter change) or the deadline — whichever comes first.
+        const s = self.wake.load(.acquire);
+        self.mutex.unlock(self.io);
+        self.io.futexWaitTimeout(u32, &self.wake.raw, s, .{
+            .duration = .{ .raw = .fromNanoseconds(@intCast(wait_ns)), .clock = .awake },
+        }) catch {};
     }
 };
 
 /// chat_id → unblock-at ms. Lookups prune expired entries to bound memory.
 pub const BlockedMap = struct {
     map:   std.AutoHashMap(i64, i64),
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
+    io:    std.Io,
 
-    pub fn init(allocator: std.mem.Allocator) BlockedMap {
-        return .{ .map = std.AutoHashMap(i64, i64).init(allocator) };
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) BlockedMap {
+        return .{ .map = std.AutoHashMap(i64, i64).init(allocator), .io = io };
     }
 
     pub fn deinit(self: *BlockedMap) void {
@@ -107,16 +116,16 @@ pub const BlockedMap = struct {
     /// Mark `chat_id` blocked until `until_ms`. Best-effort: an OOM on insert
     /// leaves the chat unblocked rather than failing the caller.
     pub fn block(self: *BlockedMap, chat_id: i64, until_ms: i64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.map.put(chat_id, until_ms) catch {};
     }
 
     /// Return the unblock time if `chat_id` is still blocked at `now_ms`, else
     /// null — removing the entry when its window has passed.
     pub fn blockedUntil(self: *BlockedMap, chat_id: i64, now_ms: i64) ?i64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const until = self.map.get(chat_id) orelse return null;
         if (until > now_ms) return until;
         _ = self.map.remove(chat_id);
@@ -137,7 +146,7 @@ pub const RequeueArgs = struct {
 /// `stop` responsive.
 pub fn requeueThread(args: RequeueArgs) void {
     while (!args.stop.load(.acquire)) {
-        const now = std.time.milliTimestamp();
+        const now = rt.nowMs(args.delay_q.io);
         while (args.delay_q.popReady(now)) |call| {
             args.disp_q.push(call) catch {
                 // disp_q full — drop (rare). Count as shed.
@@ -147,7 +156,7 @@ pub fn requeueThread(args: RequeueArgs) void {
             };
             if (args.metrics) |m| _ = m.throttle_delay_depth.fetchSub(1, .monotonic);
         }
-        args.delay_q.waitNext(std.time.milliTimestamp(), 50 * std.time.ns_per_ms);
+        args.delay_q.waitNext(rt.nowMs(args.delay_q.io), 50 * std.time.ns_per_ms);
     }
     log.info("requeue thread stopped", .{});
 }
@@ -163,7 +172,7 @@ fn dummyCall(allocator: std.mem.Allocator, chat_id: i64) !types.ApiCall {
 }
 
 test "DelayQueue popReady orders by ready_at then seq and respects ready time" {
-    var dq = DelayQueue.init(testing.allocator, 16);
+    var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
     defer dq.deinitDrain(testing.allocator);
 
     // Same ready_at for chat 1 then chat 2 (push order), earlier ready_at for chat 3.
@@ -187,7 +196,7 @@ test "DelayQueue popReady orders by ready_at then seq and respects ready time" {
 }
 
 test "DelayQueue push past capacity returns error.Full" {
-    var dq = DelayQueue.init(testing.allocator, 2);
+    var dq = DelayQueue.init(testing.allocator, rt.io(), 2);
     defer dq.deinitDrain(testing.allocator);
     try dq.push(10, try dummyCall(testing.allocator, 1));
     try dq.push(10, try dummyCall(testing.allocator, 2));
@@ -197,14 +206,14 @@ test "DelayQueue push past capacity returns error.Full" {
 }
 
 test "DelayQueue deinitDrain frees held calls (no leak)" {
-    var dq = DelayQueue.init(testing.allocator, 16);
+    var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
     try dq.push(10, try dummyCall(testing.allocator, 1));
     try dq.push(20, try dummyCall(testing.allocator, 2));
     dq.deinitDrain(testing.allocator); // must free both — leak check via testing allocator
 }
 
 test "BlockedMap returns window while blocked, prunes when expired" {
-    var bm = BlockedMap.init(testing.allocator);
+    var bm = BlockedMap.init(testing.allocator, rt.io());
     defer bm.deinit();
 
     bm.block(42, 1000);
@@ -215,9 +224,9 @@ test "BlockedMap returns window while blocked, prunes when expired" {
 }
 
 test "requeueThread moves a due call to disp_q after its delay" {
-    var disp = try queue_mod.Queue(types.ApiCall).init(testing.allocator, 16);
+    var disp = try queue_mod.Queue(types.ApiCall).init(testing.allocator, rt.io(), 16);
     defer disp.deinit(testing.allocator);
-    var dq = DelayQueue.init(testing.allocator, 16);
+    var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
     defer dq.deinitDrain(testing.allocator);
     var stop = std.atomic.Value(bool).init(false);
 
@@ -226,7 +235,7 @@ test "requeueThread moves a due call to disp_q after its delay" {
         .metrics = null, .allocator = testing.allocator,
     }});
 
-    const now = std.time.milliTimestamp();
+    const now = rt.nowMs(rt.io());
     try dq.push(now + 100, try dummyCall(testing.allocator, 1));
 
     // Not delivered before its ready time.

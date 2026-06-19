@@ -15,6 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ziglua = @import("ziglua");
 const watcher = @import("watcher.zig");
+const rt = @import("rt.zig");
 
 const Lua = ziglua.Lua;
 const log = std.log.scoped(.schema);
@@ -63,8 +64,8 @@ pub const SchemaStore = struct {
     }
 
     /// Read and parse `path` into a heap-allocated SchemaStore.
-    pub fn fromFile(gpa: std.mem.Allocator, path: []const u8) !*SchemaStore {
-        const bytes = try std.fs.cwd().readFileAlloc(gpa, path, MAX_SCHEMA_BYTES);
+    pub fn fromFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !*SchemaStore {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(MAX_SCHEMA_BYTES));
         defer gpa.free(bytes);
         return fromSlice(gpa, bytes);
     }
@@ -189,11 +190,12 @@ pub const SchemaSlot = struct {
     current: std.atomic.Value(?*SchemaStore) = .init(null),
     version: std.atomic.Value(u64) = .init(0),
     failures: std.atomic.Value(u64) = .init(0),
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
+    io: std.Io,
     retired: std.ArrayListUnmanaged(*SchemaStore) = .empty,
 
-    pub fn init(gpa: std.mem.Allocator) SchemaSlot {
-        return .{ .gpa = gpa };
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) SchemaSlot {
+        return .{ .gpa = gpa, .io = io };
     }
 
     /// Current schema, or null when none is loaded (Tier-0). Lock-free.
@@ -203,8 +205,8 @@ pub const SchemaSlot = struct {
 
     /// Swap in `new_store`, retire the previous one, bump `version`.
     pub fn install(self: *SchemaSlot, new_store: *SchemaStore) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const old = self.current.swap(new_store, .release);
         if (old) |o| self.retired.append(self.gpa, o) catch {
             // OOM: cannot defer this free to deinit; free it immediately so
@@ -221,9 +223,9 @@ pub const SchemaSlot = struct {
         // Swap current to null under the mutex so a concurrent install() that
         // hasn't been stopped yet cannot displace the same pointer into retired
         // after deinit has already freed it (double-free).
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const c = self.current.swap(null, .release);
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         if (c) |store| store.destroy(self.gpa);
         for (self.retired.items) |r| r.destroy(self.gpa);
         self.retired.deinit(self.gpa);
@@ -233,7 +235,7 @@ pub const SchemaSlot = struct {
 /// Parse `path` at startup and install it. On any failure, log a warning and
 /// leave the slot empty — the process runs in Tier-0 (no validation).
 pub fn loadInitial(slot: *SchemaSlot, path: []const u8) void {
-    const store = SchemaStore.fromFile(slot.gpa, path) catch |err| {
+    const store = SchemaStore.fromFile(slot.gpa, slot.io, path) catch |err| {
         log.warn(
             "schema '{s}': {s} — running without validation (Tier-0)",
             .{ path, @errorName(err) },
@@ -257,11 +259,12 @@ const SchemaWatchCtx = struct {
 
 fn onSchemaChange(context: *anyopaque) void {
     const ctx: *SchemaWatchCtx = @alignCast(@ptrCast(context));
-    const store = SchemaStore.fromFile(ctx.slot.gpa, ctx.path) catch |err| {
-        _ = ctx.slot.failures.fetchAdd(1, .release);
+    const store = SchemaStore.fromFile(ctx.slot.gpa, ctx.slot.io, ctx.path) catch |err| {
+        // fetchAdd returns the previous value; +1 is the count including this failure.
+        const n_failures = ctx.slot.failures.fetchAdd(1, .release) + 1;
         log.warn(
-            "schema reload failed ({s}) — keeping previous schema",
-            .{@errorName(err)},
+            "schema reload failed ({s}) — keeping previous schema ({d} failed reloads since start)",
+            .{ @errorName(err), n_failures },
         );
         return;
     };
@@ -295,7 +298,9 @@ pub fn schemaWatcherThread(args: SchemaWatcherArgs) void {
     switch (builtin.os.tag) {
         .linux => watcher.watchInotify(target),
         .freebsd => watcher.watchKqueue(target),
-        else => watcher.watchPoll(target, 500, null),
+        // Linux and FreeBSD are the only supported targets; fail the build
+        // rather than ship a watcher that silently does nothing.
+        else => @compileError("schema watcher: unsupported OS (Linux and FreeBSD only)"),
     }
 }
 
@@ -344,7 +349,7 @@ test "fromSlice parses a schema and rejects malformed JSON" {
 /// and return the absolute stack index of `p` (pushed on top).
 fn pushParams(lua: *Lua, table_literal: [:0]const u8) !i32 {
     try lua.doString(table_literal); // e.g. "p = { chat_id = 1, text = 'x' }"
-    _ = try lua.getGlobal("p");
+    _ = lua.getGlobal("p");
     return lua.getTop();
 }
 
@@ -412,7 +417,7 @@ test "validate accepts valid calls and rejects bad ones" {
 }
 
 test "SchemaSlot with no schema → get() is null (Tier-0)" {
-    var slot = SchemaSlot.init(testing.allocator);
+    var slot = SchemaSlot.init(testing.allocator, testing.io);
     defer slot.deinit();
     try testing.expect(slot.get() == null);
     try testing.expectEqual(@as(u64, 0), slot.version.load(.acquire));
@@ -422,14 +427,13 @@ test "loadInitial reads a file; install swaps and retires" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     {
-        var f = try tmp.dir.createFile("s.json", .{});
-        defer f.close();
-        try f.writeAll(FIXTURE_SCHEMA);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "s.json", .data = FIXTURE_SCHEMA });
     }
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("s.json", &path_buf);
+    const path_len = try tmp.dir.realPathFile(testing.io, "s.json", &path_buf);
+    const path = path_buf[0..path_len];
 
-    var slot = SchemaSlot.init(testing.allocator);
+    var slot = SchemaSlot.init(testing.allocator, testing.io);
     defer slot.deinit();
 
     loadInitial(&slot, path);
@@ -445,7 +449,7 @@ test "loadInitial reads a file; install swaps and retires" {
 }
 
 test "loadInitial on a missing file leaves the slot empty" {
-    var slot = SchemaSlot.init(testing.allocator);
+    var slot = SchemaSlot.init(testing.allocator, testing.io);
     defer slot.deinit();
     loadInitial(&slot, "/nonexistent/zora-no-such-schema.json");
     try testing.expect(slot.get() == null);
@@ -458,14 +462,13 @@ test "schema watcher hot-reloads; a broken file is rejected" {
 
     // Initial schema: sendMessage only.
     {
-        var f = try tmp.dir.createFile("s.json", .{});
-        defer f.close();
-        try f.writeAll(FIXTURE_SCHEMA);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "s.json", .data = FIXTURE_SCHEMA });
     }
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath("s.json", &path_buf);
+    const path_len = try tmp.dir.realPathFile(testing.io, "s.json", &path_buf);
+    const path = path_buf[0..path_len];
 
-    var slot = SchemaSlot.init(testing.allocator);
+    var slot = SchemaSlot.init(testing.allocator, testing.io);
     defer slot.deinit();
     loadInitial(&slot, path);
 
@@ -473,7 +476,7 @@ test "schema watcher hot-reloads; a broken file is rejected" {
     var stop = std.atomic.Value(bool).init(false);
     const t = try std.Thread.spawn(.{}, struct {
         fn run(target: watcher.WatchTarget, stp: *std.atomic.Value(bool)) void {
-            watcher.watchPoll(target, 50, stp);
+            watcher.watchPoll(target, testing.io, 50, stp);
         }
     }.run, .{
         watcher.WatchTarget{ .path = path, .context = &ctx, .on_write = onSchemaChange },
@@ -484,36 +487,32 @@ test "schema watcher hot-reloads; a broken file is rejected" {
         t.join();
     }
 
-    std.Thread.sleep(120 * std.time.ns_per_ms); // record initial mtime
+    rt.sleepNs(rt.io(), 120 * std.time.ns_per_ms); // record initial mtime
 
     // Valid reload: add a method.
     {
-        var f = try tmp.dir.createFile("s.json", .{});
-        defer f.close();
-        try f.writeAll(
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "s.json", .data =
             \\{"methods":{"sendMessage":{"fields":[]},"newMethod":{"fields":[]}},"types":{}}
-        );
+        });
     }
     {
-        const deadline = std.time.milliTimestamp() + 2000;
+        const deadline = rt.nowMs(rt.io()) + 2000;
         while (slot.version.load(.acquire) < 2) {
-            if (std.time.milliTimestamp() >= deadline) return error.TestReloadTimeout;
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            if (rt.nowMs(rt.io()) >= deadline) return error.TestReloadTimeout;
+            rt.sleepNs(rt.io(), 10 * std.time.ns_per_ms);
         }
     }
     try testing.expect(slot.get().?.method("newMethod") != null);
 
     // Broken reload: failures bump, version stays, old schema retained.
     {
-        var f = try tmp.dir.createFile("s.json", .{});
-        defer f.close();
-        try f.writeAll("{ this is not json");
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "s.json", .data = "{ this is not json" });
     }
     {
-        const deadline = std.time.milliTimestamp() + 2000;
+        const deadline = rt.nowMs(rt.io()) + 2000;
         while (slot.failures.load(.acquire) < 1) {
-            if (std.time.milliTimestamp() >= deadline) return error.TestFailureTimeout;
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            if (rt.nowMs(rt.io()) >= deadline) return error.TestFailureTimeout;
+            rt.sleepNs(rt.io(), 10 * std.time.ns_per_ms);
         }
     }
     try testing.expectEqual(@as(u64, 2), slot.version.load(.acquire));
