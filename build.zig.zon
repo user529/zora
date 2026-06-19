@@ -1,6 +1,7 @@
 .{
     .name = .zora,
-    .version = "0.1.0",
+    .version = "0.6.0",
+    .minimum_zig_version = "0.16.0",
     .fingerprint = 0x41f159434ef1c409,
     .paths = .{
         "build.zig",
@@ -12,8 +13,8 @@
     },
     .dependencies = .{
         .ziglua = .{
-            .url = "https://github.com/natecraddock/ziglua/archive/refs/tags/0.6.0.tar.gz",
-            .hash = "zlua-0.1.0-hGRpCww-BQCx3cX6zbKWfTgOx6B7Peo4P17RK2hm7-xV",
+            .url = "https://github.com/natecraddock/ziglua/archive/refs/heads/main.tar.gz",
+            .hash = "zlua-0.1.0-hGRpCwGVBQCZRZ2QEHLENoYjRj-nNjD500_BmMsXeqT4",
         },
     },
 }
