@@ -21,6 +21,8 @@ const state_store = @import("state_store.zig");
 const serializer = @import("serializer.zig");
 const types = @import("types.zig");
 const io_pool = @import("io_pool.zig");
+const rt = @import("rt.zig");
+const scheduler = @import("scheduler.zig");
 
 const Lua = ziglua.Lua;
 
@@ -47,6 +49,10 @@ pub const ApiCtx = struct {
     /// Read and cleared by lua_engine.startHandler / resumeHandler after
     /// resumeThread returns .yield.  Null at all other times.
     pending_job: ?PendingJob = null,
+    /// Set by main.zig so bot.schedule_* can wake the timer after inserting a
+    /// job. Null in unit tests — the insert still works, the timer just relies
+    /// on its wait cap to notice the new row.
+    scheduler: ?*scheduler.Scheduler = null,
 };
 
 const REGISTRY_KEY: [:0]const u8 = "_zora_ctx";
@@ -134,6 +140,10 @@ pub fn register(lua: *Lua, ctx: *ApiCtx, rules_api_version: u32) void {
         .{ .name = "get_global",     .func = botGetGlobal },
         .{ .name = "set_global",     .func = botSetGlobal },
         .{ .name = "log",            .func = botLog },
+        .{ .name = "now_ms",         .func = botNowMs },
+        .{ .name = "schedule_at",    .func = botScheduleAt },
+        .{ .name = "schedule_after", .func = botScheduleAfter },
+        .{ .name = "unschedule",     .func = botUnschedule },
         .{ .name = "emit",           .func = botEmit },
         .{ .name = "url_encode",     .func = botUrlEncode },
         .{ .name = "shell_quote",    .func = botShellQuote },
@@ -513,6 +523,95 @@ fn botSetGlobal(state: ?*ziglua.LuaState) callconv(.c) c_int {
 }
 
 // ---------------------------------------------------------------------------
+// bot.now_ms() -> integer  (epoch ms; the sandbox has no os.time)
+// ---------------------------------------------------------------------------
+
+fn botNowMs(state: ?*ziglua.LuaState) callconv(.c) c_int {
+    const lua: *Lua = @ptrCast(state.?);
+    const ctx = getCtx(lua);
+    lua.pushInteger(@intCast(rt.nowMs(ctx.io)));
+    return 1;
+}
+
+/// Serialize the `payload` field of the arg table at stack index 1, insert a
+/// row with `fire_at_ms`, wake the scheduler if wired, and push the new id.
+/// Shared by botScheduleAt and botScheduleAfter.
+///
+/// json is freed explicitly on both the error path (before raiseErrorStr) and
+/// the success path — never via defer, because raiseErrorStr calls lua_error
+/// (longjmp) which skips any Zig defer in this frame.
+fn scheduleInsertCommon(lua: *Lua, ctx: *ApiCtx, fire_at_ms: i64) c_int {
+    // payload is optional; default to "{}" when absent or nil.
+    // The three raiseErrorStr calls in this expression fire BEFORE json exists,
+    // so no allocation is held at those points — no free needed there.
+    const ptype = lua.getField(1, "payload");
+    const json: []u8 = if (ptype == .table)
+        serializer.luaTableToJsonCapped(lua, lua.getTop(), ctx.allocator, ctx.json_max_bytes) catch |err| {
+            lua.raiseErrorStr("schedule: payload serialize error: %s", .{@errorName(err).ptr});
+        }
+    else if (ptype == .nil)
+        ctx.allocator.dupe(u8, "{}") catch lua.raiseErrorStr("schedule: OOM", .{})
+    else
+        lua.raiseErrorStr("schedule: payload must be a table", .{});
+    lua.pop(1); // pop the payload field
+
+    const id = ctx.db.scheduleInsert(fire_at_ms, json) catch |err| {
+        ctx.allocator.free(json); // free before longjmp; defer would be skipped
+        lua.raiseErrorStr("schedule: db error: %s", .{@errorName(err).ptr});
+    };
+    ctx.allocator.free(json); // success path (raiseErrorStr above is noreturn)
+    if (ctx.scheduler) |s| s.wakeUp();
+    lua.pushInteger(@intCast(id));
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// bot.schedule_at{ at_ms = integer, payload = table? } -> id
+// ---------------------------------------------------------------------------
+
+fn botScheduleAt(state: ?*ziglua.LuaState) callconv(.c) c_int {
+    const lua: *Lua = @ptrCast(state.?);
+    lua.checkType(1, .table);
+    const ctx = getCtx(lua);
+    _ = lua.getField(1, "at_ms");
+    const at_ms = lua.toInteger(-1) catch lua.raiseErrorStr("schedule_at: at_ms must be an integer", .{});
+    lua.pop(1);
+    return scheduleInsertCommon(lua, ctx, at_ms);
+}
+
+// ---------------------------------------------------------------------------
+// bot.schedule_after{ seconds = number(>=0), payload = table? } -> id
+// ---------------------------------------------------------------------------
+
+fn botScheduleAfter(state: ?*ziglua.LuaState) callconv(.c) c_int {
+    const lua: *Lua = @ptrCast(state.?);
+    lua.checkType(1, .table);
+    const ctx = getCtx(lua);
+    _ = lua.getField(1, "seconds");
+    const seconds = lua.toNumber(-1) catch lua.raiseErrorStr("schedule_after: seconds must be a number", .{});
+    lua.pop(1);
+    if (!std.math.isFinite(seconds) or seconds < 0)
+        lua.raiseErrorStr("schedule_after: seconds must be a finite number >= 0", .{});
+    const fire_at_ms = rt.nowMs(ctx.io) +| std.math.lossyCast(i64, seconds * 1000.0);
+    return scheduleInsertCommon(lua, ctx, fire_at_ms);
+}
+
+// ---------------------------------------------------------------------------
+// bot.unschedule(id: integer) -> boolean
+// ---------------------------------------------------------------------------
+
+fn botUnschedule(state: ?*ziglua.LuaState) callconv(.c) c_int {
+    const lua: *Lua = @ptrCast(state.?);
+    const ctx = getCtx(lua);
+    const id = lua.checkInteger(1);
+    const removed = ctx.db.scheduleDelete(@intCast(id)) catch |err| {
+        lua.raiseErrorStr("unschedule: db error: %s", .{@errorName(err).ptr});
+    };
+    lua.pushBoolean(removed);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
 // bot.log(level: string, message: string)
 // ---------------------------------------------------------------------------
 
@@ -542,7 +641,7 @@ fn botLog(state: ?*ziglua.LuaState) callconv(.c) c_int {
 //
 // `bot.emit{ method = ..., params = {...} }` appends an API-call table to a
 // per-invocation accumulator held in the Lua registry.  lua_engine drains the
-// accumulator after on_message returns: emitted calls are dispatched in call
+// accumulator after on_message returns, dispatching the emitted calls in call
 // order, before the on_message return-list.
 // ---------------------------------------------------------------------------
 
@@ -1089,6 +1188,53 @@ test "validateHeaderValue accepts text, rejects CR/LF/NUL" {
     try testing.expectError(error.BadValueByte, validateHeaderValue("a\x00b"));
 }
 
+test "bot.schedule_after / schedule_at / unschedule / now_ms" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    var ctx = testCtx(&db);
+
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+
+    lua.openBase();
+    register(lua, &ctx, 1);
+
+    // schedule_after returns an integer id and inserts a row.
+    try lua.doString(
+        \\id = bot.schedule_after{ seconds = 0, payload = { n = 1 } }
+        \\assert(type(id) == "number", "id must be a number")
+        \\assert(bot.unschedule(id) == true, "unschedule should remove the row")
+        \\assert(bot.unschedule(id) == false, "second unschedule should be false")
+    );
+
+    // Negative seconds must be rejected with a Lua error.
+    {
+        const result = lua.doString(
+            \\bot.schedule_after{ seconds = -1, payload = {} }
+        );
+        if (result) |_| return error.TestExpectedLuaError else |_| {}
+    }
+
+    // Non-finite seconds: NaN (0/0) must be rejected — not a crash.
+    {
+        const r = lua.doString("bot.schedule_after{ seconds = 0/0, payload = {} }");
+        if (r) |_| return error.TestExpectedLuaError else |_| {}
+    }
+
+    // Non-finite seconds: +inf (1/0) must be rejected — not a crash.
+    {
+        const r = lua.doString("bot.schedule_after{ seconds = 1/0, payload = {} }");
+        if (r) |_| return error.TestExpectedLuaError else |_| {}
+    }
+
+    // schedule_at accepts a past instant; now_ms returns a usable integer.
+    try lua.doString(
+        \\local a = bot.schedule_at{ at_ms = bot.now_ms() - 5000, payload = {} }
+        \\assert(type(a) == "number")
+    );
+}
+
 test "state round-trips through bot.*" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
@@ -1340,6 +1486,13 @@ fn testCtx(db: *state_store.StateStore) ApiCtx {
     return testCtxCap(db, 1048576);
 }
 
+/// Run `src` and assert it raises a Lua error. Fails the test if the chunk
+/// runs cleanly. Shared by the bad-arg validation tests, which all assert a
+/// rejected argument surfaces as a Lua-level error (not a Zig log.err).
+fn expectLuaError(lua: *Lua, src: [:0]const u8) !void {
+    if (lua.doString(src)) |_| return error.TestExpectedLuaError else |_| {}
+}
+
 test "json.decode handles valid, oversized, and malformed input" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
@@ -1503,7 +1656,7 @@ test "bot.send_message produces a tracked send with merged opts" {
             \\end
         );
 
-        const outcome = try engine.startHandler("{}", 7, 3, testing.allocator);
+        const outcome = try engine.startHandler("{}", 7, 3, testing.allocator, "on_message", null);
         switch (outcome) {
             .yielded => |y| {
                 defer lua_engine_mod.teardownCoro(engine.lua, y.handle);
@@ -1545,7 +1698,7 @@ test "bot.send_message produces a tracked send with merged opts" {
             \\end
         );
 
-        const outcome = try engine.startHandler("{}", 1, 0, testing.allocator);
+        const outcome = try engine.startHandler("{}", 1, 0, testing.allocator, "on_message", null);
         switch (outcome) {
             .yielded => |y| {
                 defer lua_engine_mod.teardownCoro(engine.lua, y.handle);
@@ -1561,4 +1714,181 @@ test "bot.send_message produces a tracked send with merged opts" {
             else => return error.ExpectedYield,
         }
     }
+}
+
+test "state setters/getters reject bad arguments with a Lua error" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    var ctx = testCtx(&db);
+
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+
+    lua.openBase();
+    register(lua, &ctx, 1);
+
+    // Non-integer ids: checkInteger rejects a string.
+    try expectLuaError(lua, "bot.set_user_state(\"x\", {})");
+    try expectLuaError(lua, "bot.get_chat_state(\"x\")");
+    try expectLuaError(lua, "bot.set_chat_state(\"x\", {})");
+
+    // Setters require a table as the second argument: checkType rejects a string.
+    try expectLuaError(lua, "bot.set_user_state(1, \"not a table\")");
+    try expectLuaError(lua, "bot.set_chat_state(1, \"not a table\")");
+
+    // Global key/value must be strings: checkString rejects nil/absent args.
+    try expectLuaError(lua, "bot.get_global()");
+    try expectLuaError(lua, "bot.set_global(\"k\")");
+    try expectLuaError(lua, "bot.set_global()");
+}
+
+test "buildApiCall handles __file_bytes and requires filename" {
+    const alloc = testing.allocator;
+    var db = try state_store.StateStore.open(alloc, ":memory:");
+    defer db.close();
+
+    var lua = try Lua.init(alloc);
+    defer lua.deinit();
+    lua.openBase();
+
+    var ctx = testCtx(&db);
+    register(lua, &ctx, 1);
+
+    // { photo = { __file_bytes = "...", filename = "x.bin" } } → one multipart part.
+    {
+        lua.newTable();                       // params
+        lua.newTable();                       // descriptor
+        _ = lua.pushString("\x01\x02\x03");
+        lua.setField(-2, "__file_bytes");     // descriptor.__file_bytes
+        _ = lua.pushString("x.bin");
+        lua.setField(-2, "filename");         // descriptor.filename
+        lua.setField(-2, "photo");            // params.photo = descriptor
+        const params_idx: i32 = lua.getTop();
+
+        const call = try buildApiCall(lua, params_idx, "sendDocument", &ctx);
+        defer types.freeApiCall(call, alloc);
+        lua.setTop(0);
+
+        try testing.expectEqualStrings("sendDocument", call.method);
+        switch (call.payload) {
+            .multipart => |parts| {
+                try testing.expectEqual(@as(usize, 1), parts.len);
+                try testing.expectEqualStrings("photo", parts[0].name);
+                try testing.expectEqualStrings("\x01\x02\x03", parts[0].content);
+                try testing.expectEqualStrings("x.bin", parts[0].filename.?);
+            },
+            .json => return error.ExpectedMultipart,
+        }
+    }
+    // __file_bytes without filename → error.MissingFilename.
+    {
+        lua.newTable();                       // params
+        lua.newTable();                       // descriptor (no filename)
+        _ = lua.pushString("\x01\x02\x03");
+        lua.setField(-2, "__file_bytes");
+        lua.setField(-2, "photo");
+        const params_idx: i32 = lua.getTop();
+
+        try testing.expectError(error.MissingFilename, buildApiCall(lua, params_idx, "sendDocument", &ctx));
+        lua.setTop(0);
+    }
+}
+
+test "headerIndex resolves response headers case-insensitively" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    var ctx = testCtx(&db);
+
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+
+    lua.openBase();
+    register(lua, &ctx, 1);
+
+    // Build a verbatim-keyed table and attach the shared header metatable, then
+    // confirm a differently-cased lookup hits the same value and a missing key
+    // reads back nil.
+    lua.newTable();
+    _ = lua.pushString("application/json");
+    lua.setField(-2, "Content-Type");
+    attachHeaderMetatable(lua);
+    lua.setGlobal("h");
+
+    try lua.doString(
+        \\assert(h["content-type"] == "application/json",
+        \\       "case-insensitive lookup failed: " .. tostring(h["content-type"]))
+        \\assert(h["CONTENT-TYPE"] == "application/json", "upper-case lookup failed")
+        \\assert(h["Content-Type"] == "application/json", "verbatim lookup failed")
+        \\assert(h["X-Missing"] == nil, "missing header should read nil")
+    );
+}
+
+test "bot.send_message rejects missing required fields" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    var ctx = testCtx(&db);
+
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+
+    lua.openBase();
+    register(lua, &ctx, 1);
+
+    // Missing chat_id and missing text each raise a Lua error. The send yields
+    // on success, so reaching the yield would mean the field passed validation;
+    // a raised error before the yield is the rejection we want.
+    try expectLuaError(lua, "bot.send_message{ text = \"x\" }");
+    try expectLuaError(lua, "bot.send_message{ chat_id = 1 }");
+}
+
+test "http_request/exec/shell reject bad arguments" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    var ctx = testCtx(&db);
+
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+
+    lua.openBase();
+    register(lua, &ctx, 1);
+
+    // bot.exec: an empty argv is rejected before any subprocess is built.
+    try expectLuaError(lua, "bot.exec{ argv = {} }");
+
+    // bot.http_request: a string headers map is the dropped form and is rejected.
+    try expectLuaError(lua,
+        "bot.http_request{ method = \"GET\", url = \"http://x\", headers = \"oops\" }",
+    );
+
+    // bot.shell: a non-string command fails checkString. A table never coerces
+    // to a string (unlike a number, which checkString accepts), so it rejects
+    // before any command is duped or yield is reached.
+    try expectLuaError(lua, "bot.shell{ command = {} }");
+}
+
+test "bot.schedule_after without payload returns a valid id" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    var ctx = testCtx(&db);
+
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+
+    lua.openBase();
+    register(lua, &ctx, 1);
+
+    // No payload key at all → the nil-payload branch dupes "{}" and inserts a
+    // row. openBase does not load `math`, so integer-ness is checked with `% 1`
+    // rather than math.type.
+    try lua.doString(
+        \\local id = bot.schedule_after{ seconds = 0 }
+        \\assert(type(id) == "number", "id must be a number, got " .. type(id))
+        \\assert(id % 1 == 0, "id must be an integer, got " .. tostring(id))
+        \\assert(id > 0, "id must be positive, got " .. tostring(id))
+    );
 }

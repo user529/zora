@@ -491,3 +491,128 @@ test "QueueKind tag names match log labels and default to .worker" {
     q.kind = .dispatcher;
     try testing.expectEqual(QueueKind.dispatcher, q.kind);
 }
+
+// A small non-scalar element type: by-value struct with mixed fields. Proves
+// the ring buffer handles aggregates, not just machine words.
+const Job = struct {
+    id: u64,
+    label: []const u8,
+};
+
+test "non-scalar element type: push-at-capacity, pop, push again, close drains" {
+    var q = try Queue(Job).init(testing.allocator, rt.io(), 3);
+    defer q.deinit(testing.allocator);
+
+    try q.push(.{ .id = 1, .label = "a" });
+    try q.push(.{ .id = 2, .label = "b" });
+    try q.push(.{ .id = 3, .label = "c" });
+
+    // One beyond capacity must fail with QueueFull and leave the queue intact.
+    try testing.expectError(error.QueueFull, q.push(.{ .id = 4, .label = "d" }));
+    try testing.expectEqual(@as(usize, 3), q.len());
+
+    // Blocking pop returns the head aggregate, fields preserved.
+    const first = q.pop();
+    try testing.expectEqual(@as(u64, 1), first.id);
+    try testing.expectEqualStrings("a", first.label);
+
+    // A slot freed, the previously-rejected push now succeeds.
+    try q.push(.{ .id = 4, .label = "d" });
+    try testing.expectEqual(@as(usize, 3), q.len());
+
+    // close() drains the remaining queued aggregates in FIFO order, then null.
+    q.close();
+    const second = q.popBlocking() orelse return error.Unexpected;
+    try testing.expectEqual(@as(u64, 2), second.id);
+    try testing.expectEqualStrings("b", second.label);
+    const third = q.popBlocking() orelse return error.Unexpected;
+    try testing.expectEqual(@as(u64, 3), third.id);
+    const fourth = q.popBlocking() orelse return error.Unexpected;
+    try testing.expectEqual(@as(u64, 4), fourth.id);
+    try testing.expectEqual(@as(?Job, null), q.popBlocking());
+}
+
+test "fillBand returns the correct band at each boundary" {
+    // Capacity 100 makes pct == count, so each boundary lands on an exact count.
+    // Bands the production code defines: >=99 -> 99, >=95 -> 95, >=90 -> 90,
+    // >=75 -> 75, else 0.
+    const Q = Queue(u32);
+    try testing.expectEqual(@as(u8, 0), Q.fillBand(74, 100)); // just below 75%
+    try testing.expectEqual(@as(u8, 75), Q.fillBand(75, 100));
+    try testing.expectEqual(@as(u8, 75), Q.fillBand(89, 100)); // top of 75 band
+    try testing.expectEqual(@as(u8, 90), Q.fillBand(90, 100));
+    try testing.expectEqual(@as(u8, 90), Q.fillBand(94, 100)); // top of 90 band
+    try testing.expectEqual(@as(u8, 95), Q.fillBand(95, 100));
+    try testing.expectEqual(@as(u8, 95), Q.fillBand(98, 100)); // top of 95 band
+    try testing.expectEqual(@as(u8, 99), Q.fillBand(99, 100));
+    try testing.expectEqual(@as(u8, 99), Q.fillBand(100, 100)); // full
+}
+
+test "checkFillThreshold advances last_warn_threshold through warn bands; reset on drain" {
+    // The default Zig test runner fails the build on any log.err. The 99% band
+    // logs at .err ("critical backpressure"); the 75/90/95 bands log at .warn.
+    // This test therefore drives last_warn_threshold through the three warn
+    // bands only (up to count 98) — exercising checkFillThreshold's advance
+    // logic without tripping the err path — then exercises resetFillThreshold.
+    var q = try Queue(u32).init(testing.allocator, rt.io(), 100);
+    defer q.deinit(testing.allocator);
+    q.metrics_log = true; // push() calls checkFillThreshold under metrics_log.
+
+    // Below 75%: no band crossed yet.
+    for (0..74) |i| try q.push(@intCast(i));
+    try testing.expectEqual(@as(u8, 0), q.last_warn_threshold);
+
+    // Cross into 75% band (push the 75th item -> count 75).
+    try q.push(74);
+    try testing.expectEqual(@as(usize, 75), q.len());
+    try testing.expectEqual(@as(u8, 75), q.last_warn_threshold);
+
+    // Fill the rest of the 75 band to count 89 — threshold stays at 75.
+    for (75..89) |i| try q.push(@intCast(i)); // counts 76..89
+    try testing.expectEqual(@as(usize, 89), q.len());
+    try testing.expectEqual(@as(u8, 75), q.last_warn_threshold);
+
+    // Cross into 90% band (count 90).
+    try q.push(89);
+    try testing.expectEqual(@as(usize, 90), q.len());
+    try testing.expectEqual(@as(u8, 90), q.last_warn_threshold);
+
+    // Fill the rest of the 90 band to count 94 — threshold stays at 90.
+    for (90..94) |i| try q.push(@intCast(i)); // counts 91..94
+    try testing.expectEqual(@as(usize, 94), q.len());
+    try testing.expectEqual(@as(u8, 90), q.last_warn_threshold);
+
+    // Cross into 95% band (count 95).
+    try q.push(94);
+    try testing.expectEqual(@as(usize, 95), q.len());
+    try testing.expectEqual(@as(u8, 95), q.last_warn_threshold);
+
+    // Up to count 98 stays in the 95 band (count 99 would log .err).
+    for (95..98) |i| try q.push(@intCast(i)); // counts 96..98
+    try testing.expectEqual(@as(usize, 98), q.len());
+    try testing.expectEqual(@as(u8, 95), q.last_warn_threshold);
+
+    // Drain back below 75%: resetFillThreshold (called from takeLocked under
+    // metrics_log) must lower last_warn_threshold to track the falling band.
+    // Pop to count 95 — still in the 95 band, threshold unchanged.
+    for (0..3) |_| _ = q.pop(); // count 98 -> 95
+    try testing.expectEqual(@as(usize, 95), q.len());
+    try testing.expectEqual(@as(u8, 95), q.last_warn_threshold);
+
+    // Pop down to count 74 — below all bands; threshold resets to 0.
+    while (q.len() > 74) _ = q.pop();
+    try testing.expectEqual(@as(usize, 74), q.len());
+    try testing.expectEqual(@as(u8, 0), q.last_warn_threshold);
+}
+
+test "close() is idempotent: double close does not panic, popBlocking returns null" {
+    var q = try Queue(u32).init(testing.allocator, rt.io(), 4);
+    defer q.deinit(testing.allocator);
+
+    q.close();
+    q.close(); // second close must be a no-op, not a panic.
+
+    try testing.expectEqual(@as(?u32, null), q.popBlocking());
+    // Still null on a repeat call — close is sticky across both invocations.
+    try testing.expectEqual(@as(?u32, null), q.popBlocking());
+}

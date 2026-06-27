@@ -159,7 +159,7 @@ pub const LuaEngine = struct {
         allocator: std.mem.Allocator,
         body:      []const u8,
     ) ![]types.ApiCall {
-        const outcome = try self.startHandler(body, 0, 0, allocator);
+        const outcome = try self.startHandler(body, 0, 0, allocator, "on_message", null);
         switch (outcome) {
             .done    => |actions| return actions,
             .yielded => |y| {
@@ -178,12 +178,18 @@ pub const LuaEngine = struct {
     /// Start a new coroutine handler for `body`.
     /// Creates a child Lua thread, decodes the JSON body, calls the first resumeThread.
     /// Returns CoroOutcome.done (fast path — no yield), .yielded, or .err.
+    ///
+    /// `handler` is the name of the Lua global to call (e.g. "on_message",
+    /// "on_schedule"). When `extra_int` is non-null it is pushed as a second Lua
+    /// argument after the decoded body table (nargs becomes 2).
     pub fn startHandler(
         self:      *LuaEngine,
         body:      []const u8,
         coro_id:   u32,
         worker_id: u8,
         allocator: std.mem.Allocator,
+        handler:   [:0]const u8,
+        extra_int: ?i64,
     ) !CoroOutcome {
         const main = self.lua;
 
@@ -201,35 +207,41 @@ pub const LuaEngine = struct {
         // Initialise per-coroutine emit accumulator (registry[thread] = {}).
         lua_api.beginEmitBatch(thread);
 
-        // Push on_message function onto the thread's stack. getGlobal pushes the
-        // value (nil when absent) and returns its type; a missing or non-function
-        // on_message is handled the same way.
-        const fn_type = thread.getGlobal("on_message");
+        // Push the selected handler. A missing or non-function handler logs and
+        // returns .err (the caller treats .err as a completed no-op).
+        const fn_type = thread.getGlobal(handler);
         if (fn_type != .function) {
             thread.pop(1);
             if (fn_type == .nil) {
-                log.warn("on_message not found", .{});
+                log.warn("{s} not found", .{handler});
             } else {
-                log.warn("on_message is not a function", .{});
+                log.warn("{s} is not a function", .{handler});
             }
             teardownCoro(main, handle);
             return .err;
         }
 
-        // Decode JSON body → Lua table (the update argument).
+        // Decode JSON body → Lua table (the first handler argument).
         serializer.jsonToLuaTable(thread, body, allocator) catch |e| {
             log.err("startHandler: body decode failed: {s}", .{@errorName(e)});
-            thread.pop(1); // pop on_message
+            thread.pop(1); // pop handler
             teardownCoro(main, handle);
             return .err;
         };
 
+        // Optional second argument (the schedule id for on_schedule).
+        var nargs: i32 = 1;
+        if (extra_int) |v| {
+            thread.pushInteger(@intCast(v));
+            nargs = 2;
+        }
+
         // Set per-resume instruction cap.
         thread.setHook(ziglua.wrap(hookCountLimit), .{ .count = true }, INSTRUCTION_CAP);
 
-        // First resume: call on_message(update_table).
+        // First resume: call handler(body_table[, extra_int]).
         var nres: i32 = 0;
-        const status = thread.resumeThread(main, 1, &nres) catch |e| {
+        const status = thread.resumeThread(main, nargs, &nres) catch |e| {
             log.warn("startHandler resumeThread error: {s}", .{@errorName(e)});
             teardownCoro(main, handle);
             return .err;
@@ -419,7 +431,7 @@ fn pushTrackedSendResult(thread: *Lua, result: io_pool.IoResult) void {
 /// Parse one `{ method = "...", params = {...} }` Lua table (at absolute
 /// `table_idx`) into an ApiCall.  `method` is required; `params` is optional.
 /// When `mode != .off` and `schema` is non-null, params are schema-validated.
-/// Payload building (JSON vs multipart) is delegated to lua_api.buildApiCall.
+/// lua_api.buildApiCall builds the payload (JSON vs multipart).
 fn parseOneApiCall(
     lua:       *Lua,
     table_idx: i32,
@@ -529,6 +541,22 @@ test "io.open / os.execute / require raise errors; math/string/table/utf8 work" 
     try engine.loadString("return string.upper('hello')");
     try engine.loadString("local t = {}; table.insert(t,1); return t[1]");
     try engine.loadString("return utf8.len('hello')");
+}
+
+test "dofile and loadfile globals are nil → calling them raises a Lua error" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+    var ctx = testCtx(&db);
+    var engine = try LuaEngine.init(testing.allocator, &ctx);
+    defer engine.deinit();
+
+    // init() nils both after openBase, so they are no longer callable: invoking
+    // a nil value is a runtime error surfaced as error.LuaError.
+    try testing.expectError(error.LuaError, engine.loadString("dofile('x')"));
+    try testing.expectError(error.LuaError, engine.loadString("loadfile('x')"));
+
+    // The globals themselves read back as nil.
+    try engine.loadString("assert(dofile == nil); assert(loadfile == nil)");
 }
 
 test "on_message returning {} → empty slice" {
@@ -679,11 +707,16 @@ test "return-list — six method shapes parse to ApiCalls" {
     try testing.expectEqualStrings("sendDice", actions[5].method);
 
     // Bodies carry the expected fields (key order from luaTableToJson is
-    // unspecified — assert by substring).
+    // unspecified — assert by substring, or parse for the {chat_id,text} shape).
+    try expectMsgBody(actions[0].payload.json, 1, "m"); // sendMessage chat_id+text
     try testing.expect(std.mem.indexOf(u8, actions[1].payload.json, "\"parse_mode\":\"HTML\"") != null);
+    try testing.expect(std.mem.indexOf(u8, actions[1].payload.json, "\"message_id\":2") != null);
     try testing.expect(std.mem.indexOf(u8, actions[2].payload.json, "\"callback_data\":\"d\"") != null);
     try testing.expect(std.mem.indexOf(u8, actions[2].payload.json, "\"inline_keyboard\"") != null);
     try testing.expect(std.mem.indexOf(u8, actions[3].payload.json, "\"callback_query_id\":\"cq\"") != null);
+    // deleteMessage carries chat_id and message_id (no text field).
+    try testing.expect(std.mem.indexOf(u8, actions[4].payload.json, "\"chat_id\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, actions[4].payload.json, "\"message_id\":2") != null);
     try testing.expect(std.mem.indexOf(u8, actions[5].payload.json, "\"chat_id\":1") != null);
 }
 
@@ -848,6 +881,45 @@ test "shipped rules/rules.lua produces sendMessage calls (generic form)" {
         try testing.expectEqualStrings("sendMessage", actions[0].method);
         try expectMsgBody(actions[0].payload.json, 9, "Echo: hello");
     }
+    // /stats → the rule's `string.format("Your messages: %d | Total: %d", ...)`.
+    // State persists across the calls above for user 1: this is the third message
+    // (/start, hello, /stats), so per-user count and global total are both 3.
+    {
+        const actions = try engine.callOnMessage(testing.allocator,
+            \\{"message":{"from":{"id":1},"chat":{"id":9},"text":"/stats"}}
+        );
+        defer types.freeApiCalls(actions, testing.allocator);
+        try testing.expectEqual(@as(usize, 1), actions.len);
+        try testing.expectEqualStrings("sendMessage", actions[0].method);
+        try expectMsgBody(actions[0].payload.json, 9, "Your messages: 3 | Total: 3");
+    }
+    // /remind <secs> <text> → schedules a job (bot.schedule_after, synchronous
+    // insert into the StateStore) and confirms with one sendMessage.
+    {
+        const actions = try engine.callOnMessage(testing.allocator,
+            \\{"message":{"from":{"id":1},"chat":{"id":9},"text":"/remind 5 hello"}}
+        );
+        defer types.freeApiCalls(actions, testing.allocator);
+        try testing.expectEqual(@as(usize, 1), actions.len);
+        try testing.expectEqualStrings("sendMessage", actions[0].method);
+        try expectMsgBody(actions[0].payload.json, 9, "Reminder set for 5s.");
+    }
+    // on_schedule(payload, id) → one sendMessage echoing the scheduled payload,
+    // mirroring the /remind job above ({ chat = chat_id, text = rest }).
+    {
+        const outcome = try engine.startHandler(
+            \\{"chat":9,"text":"hello"}
+        , 0, 0, testing.allocator, "on_schedule", @as(?i64, 1));
+        switch (outcome) {
+            .done => |actions| {
+                defer types.freeApiCalls(actions, testing.allocator);
+                try testing.expectEqual(@as(usize, 1), actions.len);
+                try testing.expectEqualStrings("sendMessage", actions[0].method);
+                try expectMsgBody(actions[0].payload.json, 9, "hello");
+            },
+            else => return error.UnexpectedOutcome,
+        }
+    }
 }
 
 // ── coroutine engine tests ───────────────────────────────────────────────────
@@ -865,7 +937,7 @@ test "sync rule (no yield) via startHandler → .done with actions" {
         \\end
     );
 
-    const outcome = try engine.startHandler("{\"update_id\":1}", 42, 0, testing.allocator);
+    const outcome = try engine.startHandler("{\"update_id\":1}", 42, 0, testing.allocator, "on_message", null);
     switch (outcome) {
         .done => |actions| {
             defer types.freeApiCalls(actions, testing.allocator);
@@ -889,7 +961,7 @@ test "per-resume instruction cap aborts infinite loop" {
         \\end
     );
 
-    const outcome = try engine.startHandler("{}", 1, 0, testing.allocator);
+    const outcome = try engine.startHandler("{}", 1, 0, testing.allocator, "on_message", null);
     switch (outcome) {
         .err => {},
         else => return error.ExpectedError,
@@ -911,12 +983,41 @@ test "bounded heavy computation in one resume is not falsely aborted" {
         \\end
     );
 
-    const outcome = try engine.startHandler("{}", 2, 0, testing.allocator);
+    const outcome = try engine.startHandler("{}", 2, 0, testing.allocator, "on_message", null);
     switch (outcome) {
         .done => |actions| {
             defer types.freeApiCalls(actions, testing.allocator);
             try testing.expectEqual(@as(usize, 1), actions.len);
         },
         else => return error.FalselyAborted,
+    }
+}
+
+test "startHandler dispatches on_schedule with payload and id" {
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+    var ctx = testCtx(&db);
+    var engine = try LuaEngine.init(testing.allocator, &ctx);
+    defer engine.deinit();
+
+    try engine.loadString(
+        \\function on_schedule(payload, id)
+        \\  return { { method = "noteId", params = { got = id, n = payload.n } } }
+        \\end
+    );
+
+    const outcome = try engine.startHandler("{\"n\":5}", 0, 0, testing.allocator, "on_schedule", @as(?i64, 77));
+    switch (outcome) {
+        .done => |actions| {
+            defer {
+                for (actions) |a| types.freeApiCall(a, testing.allocator);
+                testing.allocator.free(actions);
+            }
+            try testing.expectEqual(@as(usize, 1), actions.len);
+            try testing.expectEqualStrings("noteId", actions[0].method);
+            try testing.expect(std.mem.indexOf(u8, actions[0].payload.json, "\"got\":77") != null);
+            try testing.expect(std.mem.indexOf(u8, actions[0].payload.json, "\"n\":5") != null);
+        },
+        else => return error.UnexpectedOutcome,
     }
 }

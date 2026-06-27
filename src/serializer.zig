@@ -53,7 +53,7 @@ pub fn luaTableToJsonCapped(lua: *Lua, index: i32, allocator: std.mem.Allocator,
 }
 
 /// Parse `json_str` and push one value onto the Lua stack.
-/// On error the stack is restored to its state before the call.
+/// On error it restores the stack to its state before the call.
 /// No input-size limit — required for webhook body decoding up to 1 MB.
 pub fn jsonToLuaTable(lua: *Lua, json_str: []const u8, allocator: std.mem.Allocator) !void {
     const top_before = lua.getTop();
@@ -521,7 +521,9 @@ test "table shape maps to a JSON array or object" {
         lua.pop(1);
         try testing.expectEqualStrings("{\"name\":\"bob\"}", json);
     }
-    // Non-consecutive integer keys {[1],[3]} → object, not array.
+    // Non-consecutive integer keys {[1]="a",[3]="c"} → object, not array.
+    // Numeric keys serialize as quoted strings; key order is undefined, so
+    // parse the result back and assert each key maps to its value.
     {
         lua.createTable(0, 2);
         lua.pushInteger(1); _ = lua.pushString("a"); lua.setTableRaw(-3);
@@ -530,8 +532,16 @@ test "table shape maps to a JSON array or object" {
         defer testing.allocator.free(json);
         lua.pop(1);
         try testing.expect(json[0] == '{');
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        try testing.expectEqual(@as(usize, 2), obj.count());
+        try testing.expectEqualStrings("a", obj.get("1").?.string);
+        try testing.expectEqualStrings("c", obj.get("3").?.string);
     }
-    // Mixed integer and string keys → object.
+    // Mixed integer and string keys {[1]="a", name="b"} → object.
+    // Assert both keys and their distinct values survive, not just the brace.
     {
         lua.createTable(0, 2);
         lua.pushInteger(1); _ = lua.pushString("a"); lua.setTableRaw(-3);
@@ -540,6 +550,13 @@ test "table shape maps to a JSON array or object" {
         defer testing.allocator.free(json);
         lua.pop(1);
         try testing.expect(json[0] == '{');
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        try testing.expectEqual(@as(usize, 2), obj.count());
+        try testing.expectEqualStrings("a", obj.get("1").?.string);
+        try testing.expectEqualStrings("b", obj.get("name").?.string);
     }
     // Empty table → "{}".
     {
@@ -733,5 +750,51 @@ test "boolean key returns error.UnsupportedKeyType" {
     lua.setTableRaw(-3);
 
     try testing.expectError(error.UnsupportedKeyType, luaTableToJson(lua, -1, testing.allocator));
+    lua.pop(1);
+}
+
+test "JSON integer beyond i64 range pushes the literal as a string" {
+    var lua = try newLua(testing.allocator);
+    defer lua.deinit();
+
+    // 99999999999999999999 exceeds i64 and loses precision as f64, so std.json
+    // reports it as .number_string. pushJsonValue must push the exact literal
+    // as a Lua string rather than a truncated or overflowed number.
+    const literal = "99999999999999999999";
+    try jsonToLuaTable(lua, literal, testing.allocator);
+    // typeOf, not isNumber: Lua 5.4's isNumber coerces a numeric string, so it
+    // would report true even though the value is genuinely a string. The point
+    // is that the value was stored as a string literal, not a parsed number.
+    try testing.expectEqual(ziglua.LuaType.string, lua.typeOf(-1));
+    try testing.expectEqualStrings(literal, try lua.toString(-1));
+    lua.pop(1);
+}
+
+test "luaTableToJson keeps the stack balanced on an error" {
+    var lua = try newLua(testing.allocator);
+    defer lua.deinit();
+
+    // A boolean key forces error.UnsupportedKeyType partway through table
+    // traversal; the stack must return to its prior depth despite the abort.
+    lua.createTable(0, 1);
+    lua.pushBoolean(true);
+    lua.pushInteger(1);
+    lua.setTableRaw(-3);
+
+    const top_before = lua.getTop();
+    try testing.expectError(error.UnsupportedKeyType, luaTableToJson(lua, -1, testing.allocator));
+    try testing.expectEqual(top_before, lua.getTop());
+    lua.pop(1);
+}
+
+test "JSON string escapes decode to their literal bytes" {
+    var lua = try newLua(testing.allocator);
+    defer lua.deinit();
+
+    // The JSON source carries \n, \t, \" and \\ escapes; the Lua value must
+    // hold the actual newline, tab, quote and backslash bytes.
+    try jsonToLuaTable(lua, "\"a\\nb\\tc\\\"d\\\\e\"", testing.allocator);
+    try testing.expect(lua.isString(-1));
+    try testing.expectEqualStrings("a\nb\tc\"d\\e", try lua.toString(-1));
     lua.pop(1);
 }

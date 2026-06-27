@@ -2,7 +2,7 @@
 ///
 /// One StateStore per worker thread (owns its own SQLite connection).
 /// WAL mode allows concurrent readers across connections on the same file.
-/// Schema is applied idempotently on open(); version mismatch aborts startup.
+/// open() applies the schema idempotently; a version mismatch aborts startup.
 
 const std = @import("std");
 
@@ -61,6 +61,13 @@ pub const StateStore = struct {
     stmt_get_global: *c.sqlite3_stmt = undefined,
     stmt_set_global: *c.sqlite3_stmt = undefined,
 
+    /// Test-only fault injection. When true, the next `commit()` returns
+    /// `error.SqliteError` instead of issuing COMMIT, leaving the open
+    /// transaction unresolved (the real failure shape: the caller must
+    /// `rollback()`). The flag auto-clears so only one commit fails. Default
+    /// false — inert in production; no path sets it except tests.
+    fail_next_commit: bool = false,
+
     /// Open (or create) the database at `path`.
     /// For in-memory databases use path = ":memory:".
     /// Open schema and verifies schema_version on every open,
@@ -115,6 +122,13 @@ pub const StateStore = struct {
     }
 
     pub fn commit(self: *StateStore) !void {
+        // Test-only fault injection: simulate a COMMIT failure without issuing
+        // it, leaving the transaction open for the caller to roll back. Inert
+        // unless a test sets `fail_next_commit`.
+        if (self.fail_next_commit) {
+            self.fail_next_commit = false;
+            return error.SqliteError;
+        }
         try sqliteOk(c.sqlite3_exec(self.db, "COMMIT", null, null, null));
     }
 
@@ -200,6 +214,134 @@ pub const StateStore = struct {
         try sqliteOk(c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null));
         try sqliteOk(c.sqlite3_bind_text(stmt, 2, value.ptr, @intCast(value.len), null));
         try sqliteDone(c.sqlite3_step(stmt));
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduler queries — cold path: prepared per call, never cached.
+    // -----------------------------------------------------------------------
+    //
+    // The schedule path is not hot, so these statements do not join the six
+    // cached CRUD statements. Reuse-first (PRINCIPLESv2 §1): all four methods
+    // funnel through prepareBound/execParams instead of repeating the
+    // prepare -> bind -> step -> finalize dance.
+
+    /// One positional bind value for a cold-path statement. A `text` slice binds
+    /// with SQLITE_STATIC (the `null` destructor), so its bytes must stay valid
+    /// until the statement is stepped and finalized — true for every caller here,
+    /// which binds slices that outlive the statement.
+    const Param = union(enum) { int: i64, text: []const u8 };
+
+    /// Prepare `sql` and bind `params` positionally (1-based); return the bound,
+    /// not-yet-stepped statement — the shared prepare+bind prefix for every
+    /// cold-path scheduler query. Ownership passes to the caller, which MUST
+    /// `defer _ = c.sqlite3_finalize(stmt)` and then step as its query needs
+    /// (writes step once to DONE; reads loop over rows). A bind failure finalizes
+    /// the statement here before the error propagates (zero-leak).
+    fn prepareBound(self: *StateStore, sql: [:0]const u8, params: []const Param) !*c.sqlite3_stmt {
+        const stmt = try self.prepare(sql);
+        errdefer _ = c.sqlite3_finalize(stmt);
+        for (params, 1..) |p, i| {
+            const idx: c_int = @intCast(i);
+            switch (p) {
+                .int  => |v| try sqliteOk(c.sqlite3_bind_int64(stmt, idx, v)),
+                .text => |v| try sqliteOk(c.sqlite3_bind_text(stmt, idx, v.ptr, @intCast(v.len), null)),
+            }
+        }
+        return stmt;
+    }
+
+    /// Prepare+bind `sql`, step once expecting SQLITE_DONE, finalize. The
+    /// no-result write path (INSERT/DELETE) on the cold scheduler path.
+    fn execParams(self: *StateStore, sql: [:0]const u8, params: []const Param) !void {
+        const stmt = try self.prepareBound(sql, params);
+        defer _ = c.sqlite3_finalize(stmt);
+        try sqliteDone(c.sqlite3_step(stmt));
+    }
+
+    /// One claimed scheduler row. `payload` is owned by the caller.
+    pub const ClaimedJob = struct { id: i64, payload: []u8 };
+
+    /// Insert a job; returns its rowid.
+    pub fn scheduleInsert(self: *StateStore, fire_at_ms: i64, payload: []const u8) !i64 {
+        try self.execParams(
+            "INSERT INTO schedule (fire_at_ms, payload) VALUES (?, ?)",
+            &.{ .{ .int = fire_at_ms }, .{ .text = payload } },
+        );
+        return c.sqlite3_last_insert_rowid(self.db);
+    }
+
+    /// Delete a job by id. Returns true if a row was removed.
+    pub fn scheduleDelete(self: *StateStore, id: i64) !bool {
+        try self.execParams("DELETE FROM schedule WHERE id = ?", &.{.{ .int = id }});
+        return c.sqlite3_changes(self.db) > 0;
+    }
+
+    /// Smallest fire_at_ms among claimable rows (unclaimed, or lease older than
+    /// `reclaim_cutoff_ms`). Null when no claimable row exists.
+    pub fn scheduleMinFire(self: *StateStore, reclaim_cutoff_ms: i64) !?i64 {
+        const stmt = try self.prepareBound(
+            "SELECT MIN(fire_at_ms) FROM schedule " ++
+                "WHERE claimed_at_ms IS NULL OR claimed_at_ms < ?",
+            &.{.{ .int = reclaim_cutoff_ms }},
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.SqliteError;
+        // MIN over an empty set yields SQL NULL → column_type is NULL.
+        if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+        return c.sqlite3_column_int64(stmt, 0);
+    }
+
+    /// Atomically claim up to `max_batch` due rows: stamp claimed_at_ms = now_ms
+    /// on the earliest rows whose fire_at_ms <= now that are unclaimed (or whose
+    /// lease predates reclaim_cutoff_ms), and return them. One bulk
+    /// UPDATE ... RETURNING does the claim in a single atomic statement, so a row
+    /// is never handed out twice — no explicit transaction, no per-row update.
+    /// Caller owns each payload and the slice.
+    pub fn scheduleClaimDue(
+        self: *StateStore,
+        now_ms: i64,
+        reclaim_cutoff_ms: i64,
+        max_batch: u32,
+        allocator: std.mem.Allocator,
+    ) ![]ClaimedJob {
+        // SQLite does not accept ORDER BY/LIMIT directly on UPDATE, so the
+        // earliest-N rows are chosen by a subquery and stamped in bulk; RETURNING
+        // streams the claimed rows back. Their order is unspecified — the
+        // scheduler round-robins, so batch order does not matter.
+        const stmt = try self.prepareBound(
+            "UPDATE schedule SET claimed_at_ms = ? " ++
+                "WHERE id IN (SELECT id FROM schedule " ++
+                "WHERE fire_at_ms <= ? AND (claimed_at_ms IS NULL OR claimed_at_ms < ?) " ++
+                "ORDER BY fire_at_ms LIMIT ?) " ++
+                "RETURNING id, payload",
+            &.{
+                .{ .int = now_ms },            // SET claimed_at_ms
+                .{ .int = now_ms },            // fire_at_ms <= now
+                .{ .int = reclaim_cutoff_ms },
+                .{ .int = @intCast(max_batch) },
+            },
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var list: std.ArrayListUnmanaged(ClaimedJob) = .empty;
+        errdefer {
+            for (list.items) |j| allocator.free(j.payload);
+            list.deinit(allocator);
+        }
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const id = c.sqlite3_column_int64(stmt, 0);
+            const text = c.sqlite3_column_text(stmt, 1);
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            const payload = if (text != null)
+                try allocator.dupe(u8, text[0..len])
+            else
+                try allocator.dupe(u8, "{}");
+            errdefer allocator.free(payload);
+            try list.append(allocator, .{ .id = id, .payload = payload });
+        }
+
+        return list.toOwnedSlice(allocator);
     }
 
     // -----------------------------------------------------------------------
@@ -308,21 +450,36 @@ fn openMem() !StateStore {
     return StateStore.open(testing.allocator, ":memory:");
 }
 
+/// Read back an integer-valued PRAGMA on `store`'s connection. Shared by the
+/// pragma-verification tests (synchronous, foreign_keys, busy_timeout) so each
+/// asserts the effective value rather than trusting the open() path.
+fn readPragmaInt(store: *StateStore, pragma: [:0]const u8) !i64 {
+    const stmt = try store.prepare(pragma);
+    defer _ = c.sqlite3_finalize(stmt);
+    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
 test "fresh in-memory DB creates all tables without error" {
     var store = try openMem();
     defer store.close();
 
-    // Verify each table exists by querying sqlite_master
+    // Verify each table exists by querying it. A missing table makes prepare()
+    // fail ('no such table'); an empty table steps to SQLITE_DONE. Either is a
+    // clean signal the table is present, so assert the step return is one of
+    // the two — not silently discarded.
     const tables = [_][:0]const u8{
         "SELECT 1 FROM meta LIMIT 1",
         "SELECT 1 FROM user_state LIMIT 1",
         "SELECT 1 FROM chat_state LIMIT 1",
         "SELECT 1 FROM global_state LIMIT 1",
+        "SELECT 1 FROM schedule LIMIT 1",
     };
     for (tables) |sql| {
         const stmt = try store.prepare(sql);
-        _ = c.sqlite3_step(stmt);
-        _ = c.sqlite3_finalize(stmt);
+        defer _ = c.sqlite3_finalize(stmt);
+        const rc = c.sqlite3_step(stmt);
+        try testing.expect(rc == c.SQLITE_ROW or rc == c.SQLITE_DONE);
     }
 }
 
@@ -450,6 +607,11 @@ test "3 connections on same file-based DB, concurrent reads, WAL confirmed" {
     const jm_len: usize = @intCast(c.sqlite3_column_bytes(jm_stmt, 0));
     try testing.expect(jm_text != null);
     try testing.expectEqualStrings("wal", jm_text[0..jm_len]);
+
+    // The other required pragmas must also be in effect on the
+    // connection (synchronous=NORMAL == 1, foreign_keys=ON == 1).
+    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s1, "PRAGMA synchronous"));
+    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s1, "PRAGMA foreign_keys"));
 }
 
 test "a second write upserts over the first" {
@@ -511,8 +673,14 @@ test "open prepares exactly 6 cached statements; close tears down cleanly" {
     // Exactly the six cached CRUD statements are live after open().
     try testing.expectEqual(@as(usize, 6), countStmts(store.db));
     // Exercise the real close() teardown (finalize all six, then sqlite3_close).
-    // A finalize omission in close() would leave the connection BUSY and leak it,
-    // which the surrounding test suite's `defer store.close()` usage would surface.
+    // close() discards sqlite3_close's return code by design, so this test cannot
+    // assert SQLITE_OK directly. The teardown's success is asserted by the
+    // companion white-box test "finalizing the six cached statements lets
+    // sqlite3_close return OK", which mirrors close()'s exact finalize sequence
+    // and checks the SQLITE_OK return. A finalize omission here would leave the
+    // connection BUSY and leak it — surfaced by countStmts being non-zero and by
+    // the suite-wide `defer store.close()` usage.
+    try testing.expectEqual(@as(usize, 6), countStmts(store.db));
     store.close();
 }
 
@@ -641,16 +809,195 @@ test "busy_timeout set — concurrent writers complete without BUSY error" {
         try s2.setUserState(@intCast(i + 1000), "{}");
     }
 
-    // Verify busy_timeout pragma is 5000
-    const stmt1 = try s1.prepare("PRAGMA busy_timeout");
-    defer _ = c.sqlite3_finalize(stmt1);
-    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt1));
-    const timeout1 = c.sqlite3_column_int64(stmt1, 0);
-    try testing.expectEqual(@as(i64, 5000), timeout1);
+    // busy_timeout must be 5000 on BOTH connections (the second query reads
+    // s2, not s1 again).
+    try testing.expectEqual(@as(i64, 5000), try readPragmaInt(&s1, "PRAGMA busy_timeout"));
+    try testing.expectEqual(@as(i64, 5000), try readPragmaInt(&s2, "PRAGMA busy_timeout"));
 
-    const stmt2 = try s1.prepare("PRAGMA busy_timeout");
-    defer _ = c.sqlite3_finalize(stmt2);
-    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt2));
-    const timeout2 = c.sqlite3_column_int64(stmt2, 0);
-    try testing.expectEqual(@as(i64, 5000), timeout2);
+    // The other required pragmas hold on both connections too.
+    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s1, "PRAGMA synchronous"));
+    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s2, "PRAGMA synchronous"));
+    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s1, "PRAGMA foreign_keys"));
+    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s2, "PRAGMA foreign_keys"));
+}
+
+test "scheduleInsert returns rowid; scheduleDelete reports removal" {
+    var store = try StateStore.open(std.testing.allocator, ":memory:");
+    defer store.close();
+
+    const id1 = try store.scheduleInsert(1000, "{\"a\":1}");
+    const id2 = try store.scheduleInsert(2000, "{}");
+    try std.testing.expect(id2 > id1);
+
+    try std.testing.expect(try store.scheduleDelete(id1)); // removed
+    try std.testing.expect(!try store.scheduleDelete(id1)); // already gone
+    try std.testing.expect(try store.scheduleDelete(id2));
+}
+
+test "scheduleMinFire ignores freshly-claimed rows" {
+    var store = try StateStore.open(std.testing.allocator, ":memory:");
+    defer store.close();
+    _ = try store.scheduleInsert(5000, "{}");
+    _ = try store.scheduleInsert(3000, "{}");
+
+    // Reclaim cutoff far in the past → nothing reclaimable; both unclaimed.
+    try std.testing.expectEqual(@as(?i64, 3000), try store.scheduleMinFire(0));
+
+    // Claim everything due at now=10000 → both leased at 10000.
+    const claimed = try store.scheduleClaimDue(10_000, 0, 16, std.testing.allocator);
+    defer {
+        for (claimed) |j| std.testing.allocator.free(j.payload);
+        std.testing.allocator.free(claimed);
+    }
+    try std.testing.expectEqual(@as(usize, 2), claimed.len);
+
+    // With cutoff=0, leased rows (claimed_at_ms=10000) are NOT reclaimable → null.
+    try std.testing.expectEqual(@as(?i64, null), try store.scheduleMinFire(0));
+    // With cutoff=20000 (> lease stamp), they become reclaimable again.
+    try std.testing.expectEqual(@as(?i64, 3000), try store.scheduleMinFire(20_000));
+}
+
+test "scheduleClaimDue selects only due rows, ordered, capped, and stamps lease" {
+    var store = try StateStore.open(std.testing.allocator, ":memory:");
+    defer store.close();
+    _ = try store.scheduleInsert(100, "{\"n\":1}");
+    _ = try store.scheduleInsert(200, "{\"n\":2}");
+    _ = try store.scheduleInsert(900, "{\"n\":9}"); // not due at now=300
+
+    const claimed = try store.scheduleClaimDue(300, 0, 1, std.testing.allocator); // cap 1
+    defer {
+        for (claimed) |j| std.testing.allocator.free(j.payload);
+        std.testing.allocator.free(claimed);
+    }
+    // cap=1 → only the earliest due row (fire_at_ms=100).
+    try std.testing.expectEqual(@as(usize, 1), claimed.len);
+    try std.testing.expectEqualStrings("{\"n\":1}", claimed[0].payload);
+
+    // A second claim at the same now returns the next due row (first is leased).
+    const claimed2 = try store.scheduleClaimDue(300, 0, 16, std.testing.allocator);
+    defer {
+        for (claimed2) |j| std.testing.allocator.free(j.payload);
+        std.testing.allocator.free(claimed2);
+    }
+    try std.testing.expectEqual(@as(usize, 1), claimed2.len);
+    try std.testing.expectEqualStrings("{\"n\":2}", claimed2[0].payload);
+}
+
+test "schedule table and index exist after open" {
+    var store = try StateStore.open(std.testing.allocator, ":memory:");
+    defer store.close();
+
+    // The table is queryable (would error 'no such table' if absent).
+    const tbl = try store.prepare("SELECT count(*) FROM schedule");
+    defer _ = c.sqlite3_finalize(tbl);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(tbl));
+    try std.testing.expectEqual(@as(c_int, 0), c.sqlite3_column_int(tbl, 0));
+
+    // The fire-time index exists.
+    const idx = try store.prepare(
+        "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='idx_schedule_fire'",
+    );
+    defer _ = c.sqlite3_finalize(idx);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(idx));
+    try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_column_int(idx, 0));
+}
+
+test "open applies synchronous=NORMAL and foreign_keys=ON" {
+    // pragma.sql sets synchronous=NORMAL and foreign_keys=ON, both
+    // mandatory. A regression dropping either pragma is
+    // otherwise undetected. The readback values are SQLite's canonical
+    // encodings: synchronous NORMAL == 1, foreign_keys ON == 1.
+    var store = try openMem();
+    defer store.close();
+    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&store, "PRAGMA synchronous"));
+    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&store, "PRAGMA foreign_keys"));
+}
+
+test "beginDeferred commits a write and rolls one back" {
+    // P4-7: the worker's resumed-coroutine path wraps each post-yield segment in
+    // beginDeferred (lazy write lock). Commit must persist the segment's write;
+    // rollback must discard it, leaving the last committed value intact.
+    var store = try openMem();
+    defer store.close();
+
+    // Commit path: write under a deferred txn, commit, read back the new value.
+    try store.beginDeferred();
+    try store.setUserState(1, "{\"v\":\"committed\"}");
+    try store.commit();
+    {
+        const data = try store.getUserState(1);
+        defer testing.allocator.free(data);
+        try testing.expectEqualStrings("{\"v\":\"committed\"}", data);
+    }
+
+    // Rollback path: write under a second deferred txn, roll back, confirm the
+    // committed value is unchanged.
+    try store.beginDeferred();
+    try store.setUserState(1, "{\"v\":\"discarded\"}");
+    store.rollback();
+    {
+        const data = try store.getUserState(1);
+        defer testing.allocator.free(data);
+        try testing.expectEqualStrings("{\"v\":\"committed\"}", data);
+    }
+}
+
+test "scheduleClaimDue substitutes {} for a NULL payload" {
+    // P4-27: scheduleClaimDue defensively duplicates "{}" when a claimed row's
+    // payload column is SQL NULL. The shipped schema marks payload NOT NULL, so
+    // the only way to reach that branch is to bypass the constraint. Recreate
+    // the schedule table without NOT NULL (raw test-local SQL), insert a row
+    // with a NULL payload, claim it, and assert the fallback fired.
+    var store = try openMem();
+    defer store.close();
+
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(store.db, "DROP TABLE schedule", null, null, null));
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(store.db,
+        "CREATE TABLE schedule (id INTEGER PRIMARY KEY, fire_at_ms INTEGER NOT NULL, " ++
+            "payload TEXT, claimed_at_ms INTEGER) STRICT", null, null, null));
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(store.db,
+        "INSERT INTO schedule (id, fire_at_ms, payload, claimed_at_ms) VALUES (1, 100, NULL, NULL)",
+        null, null, null));
+
+    const claimed = try store.scheduleClaimDue(200, 0, 16, testing.allocator);
+    defer {
+        for (claimed) |j| testing.allocator.free(j.payload);
+        testing.allocator.free(claimed);
+    }
+    try testing.expectEqual(@as(usize, 1), claimed.len);
+    try testing.expectEqualStrings("{}", claimed[0].payload);
+}
+
+test "fail_next_commit seam makes one commit fail, then auto-resets" {
+    // Test-only fault seam used by the worker resume-path test (B4b): set
+    // fail_next_commit, run a txn + write, and the next commit() errors without
+    // issuing COMMIT (transaction left open for rollback). The flag clears
+    // itself, so the following commit succeeds normally.
+    var store = try openMem();
+    defer store.close();
+
+    store.fail_next_commit = true;
+    try store.beginDeferred();
+    try store.setUserState(1, "{\"v\":\"A\"}");
+    try testing.expectError(error.SqliteError, store.commit());
+    // The seam cleared itself.
+    try testing.expect(!store.fail_next_commit);
+    // The transaction is still open (commit was never issued); roll it back so
+    // the write is discarded — the real failure-handling shape.
+    store.rollback();
+    {
+        const data = try store.getUserState(1);
+        defer testing.allocator.free(data);
+        try testing.expectEqualStrings("{}", data);
+    }
+
+    // A subsequent normal commit succeeds: the seam is one-shot.
+    try store.beginDeferred();
+    try store.setUserState(1, "{\"v\":\"B\"}");
+    try store.commit();
+    {
+        const data = try store.getUserState(1);
+        defer testing.allocator.free(data);
+        try testing.expectEqualStrings("{\"v\":\"B\"}", data);
+    }
 }

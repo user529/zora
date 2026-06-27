@@ -18,6 +18,7 @@ const tg_schema = @import("tg_schema.zig");
 const io_pool = @import("io_pool.zig");
 const metrics_mod = @import("metrics.zig");
 const rt = @import("rt.zig");
+const scheduler = @import("scheduler.zig");
 
 const log = std.log.scoped(.worker);
 
@@ -73,7 +74,24 @@ pub const WorkerArgs = struct {
     workflow_deadline_ms: u64 = 60_000,
     /// Optional metrics sink.  Null means "don't count" (most unit tests pass null).
     metrics: ?*metrics_mod.Metrics = null,
+    /// Scheduler handle so bot.schedule_* can wake the timer after inserting a job.
+    scheduler: ?*scheduler.Scheduler = null,
+    /// Test-only deterministic clock for the coroutine reaper. When non-null the
+    /// worker reads the workflow deadline and the current time from this counter
+    /// instead of the wall clock, so a test fires the deadline by advancing the
+    /// counter rather than sleeping past a real-time margin. Null in production:
+    /// the worker then uses the monotonic wall clock via rt.nowMs.
+    clock_ms: ?*std.atomic.Value(i64) = null,
 };
+
+/// Current time in milliseconds for deadline math. Returns the injected test
+/// clock when present, otherwise the process wall clock. The reaper and the
+/// at-yield deadline computation share this one source so an injected clock
+/// governs both consistently.
+fn workerNowMs(args: *const WorkerArgs) i64 {
+    if (args.clock_ms) |clk| return clk.load(.acquire);
+    return rt.nowMs(args.io);
+}
 
 // ---------------------------------------------------------------------------
 // In-flight coroutine tracking
@@ -84,6 +102,7 @@ const InFlightEntry = struct {
     deadline_ms: i64,
     owned_strings: lua_api.OwnedStrings,
     is_tracked_send: bool = false,
+    schedule_id: ?i64 = null,
 };
 
 const InFlightMap = std.AutoHashMap(u32, InFlightEntry);
@@ -139,6 +158,7 @@ pub fn workerThread(args: WorkerArgs) void {
         .io = args.io,
         .max_file_bytes = MAX_UPLOAD_BYTES,
         .json_max_bytes = args.json_max_bytes,
+        .scheduler = args.scheduler,
     };
 
     var engine = lua_engine.LuaEngine.init(args.allocator, &api_ctx) catch |err| {
@@ -220,14 +240,28 @@ pub fn workerThread(args: WorkerArgs) void {
                     switch (outcome) {
                         .done => |actions| {
                             // resumeHandler already called lua.unref + freeOwnedStrings.
+                            const sid = entry.schedule_id;
                             _ = inflight.remove(cid);
                             decInflight(args.metrics);
+                            // Delete the schedule row before commit so it is included
+                            // in the open transaction when in_txn == true (a commit
+                            // failure rolls it back, preserving at-least-once). When
+                            // in_txn == false (autocommit fallback) the delete still
+                            // runs so a completed job is not re-fired unnecessarily.
+                            if (sid) |s| _ = args.db.scheduleDelete(s) catch |err| {
+                                log.warn("worker {d}: schedule delete failed (will re-fire): {s}", .{ args.id, @errorName(err) });
+                            };
                             // Commit the segment's state writes before emitting its
                             // actions. If the commit fails the state is gone, so the
                             // actions (which assume it) are dropped, not sent.
                             const commit_ok = if (in_txn) blk: {
                                 args.db.commit() catch |err| {
-                                    log.err("worker {d}: COMMIT after resume failed: {s}", .{ args.id, @errorName(err) });
+                                    // Recoverable: roll back, drop this segment's
+                                    // actions, and continue. Logged at warn (not
+                                    // err) so deterministic fault-injection tests
+                                    // can assert this path. warn is the level for an
+                                    // expected, handled failure.
+                                    log.warn("worker {d}: COMMIT after resume failed: {s}", .{ args.id, @errorName(err) });
                                     args.db.rollback();
                                     break :blk false;
                                 };
@@ -295,7 +329,7 @@ pub fn workerThread(args: WorkerArgs) void {
 
         // ── 2. Reap coroutines past their wall-clock deadline ─────────────
         {
-            const now_ms = rt.nowMs(args.io);
+            const now_ms = workerNowMs(&args);
             var to_reap: [64]u32 = undefined;
             var n_reap: usize = 0;
             var it = inflight.iterator();
@@ -375,7 +409,11 @@ pub fn workerThread(args: WorkerArgs) void {
                 continue;
             };
 
-            const outcome = engine.startHandler(item.body, cid, args.id, args.allocator) catch |err| {
+            const handler: [:0]const u8 = switch (item.kind) {
+                .message  => "on_message",
+                .schedule => "on_schedule",
+            };
+            const outcome = engine.startHandler(item.body, cid, args.id, args.allocator, handler, item.schedule_id) catch |err| {
                 log.err("worker {d}: startHandler OOM: {s}", .{ args.id, @errorName(err) });
                 args.db.rollback();
                 continue;
@@ -383,8 +421,16 @@ pub fn workerThread(args: WorkerArgs) void {
 
             switch (outcome) {
                 .done => |actions| {
+                    if (item.schedule_id) |sid| _ = args.db.scheduleDelete(sid) catch |err| {
+                        log.warn("worker {d}: schedule delete failed (will re-fire): {s}", .{ args.id, @errorName(err) });
+                    };
                     args.db.commit() catch |err| {
-                        log.err("worker {d}: COMMIT failed: {s}", .{ args.id, @errorName(err) });
+                        // Recoverable: roll back (which also un-deletes any
+                        // schedule row deleted above, preserving at-least-once),
+                        // drop this handler's actions, and move on. Logged at warn
+                        // (not err) so deterministic fault-injection tests can
+                        // assert this path.
+                        log.warn("worker {d}: COMMIT failed: {s}", .{ args.id, @errorName(err) });
                         args.db.rollback();
                         for (actions) |action| types.freeApiCall(action, args.allocator);
                         args.allocator.free(actions);
@@ -402,7 +448,7 @@ pub fn workerThread(args: WorkerArgs) void {
                     args.db.commit() catch |err| {
                         log.err("worker {d}: COMMIT before yield failed: {s}", .{ args.id, @errorName(err) });
                     };
-                    const deadline = rt.nowMs(args.io) +
+                    const deadline = workerNowMs(&args) +
                         @as(i64, @intCast(args.workflow_deadline_ms));
                     switch (y.pending_job) {
                         .io => |io| {
@@ -411,6 +457,7 @@ pub fn workerThread(args: WorkerArgs) void {
                                 .deadline_ms = deadline,
                                 .owned_strings = io.owned_strings,
                                 .is_tracked_send = false,
+                                .schedule_id = item.schedule_id,
                             }) catch {
                                 log.err("worker {d}: inflight map OOM", .{args.id});
                                 lua_api.freeOwnedStrings(io.owned_strings, args.allocator);
@@ -431,6 +478,7 @@ pub fn workerThread(args: WorkerArgs) void {
                                 .deadline_ms = deadline,
                                 .owned_strings = .none,
                                 .is_tracked_send = true,
+                                .schedule_id = item.schedule_id,
                             }) catch {
                                 log.err("worker {d}: inflight map OOM (tracked send)", .{args.id});
                                 types.freeApiCall(api_call, args.allocator);
@@ -670,6 +718,10 @@ const AsyncTestCtx = struct {
     pool: io_pool.IoPool,
     stop: std.atomic.Value(bool),
     reload_ver: std.atomic.Value(u64),
+    /// Deterministic clock for tests that fire the coroutine reaper structurally.
+    /// Default-initialised here; a test passes its address to spawnWorkerClock
+    /// and advances it instead of sleeping past the wall-clock deadline.
+    clock: std.atomic.Value(i64),
     path_buf: [std.fs.max_path_bytes + 1]u8,
     rules_path: [:0]const u8,
     allocator: std.mem.Allocator,
@@ -713,9 +765,21 @@ const AsyncTestCtx = struct {
 
         self.stop = std.atomic.Value(bool).init(false);
         self.reload_ver = std.atomic.Value(u64).init(0);
+        self.clock = std.atomic.Value(i64).init(0);
     }
 
     fn spawnWorker(self: *AsyncTestCtx, max_inflight: u16, workflow_deadline_ms: u64) !std.Thread {
+        return self.spawnWorkerClock(max_inflight, workflow_deadline_ms, null);
+    }
+
+    /// Spawn the worker, optionally driving its reaper from `clock` (the test's
+    /// deterministic clock). Pass null to use the wall clock (most tests).
+    fn spawnWorkerClock(
+        self: *AsyncTestCtx,
+        max_inflight: u16,
+        workflow_deadline_ms: u64,
+        clock: ?*std.atomic.Value(i64),
+    ) !std.Thread {
         return std.Thread.spawn(.{}, workerThread, .{WorkerArgs{
             .id = 0,
             .rules_path = self.rules_path,
@@ -730,6 +794,7 @@ const AsyncTestCtx = struct {
             .io_result_queue = &self.result_q,
             .max_inflight = max_inflight,
             .workflow_deadline_ms = workflow_deadline_ms,
+            .clock_ms = clock,
         }});
     }
 
@@ -739,8 +804,14 @@ const AsyncTestCtx = struct {
         t.join();
         while (self.input_q.popTimeout(0)) |item| self.allocator.free(item.body);
         while (self.output_q.popTimeout(0)) |call| types.freeApiCall(call, self.allocator);
-        while (self.result_q.popTimeout(0)) |res| io_pool.freeIoResult(res, self.allocator);
+        // Quiesce the io_pool before draining its result queue, mirroring the
+        // production shutdown order (main.zig: pool.deinit() then drain result_qs).
+        // deinit() joins the io threads and SIGKILLs in-flight children, so any
+        // final result — e.g. a "timeout"/error pushErr for a coroutine that was
+        // already reaped — is in the queue by the time we drain. Draining before
+        // the join races that late push and leaks the result's owned string.
         self.pool.deinit();
+        while (self.result_q.popTimeout(0)) |res| io_pool.freeIoResult(res, self.allocator);
         self.result_q.deinit(self.allocator);
         self.output_q.deinit(self.allocator);
         self.input_q.deinit(self.allocator);
@@ -765,6 +836,10 @@ const TestCtx = struct {
     allocator: std.mem.Allocator,
 
     fn init(allocator: std.mem.Allocator, lua_src: []const u8) !TestCtx {
+        return initWithDb(allocator, lua_src, ":memory:");
+    }
+
+    fn initWithDb(allocator: std.mem.Allocator, lua_src: []const u8, db_path: [:0]const u8) !TestCtx {
         var self: TestCtx = undefined;
         self.allocator = allocator;
         self.tmp = testing.tmpDir(.{});
@@ -778,7 +853,7 @@ const TestCtx = struct {
         self.path_buf[path_len] = 0;
         self.rules_path = self.path_buf[0..path_len :0];
 
-        self.db = try state_store.StateStore.open(allocator, ":memory:");
+        self.db = try state_store.StateStore.open(allocator, db_path);
         errdefer self.db.close();
 
         self.input_q = try Queue(types.WorkItem).init(allocator, testing.io, 64);
@@ -1266,6 +1341,211 @@ test "state written in a resumed (post-I/O) segment commits and is read by a lat
     }
 }
 
+test "write before a yield survives a later-segment failure (per-segment durability)" {
+    // Per-segment durability contract: state written in the
+    // pre-yield segment is committed when the coroutine parks, and is NOT rolled
+    // back if a later segment fails. The handler writes user_state, yields on
+    // bot.http_request, then errors in the resumed segment. The failed segment's
+    // own (empty) transaction rolls back; the pre-yield write must remain.
+    //
+    // Contrast with the resume-path COMMIT-failure test below: there the FAILED
+    // segment's own write is dropped. Here the SURVIVING write is the one made
+    // before the yield. The two together pin both halves of the contract.
+    const HTTP_OK = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+    const stub = try spawnStub(HTTP_OK);
+    defer stub.thread.join();
+
+    const lua_src = try std.fmt.allocPrint(testing.allocator,
+        \\function on_message(u)
+        \\  bot.set_user_state(11, {{ pre = "kept" }})
+        \\  bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
+        \\  error("fail after the yield")
+        \\end
+    , .{stub.port});
+    defer testing.allocator.free(lua_src);
+
+    var ctx: AsyncTestCtx = undefined;
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 2, .queue_capacity = 16, .timeout_ms = 5_000, .proc_max_output = 65_536 });
+    const t = try ctx.spawnWorker(64, 60_000);
+    defer ctx.deinit(t);
+
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
+
+    try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":1}"));
+
+    // The resumed segment errors, so no action is dispatched. Poll the state
+    // store until the pre-yield write lands (it commits when the coroutine
+    // parks), bounded so a regression that drops it fails rather than hangs.
+    var found = false;
+    var waited: u64 = 0;
+    while (waited < 5_000) : (waited += 10) {
+        const data = try ctx.db.getUserState(11);
+        defer testing.allocator.free(data);
+        if (std.mem.indexOf(u8, data, "\"pre\":\"kept\"") != null) {
+            found = true;
+            break;
+        }
+        rt.sleepNs(testing.io, 10 * std.time.ns_per_ms);
+    }
+    try testing.expect(found);
+
+    // No action was dispatched by the failed workflow.
+    try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
+}
+
+test "resume-path COMMIT failure drops the segment's actions and its state write" {
+    // P4-42 gap. The resume path commits the just-finished post-yield segment
+    // (worker.zig:258) before emitting its actions; on a COMMIT failure it rolls
+    // back and drops the actions, because they assume state that is now gone.
+    // This pins both halves: (a) the resumed segment's action is NOT dispatched,
+    // and (b) its state write is ABSENT (rolled back).
+    //
+    // Direct contrast with "write before a yield survives a later-segment
+    // failure" above: there the PRE-yield write survives because it committed
+    // when the coroutine parked; here the POST-yield write is in the SAME
+    // transaction as the failing commit, so it must NOT survive. The handler is
+    // kept deliberately parallel so the two fixtures read together.
+    //
+    // The stub delays its response, opening a window in which the coroutine is
+    // parked: the pre-yield (empty) segment has already committed, so arming
+    // fail_next_commit now trips ONLY the resume commit, not the pre-yield one.
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    const srv = try testing.allocator.create(std.Io.net.Server);
+    srv.* = try addr.listen(testing.io, .{ .reuse_address = true });
+    const port = boundPort(srv);
+    const stub_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *std.Io.net.Server) void {
+            const cio = testing.io;
+            defer {
+                s.deinit(cio);
+                testing.allocator.destroy(s);
+            }
+            var stream = s.accept(cio) catch return;
+            defer stream.close(cio);
+            var rbuf: [4096]u8 = undefined;
+            var sr = stream.reader(cio, &rbuf);
+            drainRequestHead(&sr.interface);
+            // Hold the response so the test can arm fail_next_commit while the
+            // coroutine is parked (after the pre-yield commit, before resume).
+            rt.sleepNs(cio, 400 * std.time.ns_per_ms);
+            var wbuf: [256]u8 = undefined;
+            var sw = stream.writer(cio, &wbuf);
+            sw.interface.writeAll(
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+            ) catch {};
+            sw.interface.flush() catch {};
+        }
+    }.run, .{srv});
+    defer stub_thread.join();
+
+    const lua_src = try std.fmt.allocPrint(testing.allocator,
+        \\function on_message(u)
+        \\  bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
+        \\  bot.set_user_state(33, {{ post = "dropped" }})
+        \\  return {{ {{ method="resumed_done", params={{}} }} }}
+        \\end
+    , .{port});
+    defer testing.allocator.free(lua_src);
+
+    var ctx: AsyncTestCtx = undefined;
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 2, .queue_capacity = 16, .timeout_ms = 5_000, .proc_max_output = 65_536 });
+    const t = try ctx.spawnWorker(64, 60_000);
+    defer ctx.deinit(t);
+
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
+
+    try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":1}"));
+
+    // Wait long enough for the coroutine to park on the http_request yield (the
+    // pre-yield segment has committed by now), then arm the one-shot failure so
+    // the resume commit is the one that trips it. 150 ms is well inside the
+    // stub's 400 ms hold.
+    rt.sleepNs(testing.io, 150 * std.time.ns_per_ms);
+    ctx.db.fail_next_commit = true;
+
+    // The resume commit fails → actions dropped, state rolled back. There is no
+    // dispatched action to wait on, so poll the seam reset as the completion
+    // marker (it clears when the resume commit fires).
+    var fired = false;
+    var waited: u64 = 0;
+    while (waited < 5_000) : (waited += 10) {
+        if (!ctx.db.fail_next_commit) {
+            fired = true;
+            break;
+        }
+        rt.sleepNs(testing.io, 10 * std.time.ns_per_ms);
+    }
+    try testing.expect(fired);
+
+    // (a) the resumed segment's action was NOT dispatched.
+    try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
+
+    // (b) the resumed segment's state write is ABSENT — rolled back with the
+    // failed commit. Give a brief settle margin, then read it back.
+    rt.sleepNs(testing.io, 50 * std.time.ns_per_ms);
+    const data = try ctx.db.getUserState(33);
+    defer testing.allocator.free(data);
+    try testing.expect(std.mem.indexOf(u8, data, "\"post\":\"dropped\"") == null);
+}
+
+test "no transaction is held across a yield — a second writer is not blocked" {
+    // A transaction is never held across a yield: that would block
+    // every other writer for the duration of the network call. Update 1 parks
+    // on a hang stub (a yield that never resolves within the test). Update 2,
+    // pushed while update 1 is parked, writes state and commits. If the parked
+    // coroutine still held a write transaction, update 2's BEGIN IMMEDIATE would
+    // block for the full busy_timeout (5 s) and the write would not land
+    // promptly. Asserting update 2 completes is the structural signal.
+    var hang = try spawnHangStub();
+    const port = boundPort(hang.server);
+
+    const lua_src = try std.fmt.allocPrint(testing.allocator,
+        \\function on_message(u)
+        \\  if u.park then
+        \\    bot.http_request{{ method="GET", url=u.url }}
+        \\    return {{}}
+        \\  end
+        \\  bot.set_user_state(22, {{ w = "done" }})
+        \\  return {{ {{ method="committed", params={{}} }} }}
+        \\end
+    , .{});
+    defer testing.allocator.free(lua_src);
+
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
+    defer testing.allocator.free(url);
+    const park_body = try std.fmt.allocPrint(testing.allocator, "{{\"park\":true,\"url\":\"{s}\"}}", .{url});
+    defer testing.allocator.free(park_body);
+
+    var ctx: AsyncTestCtx = undefined;
+    try ctx.init(testing.allocator, lua_src, .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 60_000, .proc_max_output = 65_536 });
+    const t = try ctx.spawnWorker(64, 60_000);
+
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
+
+    // Update 1 parks on the hang stub.
+    try ctx.input_q.push(try asyncWorkItem(testing.allocator, park_body));
+    rt.sleepNs(testing.io, 100 * std.time.ns_per_ms);
+
+    // Update 2 must write and commit while update 1 is parked. A 2 s wait far
+    // exceeds the prompt path yet stays well under the 5 s busy_timeout a held
+    // transaction would impose — so a regression (transaction held across the
+    // yield) fails this assertion instead of passing slowly.
+    try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"park\":false}"));
+    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    {
+        const a = ctx.output_q.pop();
+        defer types.freeApiCall(a, testing.allocator);
+        try testing.expectEqualStrings("committed", a.method);
+    }
+    const data = try ctx.db.getUserState(22);
+    defer testing.allocator.free(data);
+    try testing.expect(std.mem.indexOf(u8, data, "\"w\":\"done\"") != null);
+
+    // Unblock the io_pool HTTP thread before deinit joins the pool.
+    hang.deinit();
+    ctx.deinit(t);
+}
+
 test "two sequential bot.http_request calls → two yields, correct order" {
     const HTTP_A = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nA";
     const HTTP_B = "HTTP/1.1 201 Created\r\nContent-Length: 1\r\nConnection: close\r\n\r\nB";
@@ -1348,9 +1628,14 @@ test "re-yield against a populated inflight map — 8 coroutines, two yields eac
 }
 
 test "coroutine past WORKFLOW_DEADLINE_MS is reaped; worker continues" {
-    var silent = try spawnSilentStub();
-    defer silent.deinit();
-    const port = boundPort(silent.server);
+    // The reaper runs on an injected deterministic clock, not the wall clock:
+    // the test parks a coroutine on a hang stub, advances the clock past the
+    // workflow deadline, then polls the reaped-count metric. Firing the deadline
+    // structurally — rather than sleeping past a real-time margin — removes the
+    // race against parallel-suite OS scheduling that made this test flaky.
+    var m = metrics_mod.Metrics{};
+    var hang = try spawnHangStub();
+    const port = boundPort(hang.server);
 
     const lua_src = try std.fmt.allocPrint(testing.allocator,
         \\function on_message(u)
@@ -1370,19 +1655,60 @@ test "coroutine past WORKFLOW_DEADLINE_MS is reaped; worker continues" {
 
     var ctx: AsyncTestCtx = undefined;
     try ctx.init(testing.allocator, lua_src, .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 60_000, .proc_max_output = 65_536 });
-    const t = try ctx.spawnWorker(64, 200); // 200ms deadline
-    defer ctx.deinit(t);
+    // Seed the clock so the deadline (clock + 200) is a fixed, known value.
+    ctx.clock.store(1_000, .release);
+    const t = try std.Thread.spawn(.{}, workerThread, .{WorkerArgs{
+        .id = 0,
+        .rules_path = ctx.rules_path,
+        .allocator = ctx.allocator,
+        .io = testing.io,
+        .queue = &ctx.input_q,
+        .dispatcher_queue = &ctx.output_q,
+        .db = &ctx.db,
+        .stop = &ctx.stop,
+        .reload_ver = &ctx.reload_ver,
+        .io_pool_ptr = &ctx.pool,
+        .io_result_queue = &ctx.result_q,
+        .max_inflight = 64,
+        .workflow_deadline_ms = 200,
+        .metrics = &m,
+        .clock_ms = &ctx.clock,
+    }});
+
     rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
-
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, hang_body));
-    rt.sleepNs(testing.io, 400 * std.time.ns_per_ms);
 
+    // Wait for the coroutine to park (the reaper only acts on parked entries).
+    {
+        var waited: u64 = 0;
+        while (m.coroutines_inflight.load(.monotonic) == 0 and waited < 2_000) : (waited += 5) {
+            rt.sleepNs(testing.io, 5 * std.time.ns_per_ms);
+        }
+        try testing.expectEqual(@as(i64, 1), m.coroutines_inflight.load(.monotonic));
+    }
+
+    // Advance the clock past the deadline (1_000 + 200). The next reaper pass
+    // fires; poll the reaped count rather than sleeping a wall-clock margin.
+    ctx.clock.store(1_500, .release);
+    {
+        var waited: u64 = 0;
+        while (m.coroutines_reaped_total.load(.monotonic) == 0 and waited < 2_000) : (waited += 5) {
+            rt.sleepNs(testing.io, 5 * std.time.ns_per_ms);
+        }
+    }
+    try testing.expectEqual(@as(u64, 1), m.coroutines_reaped_total.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), m.coroutines_inflight.load(.monotonic));
+
+    // The worker keeps running after the reap: a fresh update is answered.
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"hang\":false}"));
     try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
-
     const action = ctx.output_q.pop();
     defer types.freeApiCall(action, testing.allocator);
     try testing.expectEqualStrings("ok", action.method);
+
+    // Unblock the io_pool HTTP thread before deinit joins the pool.
+    hang.deinit();
+    ctx.deinit(t);
 }
 
 test "at inflight ceiling new updates are not dequeued until a slot frees" {
@@ -1739,8 +2065,8 @@ test "coroutines_inflight / coroutines_reaped_total metrics" {
     var m = metrics_mod.Metrics{};
 
     // Use spawnHangStub (not spawnSilentStub): it holds the connection open
-    // so the coroutine stays parked long enough to verify the metrics, and it
-    // is safe to deinit() before ctx.deinit() to unblock the io_pool thread.
+    // so the coroutine stays parked, and it is safe to deinit() before
+    // ctx.deinit() to unblock the io_pool thread.
     var silent = try spawnHangStub();
     const port = boundPort(silent.server);
 
@@ -1759,6 +2085,9 @@ test "coroutines_inflight / coroutines_reaped_total metrics" {
 
     var ctx: AsyncTestCtx = undefined;
     try ctx.init(testing.allocator, lua_src, .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 60_000, .proc_max_output = 65_536 });
+    // Inject a deterministic clock so the reap fires on a clock advance, not a
+    // wall-clock sleep — the de-flake shared with the P2-1 reaper test.
+    ctx.clock.store(1_000, .release);
 
     const t = try std.Thread.spawn(.{}, workerThread, .{WorkerArgs{
         .id = 0,
@@ -1773,19 +2102,31 @@ test "coroutines_inflight / coroutines_reaped_total metrics" {
         .io_pool_ptr = &ctx.pool,
         .io_result_queue = &ctx.result_q,
         .max_inflight = 64,
-        .workflow_deadline_ms = 200, // short deadline for test speed
+        .workflow_deadline_ms = 200,
         .metrics = &m,
+        .clock_ms = &ctx.clock,
     }});
 
     rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, body));
 
-    // Give the worker time to park the coroutine.
-    rt.sleepNs(testing.io, 100 * std.time.ns_per_ms);
-    const inflight_while_parked = m.coroutines_inflight.load(.monotonic);
+    // Poll for the coroutine to park: the inflight gauge reaches 1.
+    {
+        var waited: u64 = 0;
+        while (m.coroutines_inflight.load(.monotonic) == 0 and waited < 2_000) : (waited += 5) {
+            rt.sleepNs(testing.io, 5 * std.time.ns_per_ms);
+        }
+    }
+    try testing.expectEqual(@as(i64, 1), m.coroutines_inflight.load(.monotonic));
 
-    // Wait for deadline reap (200ms deadline + 100ms margin).
-    rt.sleepNs(testing.io, 400 * std.time.ns_per_ms);
+    // Advance the clock past the deadline (1_000 + 200) and poll for the reap.
+    ctx.clock.store(1_500, .release);
+    {
+        var waited: u64 = 0;
+        while (m.coroutines_reaped_total.load(.monotonic) == 0 and waited < 2_000) : (waited += 5) {
+            rt.sleepNs(testing.io, 5 * std.time.ns_per_ms);
+        }
+    }
     const reaped = m.coroutines_reaped_total.load(.monotonic);
     const inflight_after_reap = m.coroutines_inflight.load(.monotonic);
 
@@ -1794,7 +2135,6 @@ test "coroutines_inflight / coroutines_reaped_total metrics" {
     silent.deinit();
     ctx.deinit(t);
 
-    try testing.expectEqual(@as(i64, 1), inflight_while_parked);
     try testing.expectEqual(@as(u64, 1), reaped);
     try testing.expectEqual(@as(i64, 0), inflight_after_reap);
 }
@@ -1974,4 +2314,128 @@ test "worker exits within WORKFLOW_DEADLINE_MS + 200ms with non-responding stub"
 
     // worker must exit within WORKFLOW_DEADLINE_MS + 200ms epsilon.
     try testing.expect(elapsed_ms < 400);
+}
+
+test "scheduled job fires on_schedule and deletes its row (at-least-once happy path)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const plen = try tmp.dir.realPathFile(testing.io, ".", pbuf[0..std.fs.max_path_bytes]);
+    var dbbuf: [std.fs.max_path_bytes + 8]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&dbbuf, "{s}/s.db", .{pbuf[0..plen]});
+
+    // Seed a due job through one connection.
+    {
+        var seed = try state_store.StateStore.open(testing.allocator, db_path);
+        defer seed.close();
+        _ = try seed.scheduleInsert(rt.nowMs(testing.io) - 1, "{\"chat\":7}");
+    }
+
+    var ctx = try TestCtx.initWithDb(testing.allocator,
+        \\function on_schedule(payload, id)
+        \\  return { { method = "sendMessage", params = { chat_id = payload.chat, text = "fired" } } }
+        \\end
+    , db_path);
+    // Scheduler teardown defer registered AFTER ctx.deinit defer so it runs FIRST (LIFO).
+    const wt = try ctx.spawnWorker();
+    defer ctx.deinit(wt);
+
+    var sched = scheduler.Scheduler{ .io = testing.io, .wait_cap_ns = 50 * std.time.ns_per_ms };
+    var sched_db = try state_store.StateStore.open(testing.allocator, db_path);
+    errdefer sched_db.close();
+    var qs = [_]*Queue(types.WorkItem){&ctx.input_q};
+    const st = try std.Thread.spawn(.{}, scheduler.schedulerThread, .{scheduler.SchedulerArgs{
+        .db = &sched_db, .worker_qs = &qs, .sched = &sched,
+        .stop = &ctx.stop, .io = testing.io, .allocator = testing.allocator,
+    }});
+    // This defer runs BEFORE ctx.deinit(wt) above (LIFO), stopping the scheduler
+    // thread and closing its DB before the worker's DB and tmp dir are cleaned up.
+    defer {
+        ctx.stop.store(true, .release);
+        sched.wakeUp();
+        st.join();
+        sched_db.close();
+    }
+
+    // The worker emits the sendMessage from on_schedule.
+    try testing.expect(waitQueue(&ctx.output_q, 1, 3000));
+    const action = popAction(&ctx.output_q);
+    defer types.freeApiCall(action, testing.allocator);
+    try testing.expect(bodyHas(action.payload.json, "\"text\":\"fired\""));
+
+    // The schedule row must be gone — deleted inside the handler transaction.
+    var check = try state_store.StateStore.open(testing.allocator, db_path);
+    defer check.close();
+    try testing.expectEqual(@as(?i64, null), try check.scheduleMinFire(rt.nowMs(testing.io) + 1_000_000));
+}
+
+test "scheduled job whose handler COMMIT fails keeps its row (delete atomic with commit)" {
+    // P3-9 strengthening sub-case. The happy-path test above checks only the
+    // success end state. This pins the atomicity contract: the row delete runs
+    // INSIDE the handler transaction (scheduleDelete then commit), so a COMMIT
+    // failure must roll the delete back too — a failed handler commit must never
+    // orphan-delete the row. The job stays present and re-claimable, preserving
+    // at-least-once (a crashed/failed firing is retried, never silently lost).
+    //
+    // The schedule WorkItem is pushed directly (kind = .schedule, no scheduler
+    // thread) so the firing is deterministic, and fail_next_commit is armed
+    // before the push so the one commit that finalizes on_schedule is the one
+    // that fails.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const plen = try tmp.dir.realPathFile(testing.io, ".", pbuf[0..std.fs.max_path_bytes]);
+    var dbbuf: [std.fs.max_path_bytes + 8]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&dbbuf, "{s}/s.db", .{pbuf[0..plen]});
+
+    // Seed one due job through a throwaway connection so the row is durable in
+    // the file DB before the worker fires it.
+    var sid: i64 = undefined;
+    {
+        var seed = try state_store.StateStore.open(testing.allocator, db_path);
+        defer seed.close();
+        sid = try seed.scheduleInsert(rt.nowMs(testing.io) - 1, "{\"chat\":7}");
+    }
+
+    var ctx = try TestCtx.initWithDb(testing.allocator,
+        \\function on_schedule(payload, id)
+        \\  return { { method = "sendMessage", params = { chat_id = payload.chat, text = "fired" } } }
+        \\end
+    , db_path);
+    const wt = try ctx.spawnWorker();
+    defer ctx.deinit(wt);
+
+    // Arm the one-shot commit failure, then fire the job. The on_schedule
+    // handler does not yield, so the start-path commit that finalizes it is the
+    // next (and only) commit — exactly the one this gate trips.
+    ctx.db.fail_next_commit = true;
+    try ctx.input_q.push(.{
+        .body = try testing.allocator.dupe(u8, "{\"chat\":7}"),
+        .user_id = null,
+        .kind = .schedule,
+        .schedule_id = sid,
+    });
+
+    // Give the worker time to fire the handler and hit the failing commit. No
+    // action is dispatched (commit failed → actions dropped), so there is no
+    // output-queue signal to wait on; poll the seam's reset as the completion
+    // marker, then assert the row survived.
+    var fired = false;
+    var waited: u64 = 0;
+    while (waited < 3_000) : (waited += 10) {
+        if (!ctx.db.fail_next_commit) {
+            fired = true;
+            break;
+        }
+        rt.sleepNs(testing.io, 10 * std.time.ns_per_ms);
+    }
+    try testing.expect(fired);
+
+    // The row must still be present and re-claimable through a fresh connection:
+    // the delete was rolled back with the failed commit, not orphaned.
+    var check = try state_store.StateStore.open(testing.allocator, db_path);
+    defer check.close();
+    try testing.expect((try check.scheduleMinFire(rt.nowMs(testing.io) + 1_000_000)) != null);
+    // And no action escaped the failed firing.
+    try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
 }

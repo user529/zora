@@ -56,3 +56,14 @@ test "io returns a usable runtime: sleep and futex round-trip" {
     m.lockUncancelable(t);
     m.unlock(t);
 }
+
+test "nowMs and nowNs advance across a sleep" {
+    const t = io();
+    // Both helpers read the same clock; a real sleep between two reads must move
+    // the returned value forward, guarding against a stuck or zeroed timestamp.
+    const ns_before = nowNs(t);
+    const ms_before = nowMs(t);
+    sleepNs(t, 2 * std.time.ns_per_ms);
+    try std.testing.expect(nowNs(t) > ns_before);
+    try std.testing.expect(nowMs(t) >= ms_before);
+}

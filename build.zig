@@ -98,6 +98,7 @@ pub fn build(b: *std.Build) void {
     const src_files = [_][]const u8{
         "src/rt.zig",
         "src/types.zig",
+        "src/metrics.zig",
         "src/config.zig",
         "src/queue.zig",
         "src/io_pool.zig",
@@ -109,6 +110,7 @@ pub fn build(b: *std.Build) void {
         "src/watcher.zig",
         "src/worker.zig",
         "src/delay.zig",
+        "src/scheduler.zig",
         "src/dispatcher.zig",
         "src/server.zig",
         "src/main.zig",

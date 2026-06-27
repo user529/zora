@@ -67,9 +67,18 @@ pub fn freeApiCalls(calls: []ApiCall, allocator: std.mem.Allocator) void {
 // frees it after `callOnMessage` returns.
 // ---------------------------------------------------------------------------
 
+/// Which ingress produced a WorkItem — selects the Lua handler in worker.zig.
+/// A third ingress is planned; the worker dispatches via an exhaustive switch
+/// with no `else`, so a new variant cannot compile without choosing a handler.
+pub const WorkKind = enum { message, schedule };
+
 pub const WorkItem = struct {
-    body: []const u8, // owned: raw webhook JSON, freed by the worker
-    user_id: ?i64,    // routing key; null when no sender could be extracted
+    body: []const u8, // owned: raw webhook JSON (message) or job payload JSON (schedule)
+    user_id: ?i64,    // routing key for messages; null for round-robined schedule jobs
+    kind: WorkKind = .message,
+    /// Set only for `.schedule` items: the schedule row id, so the worker can
+    /// delete the row on terminal success and pass it to on_schedule.
+    schedule_id: ?i64 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -209,4 +218,14 @@ test "optional ApiCall fields default null and survive free" {
         defer freeApiCall(plain, alloc);
         try std.testing.expect(plain.tracking == null);
     }
+}
+
+test "WorkItem kind defaults to message; schedule fields settable" {
+    const m = WorkItem{ .body = "x", .user_id = 7 };
+    try std.testing.expectEqual(WorkKind.message, m.kind);
+    try std.testing.expectEqual(@as(?i64, null), m.schedule_id);
+
+    const s = WorkItem{ .body = "p", .user_id = null, .kind = .schedule, .schedule_id = 42 };
+    try std.testing.expectEqual(WorkKind.schedule, s.kind);
+    try std.testing.expectEqual(@as(?i64, 42), s.schedule_id);
 }

@@ -235,17 +235,92 @@ test "requeueThread moves a due call to disp_q after its delay" {
         .metrics = null, .allocator = testing.allocator,
     }});
 
-    const now = rt.nowMs(rt.io());
-    try dq.push(now + 100, try dummyCall(testing.allocator, 1));
+    // Push a call due 100 ms out; record the push instant to bound the gap.
+    const pushed_at = rt.nowMs(rt.io());
+    try dq.push(pushed_at + 100, try dummyCall(testing.allocator, 1));
 
     // Not delivered before its ready time.
     try testing.expectEqual(@as(?types.ApiCall, null), disp.popTimeout(20 * std.time.ns_per_ms));
 
-    // Delivered shortly after.
+    // Delivered shortly after its ready time.
     const got = disp.popTimeout(2 * std.time.ns_per_s);
     try testing.expect(got != null);
+    const delivered_at = rt.nowMs(rt.io());
     types.freeApiCall(got.?, testing.allocator);
+
+    // The delay actually elapsed: a zero-delay requeue could not pass this.
+    // 80 ms is a structural lower bound, comfortably below the 100 ms nominal
+    // delay so it stays reliable under load.
+    try testing.expect(delivered_at - pushed_at >= 80);
 
     stop.store(true, .release);
     t.join();
+}
+
+test "requeueThread sheds a due call when disp_q is full" {
+    // disp_q capacity 1, pre-filled so the next push returns error.QueueFull.
+    var disp = try queue_mod.Queue(types.ApiCall).init(testing.allocator, rt.io(), 1);
+    defer disp.deinit(testing.allocator);
+    const filler = try dummyCall(testing.allocator, 99);
+    try disp.push(filler);
+
+    var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
+    defer dq.deinitDrain(testing.allocator);
+    var metrics = metrics_mod.Metrics{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    // A due item: requeueThread pops it, fails to push (disp_q full), sheds it.
+    try dq.push(rt.nowMs(rt.io()) - 1, try dummyCall(testing.allocator, 1));
+
+    const t = try std.Thread.spawn(.{}, requeueThread, .{RequeueArgs{
+        .delay_q = &dq, .disp_q = &disp, .stop = &stop,
+        .metrics = &metrics, .allocator = testing.allocator,
+    }});
+
+    // Poll the shed counter with a bounded timeout instead of a fixed sleep.
+    const deadline = rt.nowMs(rt.io()) + 2000;
+    while (metrics.throttle_shed_total.load(.monotonic) == 0 and rt.nowMs(rt.io()) < deadline) {
+        rt.sleepNs(rt.io(), std.time.ns_per_ms);
+    }
+
+    stop.store(true, .release);
+    t.join();
+
+    // Exactly one shed; the full disp_q was not force-enqueued.
+    try testing.expectEqual(@as(u64, 1), metrics.throttle_shed_total.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), disp.len());
+
+    // Drain the pre-filled item so the testing allocator sees no leak.
+    const left = disp.popTimeout(0).?;
+    types.freeApiCall(left, testing.allocator);
+}
+
+test "DelayQueue waitNext is woken early by a push" {
+    var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
+    defer dq.deinitDrain(testing.allocator);
+
+    const Blocker = struct {
+        // Block in waitNext with a 2 s ceiling and record the elapsed time.
+        fn run(q: *DelayQueue, elapsed_ms: *i64, started: *std.atomic.Value(bool)) void {
+            const before = rt.nowMs(q.io);
+            started.store(true, .release);
+            // No entry yet ⇒ waitNext parks on the wake futex for up to 2 s.
+            q.waitNext(rt.nowMs(q.io), 2 * std.time.ns_per_s);
+            elapsed_ms.* = rt.nowMs(q.io) - before;
+        }
+    };
+
+    var elapsed_ms: i64 = 0;
+    var started = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Blocker.run, .{ &dq, &elapsed_ms, &started });
+
+    // Ensure the waiter is parked, then push a due item to wake it early.
+    while (!started.load(.acquire)) {}
+    rt.sleepNs(rt.io(), 20 * std.time.ns_per_ms);
+    try dq.push(rt.nowMs(rt.io()), try dummyCall(testing.allocator, 1));
+
+    t.join();
+
+    // The push woke waitNext well before the 2 s ceiling.
+    try testing.expect(elapsed_ms < 500);
 }

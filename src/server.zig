@@ -26,7 +26,7 @@ const log = std.log.scoped(.server);
 pub const MAX_BODY_BYTES: usize = 1 * 1024 * 1024;
 
 /// Maximum number of concurrently open connection-handler threads.
-/// Connections beyond this limit are dropped at the accept level.
+/// The accept loop drops connections beyond this limit.
 pub const MAX_CONNECTIONS: u32 = 1024;
 
 /// Idle timeout (ms) to wait for a connected client's first byte before giving
@@ -68,7 +68,7 @@ pub const Server = struct {
     active: std.atomic.Value(u32),
     /// Fixed handler-thread pool (std.Thread.Pool was removed in 0.16). The
     /// accept thread pushes accepted streams to conn_queue; these threads pop
-    /// and serve them, so threads are reused rather than spawned per connection.
+    /// and serve them, so the pool reuses threads rather than spawning one per connection.
     handler_threads: []std.Thread,
     conn_queue: q_mod.Queue(std.Io.net.Stream),
     read_idle_timeout_ms: u32,
@@ -523,16 +523,29 @@ const TestSetup = struct {
     srv: *Server,
 
     fn init(n: usize, secret: []const u8) !*TestSetup {
-        return initTimeout(n, secret, DEFAULT_READ_IDLE_TIMEOUT_MS);
+        return initFull(n, secret, DEFAULT_READ_IDLE_TIMEOUT_MS, 512, null);
     }
 
     fn initTimeout(n: usize, secret: []const u8, read_idle_timeout_ms: u32) !*TestSetup {
+        return initFull(n, secret, read_idle_timeout_ms, 512, null);
+    }
+
+    /// Full constructor: N queues of `capacity` items each, optional metrics sink.
+    /// Saturation/overflow tests use a tiny capacity (so a queue fills with a
+    /// single update) and a metrics pointer (so the route counters are observable).
+    fn initFull(
+        n: usize,
+        secret: []const u8,
+        read_idle_timeout_ms: u32,
+        capacity: usize,
+        metrics: ?*metrics_mod.Metrics,
+    ) !*TestSetup {
         std.debug.assert(n > 0 and n <= MAX_Q);
         const self = try testing.allocator.create(TestSetup);
         errdefer testing.allocator.destroy(self);
         self.q_count = n;
         for (0..n) |i| {
-            self.q_store[i] = try Queue(types.WorkItem).init(testing.allocator, testing.io, 512);
+            self.q_store[i] = try Queue(types.WorkItem).init(testing.allocator, testing.io, capacity);
             self.q_ptrs[i] = &self.q_store[i];
         }
         const bind_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
@@ -544,6 +557,7 @@ const TestSetup = struct {
             .io = testing.io,
             .pool_threads = 2,
             .read_idle_timeout_ms = read_idle_timeout_ms,
+            .metrics = metrics,
         });
         return self;
     }
@@ -755,7 +769,7 @@ test "body > 1 MB → 413, server does not allocate unbounded memory" {
     defer ts.deinit();
 
     const status = try httpOversizeBody(ts.serverAddr(), TEST_SECRET);
-    try testing.expect(status == 413 or status == 400);
+    try testing.expectEqual(@as(u16, 413), status);
     try testing.expectEqual(@as(usize, 0), ts.queueLen(0));
 }
 
@@ -866,6 +880,75 @@ test "pool-backed server: 50 sequential connections all 200, deinit drains clean
 
     // Reaching here (and ts.deinit returning) proves pool.deinit() drains the
     // accepted connections and joins its workers without hanging or leaking.
+}
+
+// ---------------------------------------------------------------------------
+// Routing under backpressure: affinity-overflow placement and all-full drop
+//
+// Both paths relax the hash(user_id)%N affinity and record it on Metrics:
+//   - overflow: primary queue full, update placed on a later queue → still 200.
+//   - drop:     every queue full, update shed → 503.
+// hashUserId(2, 2) == 0, so an update from user_id 2 routes primarily to
+// queue 0; pre-filling queue 0 forces the chosen path deterministically.
+// ---------------------------------------------------------------------------
+
+/// A minimal valid Update from user_id 2 (routes to queue 0 under N=1 and N=2).
+const UPDATE_USER_2 =
+    \\{"update_id":1,"message":{"message_id":1,"from":{"id":2,"is_bot":false,"first_name":"T"},"chat":{"id":2,"type":"private"},"date":0}}
+;
+
+/// Push a placeholder WorkItem (heap-owned body, freed by TestSetup.deinit) to
+/// fill a queue slot so the server sees that queue at capacity.
+fn fillQueue(ts: *TestSetup, qi: usize) !void {
+    const body = try testing.allocator.dupe(u8, "{}");
+    try ts.q_store[qi].push(.{ .body = body, .user_id = null });
+}
+
+test "primary queue full → affinity-overflow places update on next queue, 200, route_overflow_total++" {
+    var metrics = metrics_mod.Metrics{};
+    // Two queues, capacity 1 each: filling queue 0 leaves queue 1 free, so the
+    // overflow path (place elsewhere + 200) is taken rather than the drop path.
+    const ts = try TestSetup.initFull(2, TEST_SECRET, DEFAULT_READ_IDLE_TIMEOUT_MS, 1, &metrics);
+    defer ts.deinit();
+
+    try fillQueue(ts, 0); // queue 0 at capacity; primary for user_id 2
+
+    const status = try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, UPDATE_USER_2);
+    try testing.expectEqual(@as(u16, 200), status);
+
+    // Update landed on the non-primary queue, not dropped.
+    try testing.expectEqual(@as(usize, 1), ts.queueLen(0)); // unchanged (the placeholder)
+    try testing.expectEqual(@as(usize, 1), ts.queueLen(1)); // the overflowed update
+    try testing.expectEqual(@as(u64, 1), metrics.route_overflow_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), metrics.route_drop_total.load(.monotonic));
+}
+
+test "all queues full → update dropped with 503, queue length unchanged" {
+    var metrics = metrics_mod.Metrics{};
+    // Single queue, capacity 1: once filled, every queue is saturated, so the
+    // next update is shed (503) rather than placed.
+    const ts = try TestSetup.initFull(1, TEST_SECRET, DEFAULT_READ_IDLE_TIMEOUT_MS, 1, &metrics);
+    defer ts.deinit();
+
+    try fillQueue(ts, 0); // the only queue is now at capacity
+
+    const status = try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, UPDATE_USER_2);
+    try testing.expectEqual(@as(u16, 503), status);
+
+    // The dropped update was not enqueued: the queue still holds only the filler.
+    try testing.expectEqual(@as(usize, 1), ts.queueLen(0));
+
+    // route_drop_total is NOT incremented here. A steadily-saturated server is
+    // shed at the accept loop ("all worker queues saturated — dropping
+    // connection"), which sends 503 without touching the counter; the only path
+    // that increments route_drop_total is the in-handleRequest push-loop drop,
+    // reached only in the narrow race where a queue fills *between* the accept
+    // check and the push. So under the very condition the counter names, it
+    // stays 0. See task report (B13) — flagged as a possible production bug,
+    // not fixed here (this task touches tests only). The assertion below pins
+    // the current behavior so a future fix that wires the counter is visible.
+    try testing.expectEqual(@as(u64, 0), metrics.route_drop_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), metrics.route_overflow_total.load(.monotonic));
 }
 
 test "stalled client (sends nothing) is reclaimed by the read timeout" {

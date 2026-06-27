@@ -73,7 +73,10 @@ pub fn watcherThread(args: WatcherArgs) void {
     // Duplicate so the caller can free its copy any time after spawning.
     // The defer below never executes — the function loops forever.
     const owned = args.allocator.dupe(u8, args.rules_path) catch {
-        log.err("watcherThread: OOM duplicating rules path — watcher not started", .{});
+        // Degraded-but-running: the process keeps serving with workers on the
+        // rules already loaded; only hot-reload is lost. Same severity as the
+        // file-deleted notice below, which is likewise "feature off, bot fine".
+        log.warn("watcherThread: OOM duplicating rules path — hot-reload disabled, workers keep current rules", .{});
         return;
     };
     defer args.allocator.free(owned);
@@ -351,20 +354,23 @@ const LUA_V0 = "-- rules v0";
 const LUA_V1 = "-- rules v1";
 const LUA_V2 = "-- rules v2";
 
-test "reload_version starts at zero and Value(u64) orders with acquire/release" {
-    // A fresh counter starts at 0. The process-global reload_version may have
-    // been advanced by other tests, so only its non-negative invariant holds.
-    const fresh = std.atomic.Value(u64).init(0);
-    try testing.expectEqual(@as(u64, 0), fresh.load(.acquire));
-    try testing.expect(reload_version.raw >= 0);
+test "bumpReloadCounter increments the counter it is handed" {
+    // Exercise our callback, not the stdlib atomic. bumpReloadCounter is the
+    // on_write handler wired into every watcher path; it must advance the
+    // counter passed as its opaque context by exactly one per call.
+    var counter = std.atomic.Value(u64).init(0);
+    bumpReloadCounter(&counter);
+    try testing.expectEqual(@as(u64, 1), counter.load(.acquire));
+    bumpReloadCounter(&counter);
+    bumpReloadCounter(&counter);
+    try testing.expectEqual(@as(u64, 3), counter.load(.acquire));
 
-    // fetchAdd(.release) is observed in order by load(.acquire).
-    var v = std.atomic.Value(u64).init(0);
-    _ = v.fetchAdd(1, .release);
-    try testing.expectEqual(@as(u64, 1), v.load(.acquire));
-    _ = v.fetchAdd(1, .release);
-    _ = v.fetchAdd(1, .release);
-    try testing.expectEqual(@as(u64, 3), v.load(.acquire));
+    // The process-global reload_version starts at 0 and is the context the
+    // production wrappers hand to bumpReloadCounter. Confirm the same call
+    // advances it from a captured baseline (other tests may have run first).
+    const before = reload_version.load(.acquire);
+    bumpReloadCounter(&reload_version);
+    try testing.expectEqual(before + 1, reload_version.load(.acquire));
 }
 
 test "watcherPoll detects file write within 1500ms" {
@@ -482,7 +488,7 @@ test "(Linux) 3 writes 200ms apart → counter >= 3 within 2s of last write" {
     try testing.expect(waitForCount(&counter, 3, 2000));
 }
 
-test "(Linux) atomic rename (tmp → rules.lua) → counter incremented within 1000ms" {
+test "(Linux) atomic rename (tmp → rules.lua) → counter incremented within 2000ms" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
@@ -508,7 +514,11 @@ test "(Linux) atomic rename (tmp → rules.lua) → counter incremented within 1
     }.run, .{ctx});
     t.detach();
 
-    rt.sleepNs(rt.io(), 20 * std.time.ns_per_ms);
+    // De-flake: under parallel-suite load, inotify MOVED_TO delivery races
+    // OS scheduling. Give the watch a full 50 ms to be established before the
+    // rename, and poll the counter over a 2000 ms window (matching the
+    // CLOSE_WRITE test's tolerance) rather than a single short wait.
+    rt.sleepNs(rt.io(), 50 * std.time.ns_per_ms);
 
     // Atomic write: write to tmp then rename.
     {
@@ -516,10 +526,10 @@ test "(Linux) atomic rename (tmp → rules.lua) → counter incremented within 1
     }
     try tmp.dir.rename("rules.lua.tmp", tmp.dir, "rules.lua", testing.io);
 
-    try testing.expect(waitForCount(&counter, 1, 1000));
+    try testing.expect(waitForCount(&counter, 1, 2000));
 }
 
-test "(Linux) file deleted and recreated — watcher does not panic" {
+test "(Linux) file deletion fires the on_delete callback exactly once" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
@@ -533,28 +543,93 @@ test "(Linux) file deleted and recreated — watcher does not panic" {
     const path_len = try tmp.dir.realPathFile(testing.io, "rules.lua", &path_buf);
     const path = path_buf[0..path_len];
 
-    var counter = std.atomic.Value(u64).init(0);
+    // Drive watchInotify directly so we can register an on_delete handler —
+    // the production WatchTarget already exposes one; this asserts it fires.
+    // Both callbacks share one opaque context (a Counters struct), so a delete
+    // and a write land in distinct fields and cannot be confused.
+    const Counters = struct {
+        deletes: std.atomic.Value(u64) = .init(0),
+        writes:  std.atomic.Value(u64) = .init(0),
+
+        fn onDelete(context: *anyopaque) void {
+            const c: *@This() = @alignCast(@ptrCast(context));
+            _ = c.deletes.fetchAdd(1, .release);
+        }
+        fn onWrite(context: *anyopaque) void {
+            const c: *@This() = @alignCast(@ptrCast(context));
+            _ = c.writes.fetchAdd(1, .release);
+        }
+    };
+    var counters = Counters{};
 
     const Ctx = struct {
         path: []const u8,
-        ctr:  *std.atomic.Value(u64),
+        cnt:  *Counters,
     };
-    const ctx = Ctx{ .path = path, .ctr = &counter };
+    const ctx = Ctx{ .path = path, .cnt = &counters };
     const t = try std.Thread.spawn(.{}, struct {
-        fn run(c: Ctx) void { watcherInotify(c.path, c.ctr); }
+        fn run(c: Ctx) void {
+            watchInotify(.{
+                .path      = c.path,
+                .context   = c.cnt,
+                .on_write  = Counters.onWrite,
+                .on_delete = Counters.onDelete,
+            });
+        }
     }.run, .{ctx});
     t.detach();
 
-    rt.sleepNs(rt.io(), 20 * std.time.ns_per_ms);
-
-    // Delete the file.
-    try tmp.dir.deleteFile(testing.io, "rules.lua");
+    // Establish the watch before mutating the file.
     rt.sleepNs(rt.io(), 50 * std.time.ns_per_ms);
 
-    // Recreate it (watcher may or may not pick this up, but must not panic).
+    // Delete the file → on_delete must fire once.
+    try tmp.dir.deleteFile(testing.io, "rules.lua");
+
+    try testing.expect(waitForCount(&counters.deletes, 1, 2000));
+
+    // No further deletes should arrive from the single removal. Give the
+    // watcher a settle window, then confirm the count is still exactly one
+    // and that the deletion was not misreported as a write.
+    rt.sleepNs(rt.io(), 100 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u64, 1), counters.deletes.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), counters.writes.load(.acquire));
+}
+
+test "(Linux) watcherThread returns when the path dupe fails — no reload bump" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V0 });
+    }
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(testing.io, "rules.lua", &path_buf);
+    const path = path_buf[0..path_len];
+
+    // A failing allocator (zero allowed allocations) makes watcherThread's
+    // rules-path dupe fail; it must log and return rather than establish a
+    // watch. watcherThread targets the process-global reload_version, so we
+    // capture that baseline and assert no increment follows a file write.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const before = reload_version.load(.acquire);
+
+    const args = WatcherArgs{
+        .rules_path = path,
+        .allocator  = failing.allocator(),
+        .io         = testing.io,
+    };
+    // watcherThread returns immediately on the OOM path, so a plain join is
+    // safe — it never reaches the blocking inotify loop.
+    const t = try std.Thread.spawn(.{}, watcherThread, .{args});
+    t.join();
+
+    // No watch was ever set up; a write must not bump the counter.
     {
         try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V1 });
     }
-    rt.sleepNs(rt.io(), 100 * std.time.ns_per_ms);
-    // The test passes if execution reaches here without panic.
+    rt.sleepNs(rt.io(), 200 * std.time.ns_per_ms);
+    try testing.expectEqual(before, reload_version.load(.acquire));
 }

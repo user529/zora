@@ -5,7 +5,7 @@
 ///
 ///   { "methods": { "<name>": { "fields": [ { name, types, required }, ... ] } } }
 ///
-/// One immutable `SchemaStore` is parsed per process. `SchemaSlot` holds it
+/// Each process parses one immutable `SchemaStore`. `SchemaSlot` holds it
 /// behind an atomic pointer so the watcher can swap in a re-parsed copy
 /// without locking the read path. The validator (`validate`) is the *logic*
 /// side — it lives here, in the Zig core, because the structural-check
@@ -446,6 +446,13 @@ test "loadInitial reads a file; install swaps and retires" {
     slot.install(s2);
     try testing.expectEqual(@as(u64, 2), slot.version.load(.acquire));
     try testing.expectEqual(@as(usize, 1), slot.retired.items.len);
+
+    // The newly installed store is now live: get() returns s2, not the old s1.
+    try testing.expect(slot.get() == s2);
+    // The displaced store was retired — not the wrong pointer, and not freed:
+    // it is exactly s1, and its methods are still reachable through it.
+    try testing.expect(slot.retired.items[0] == s1);
+    try testing.expect(slot.retired.items[0].method("sendMessage") != null);
 }
 
 test "loadInitial on a missing file leaves the slot empty" {
@@ -487,7 +494,28 @@ test "schema watcher hot-reloads; a broken file is rejected" {
         t.join();
     }
 
-    rt.sleepNs(rt.io(), 120 * std.time.ns_per_ms); // record initial mtime
+    // Establish a deterministic mtime baseline before touching the file.
+    // The poll watcher records the initial mtime on its first iteration and
+    // only fires on a *change* thereafter. A fixed sleep races the watcher's
+    // first poll under parallel-suite load: write too early and the new mtime
+    // becomes the baseline, so the reload is missed. Instead, wait until
+    // `version` has held steady at 1 across several full poll intervals
+    // (poll_ms = 50). A stable 1 proves the watcher has captured its baseline
+    // and produced no spurious reload — only then is it safe to write.
+    {
+        const poll_ms = 50;
+        const required_stable_polls = 3;
+        const deadline = rt.nowMs(rt.io()) + 3000;
+        var stable_polls: u32 = 0;
+        while (stable_polls < required_stable_polls) {
+            rt.sleepNs(rt.io(), poll_ms * std.time.ns_per_ms);
+            const v = slot.version.load(.acquire);
+            // A premature reload would push version past 1 — never weaken this.
+            try testing.expectEqual(@as(u64, 1), v);
+            stable_polls += 1;
+            if (rt.nowMs(rt.io()) >= deadline) return error.TestBaselineTimeout;
+        }
+    }
 
     // Valid reload: add a method.
     {
@@ -517,4 +545,44 @@ test "schema watcher hot-reloads; a broken file is rejected" {
     }
     try testing.expectEqual(@as(u64, 2), slot.version.load(.acquire));
     try testing.expect(slot.get().?.method("newMethod") != null);
+}
+
+test "onSchemaChange on a missing file bumps failures, not version" {
+    // Drive the bad-reload path directly, without the poll watcher — the
+    // failures counter and the version-unchanged invariant are exercised in
+    // isolation, free of timing flake.
+    var slot = SchemaSlot.init(testing.allocator, testing.io);
+    defer slot.deinit();
+
+    var ctx = SchemaWatchCtx{ .slot = &slot, .path = "/nonexistent/zora-no-such-schema.json" };
+    onSchemaChange(&ctx);
+
+    // A failed reload increments failures and leaves the version untouched.
+    try testing.expectEqual(@as(u64, 1), slot.failures.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), slot.version.load(.acquire));
+    // No store was installed: the slot stays empty (Tier-0).
+    try testing.expect(slot.get() == null);
+}
+
+test "validate with nil params passes when no field is required" {
+    // A method whose every field is optional accepts an absent params table:
+    // nothing is required, so nil params is valid.
+    const schema =
+        \\{"methods":{"getMe":{"fields":[
+        \\  {"name":"timeout","types":["Integer"],"required":false}
+        \\]}},"types":{}}
+    ;
+    const store = try SchemaStore.fromSlice(testing.allocator, schema);
+    defer store.destroy(testing.allocator);
+
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openBase();
+
+    // Push a nil at a known absolute index and validate against it.
+    lua.pushNil();
+    const idx = lua.getTop();
+    try testing.expect(!lua.isTable(idx));
+    try validate(store, lua, idx, "getMe");
+    lua.pop(1);
 }

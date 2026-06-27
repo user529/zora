@@ -1,8 +1,8 @@
 /// io_pool.zig — blocking I/O thread pool
 ///
 /// Executes HTTP requests and subprocesses on behalf of worker coroutines.
-/// Each pool thread owns a std.http.Client; jobs are received from a bounded
-/// MPSC queue; results are pushed to per-worker IoResult queues.
+/// Each pool thread owns a std.http.Client, receives jobs from a bounded
+/// MPSC queue, and pushes results to per-worker IoResult queues.
 ///
 /// Ownership:
 ///   IoJob payload strings  — NOT owned by pool (caller guarantees lifetime)
@@ -765,6 +765,163 @@ fn captureOnce(srv_ptr: *std.Io.net.Server, req_out: *std.ArrayListUnmanaged(u8)
     var sw = stream.writer(io, &wbuf);
     sw.interface.writeAll(response) catch {};
     sw.interface.flush() catch {};
+}
+
+/// Like spawnCaptureStub but also drains the request body after the header
+/// block, so a POST/PUT payload lands in `req_out`. Reads the body length from
+/// the Content-Length header captured in the head; if absent, reads nothing
+/// (the body capture tests always send a fixed-length body).
+fn spawnBodyCaptureStub(req_out: *std.ArrayListUnmanaged(u8), response: []const u8) !CaptureStub {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    const srv_ptr = try testing.allocator.create(std.Io.net.Server);
+    srv_ptr.* = try addr.listen(testing.io, .{ .reuse_address = true });
+    const port = boundPort(srv_ptr);
+    const thread = try std.Thread.spawn(.{}, bodyCaptureOnce, .{ srv_ptr, req_out, response });
+    return .{ .port = port, .thread = thread };
+}
+
+fn bodyCaptureOnce(srv_ptr: *std.Io.net.Server, req_out: *std.ArrayListUnmanaged(u8), response: []const u8) void {
+    const io = testing.io;
+    defer {
+        srv_ptr.deinit(io);
+        testing.allocator.destroy(srv_ptr);
+    }
+    var stream = srv_ptr.accept(io) catch return;
+    defer stream.close(io);
+    var rbuf: [8192]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    // Capture the head line-by-line, recording the declared body length, until
+    // the blank line that ends the headers.
+    var content_length: usize = 0;
+    while (sr.interface.takeDelimiterInclusive('\n')) |line| {
+        req_out.appendSlice(testing.allocator, line) catch {};
+        // Parse "Content-Length: N" (case-insensitive header name).
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            const after = std.mem.trim(u8, line["content-length:".len..], " \t\r\n");
+            content_length = std.fmt.parseInt(usize, after, 10) catch 0;
+        }
+        if (line.len <= 2) break; // "\r\n" terminates the header block
+    } else |_| {}
+    // Drain exactly content_length body bytes into req_out so the assertion can
+    // see the payload the client wrote.
+    var remaining = content_length;
+    while (remaining > 0) {
+        const chunk = sr.interface.take(@min(remaining, rbuf.len)) catch break;
+        if (chunk.len == 0) break;
+        req_out.appendSlice(testing.allocator, chunk) catch {};
+        remaining -= chunk.len;
+    }
+    var wbuf: [4096]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    sw.interface.writeAll(response) catch {};
+    sw.interface.flush() catch {};
+}
+
+test "IoJob payload variants each drive a real pool to their IoResult" {
+    // Promotes the former struct-construction compile test (P3-21): each payload
+    // variant is now submitted to a live pool and asserted to yield its outcome.
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
+    defer rq.deinit(testing.allocator);
+
+    const stub = try spawnStub(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+    defer stub.thread.join();
+
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
+    defer testing.allocator.free(url);
+
+    var pool: IoPool = undefined;
+    try pool.init(testing.allocator, testing.io,
+        .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 },
+        &.{&rq});
+    defer pool.deinit();
+
+    // http_request -> IoResult.http
+    try pool.submit(.{ .worker_id = 0, .coro_id = 1,
+        .payload = .{ .http_request = .{ .method = "GET", .url = url, .headers = &.{}, .body = "" } } });
+    const r_http = rq.popTimeout(3 * std.time.ns_per_s) orelse return error.TestTimeout;
+    defer freeIoResult(r_http, testing.allocator);
+    try testing.expectEqual(@as(u32, 1), r_http.coro_id);
+    try testing.expect(r_http.outcome == .http);
+    try testing.expectEqual(@as(u16, 200), r_http.outcome.http.status);
+
+    // exec -> IoResult.proc
+    try pool.submit(.{ .worker_id = 0, .coro_id = 2,
+        .payload = .{ .exec = .{ .argv = &.{ "/bin/echo", "exec-ok" } } } });
+    const r_exec = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
+    defer freeIoResult(r_exec, testing.allocator);
+    try testing.expectEqual(@as(u32, 2), r_exec.coro_id);
+    try testing.expect(r_exec.outcome == .proc);
+    try testing.expectEqualStrings("exec-ok\n", r_exec.outcome.proc.stdout);
+
+    // shell -> IoResult.proc (shell evaluates the arithmetic expansion)
+    try pool.submit(.{ .worker_id = 0, .coro_id = 3,
+        .payload = .{ .shell = .{ .command = "echo $((2+3))" } } });
+    const r_shell = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
+    defer freeIoResult(r_shell, testing.allocator);
+    try testing.expectEqual(@as(u32, 3), r_shell.coro_id);
+    try testing.expect(r_shell.outcome == .proc);
+    try testing.expectEqualStrings("5\n", r_shell.outcome.proc.stdout);
+}
+
+test "http_request POST sends the body to the server and reports status" {
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
+    defer rq.deinit(testing.allocator);
+
+    var req_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer req_bytes.deinit(testing.allocator);
+
+    const stub = try spawnBodyCaptureStub(&req_bytes,
+        "HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+    defer stub.thread.join();
+
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
+    defer testing.allocator.free(url);
+
+    var pool: IoPool = undefined;
+    try pool.init(testing.allocator, testing.io,
+        .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 },
+        &.{&rq});
+    defer pool.deinit();
+
+    const body = "{\"hello\":\"world\"}";
+    try pool.submit(.{ .worker_id = 0, .coro_id = 12,
+        .payload = .{ .http_request = .{ .method = "POST", .url = url, .headers = &.{}, .body = body } } });
+
+    const result = rq.popTimeout(3 * std.time.ns_per_s) orelse return error.TestTimeout;
+    defer freeIoResult(result, testing.allocator);
+
+    try testing.expect(result.outcome == .http);
+    try testing.expectEqual(@as(u16, 201), result.outcome.http.status);
+
+    // The request line carries POST, and the captured body holds the payload.
+    try testing.expect(std.mem.indexOf(u8, req_bytes.items, "POST ") != null);
+    try testing.expect(std.mem.indexOf(u8, req_bytes.items, body) != null);
+}
+
+test "http_request with unsupported method → IoResult.err unsupported_http_method" {
+    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
+    defer rq.deinit(testing.allocator);
+
+    var pool: IoPool = undefined;
+    try pool.init(testing.allocator, testing.io,
+        .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 },
+        &.{&rq});
+    defer pool.deinit();
+
+    // "BREW" is not a std.http.Method; the request never leaves the pool, so no
+    // server is needed. pushErr routes to a valid worker_id, so no log.err.
+    try pool.submit(.{ .worker_id = 0, .coro_id = 31,
+        .payload = .{ .http_request = .{
+            .method = "BREW", .url = "http://127.0.0.2:1/", .headers = &.{}, .body = "",
+        } } });
+
+    const result = rq.popTimeout(3 * std.time.ns_per_s) orelse return error.TestTimeout;
+    defer freeIoResult(result, testing.allocator);
+
+    try testing.expectEqual(@as(u32, 31), result.coro_id);
+    try testing.expect(result.outcome == .err);
+    try testing.expectEqualStrings("unsupported_http_method", result.outcome.err);
 }
 
 test "http_request to a stalled peer times out instead of pinning the pool thread" {

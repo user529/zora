@@ -28,8 +28,8 @@ pub const ConfigError = error{
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Load config from an explicit environment map. String fields are duplicated
-/// from `env` values and owned by `allocator`.
+/// Load config from an explicit environment map. It duplicates string fields
+/// from `env` values; `allocator` owns them.
 pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.Environ.Map) ConfigError!Config {
     // Required fields
     const bot_token = try getRequired(allocator, env, "BOT_TOKEN");
@@ -67,8 +67,10 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.Environ.Map) C
         return error.OutOfMemory;
     errdefer allocator.free(bot_api_base);
 
-    // Optional: WORKER_THREADS (default: cpu_count, minimum 2)
-    const worker_threads = try parseUintMin(u8, env, "WORKER_THREADS", cpuScaledThreads(1), 1);
+    // Optional: WORKER_THREADS (default: cpu_count, minimum 2 — a single
+    // worker degrades affinity routing and removes parallelism; two is the
+    // smallest safe value).
+    const worker_threads = try parseUintMin(u8, env, "WORKER_THREADS", cpuScaledThreads(1), 2);
 
     // Optional: WORKER_QUEUE_CAPACITY (per-worker inbound burst buffer; full → update
     // dropped and Telegram retries, so size for bursts — RAM is abundant here)
@@ -79,7 +81,7 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.Environ.Map) C
     const dispatcher_threads = try parseUintMin(u8, env, "DISPATCHER_THREADS", cpuScaledThreads(2), 1);
 
     // Optional: WEBHOOK_POOL_THREADS (default: cpu_count, minimum 2 — webhook
-    // connection-handler pool size). Threads are reused, so this bounds
+    // connection-handler pool size). The pool reuses threads, so this bounds
     // concurrency, not per-message allocation.
     const webhook_pool_threads = try parseUint(u8, env, "WEBHOOK_POOL_THREADS", cpuScaledThreads(1));
 
@@ -158,44 +160,62 @@ pub fn maskSecret(value: []const u8, out: []u8) []const u8 {
 ///
 /// This is an explicit ordered list, not struct reflection: env-var names are
 /// not the field names, and the secret/non-secret split must be deliberate. When
-/// you add a field to Config, add a line here and classify it secret-or-not.
+/// adding a field to Config, add a line here and classify it secret-or-not.
 pub fn logEffective(cfg: Config) void {
+    // Render the full effective-config block into a stack buffer, then emit
+    // each line via the scoped logger. A 2 KB buffer covers all current fields
+    // with room to spare (the full output runs to ~600 bytes in practice).
+    var out_buf: [2048]u8 = undefined;
+    var fw = std.Io.Writer.fixed(&out_buf);
+    writeEffective(cfg, &fw) catch return; // only fails if out_buf is too small
+
+    var lines = std.mem.splitScalar(u8, fw.buffered(), '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0) log_config.info("{s}", .{line});
+    }
+}
+
+/// Write every effective configuration parameter to `writer`, one `KEY=value`
+/// line per field, grouped by subsystem. Secrets are masked. Used by
+/// logEffective (for production logging) and by tests (to inspect the output
+/// without relying on std.log interception).
+fn writeEffective(cfg: Config, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     var sbuf: [16]u8 = undefined; // secret-mask scratch
     var abuf: [64]u8 = undefined; // listen-address scratch
 
     // [bot]
-    log_config.info("[bot] BOT_TOKEN={s}", .{maskSecret(cfg.bot_token, &sbuf)});
-    log_config.info("[bot] WEBHOOK_SECRET={s}", .{maskSecret(cfg.webhook_secret, &sbuf)});
-    log_config.info("[bot] BOT_API_BASE={s}", .{cfg.bot_api_base});
-    log_config.info("[bot] RULES_FILE={s}", .{cfg.rules_file});
-    log_config.info("[bot] DB_PATH={s}", .{cfg.db_path});
-    log_config.info("[bot] SCHEMA_FILE={s}", .{cfg.schema_file});
-    log_config.info("[bot] API_VALIDATION={s}", .{@tagName(cfg.api_validation)});
-    log_config.info("[bot] METRICS_LOG={}", .{cfg.metrics_log});
+    try writer.print("[bot] BOT_TOKEN={s}\n",       .{maskSecret(cfg.bot_token, &sbuf)});
+    try writer.print("[bot] WEBHOOK_SECRET={s}\n",  .{maskSecret(cfg.webhook_secret, &sbuf)});
+    try writer.print("[bot] BOT_API_BASE={s}\n",    .{cfg.bot_api_base});
+    try writer.print("[bot] RULES_FILE={s}\n",      .{cfg.rules_file});
+    try writer.print("[bot] DB_PATH={s}\n",         .{cfg.db_path});
+    try writer.print("[bot] SCHEMA_FILE={s}\n",     .{cfg.schema_file});
+    try writer.print("[bot] API_VALIDATION={s}\n",  .{@tagName(cfg.api_validation)});
+    try writer.print("[bot] METRICS_LOG={}\n",      .{cfg.metrics_log});
 
     // [server]
     const addr = std.fmt.bufPrint(&abuf, "{f}", .{cfg.listen_addr}) catch "?";
-    log_config.info("[server] LISTEN_ADDR={s}", .{addr});
-    log_config.info("[server] WEBHOOK_POOL_THREADS={d}", .{cfg.webhook_pool_threads});
+    try writer.print("[server] LISTEN_ADDR={s}\n",           .{addr});
+    try writer.print("[server] WEBHOOK_POOL_THREADS={d}\n",  .{cfg.webhook_pool_threads});
 
     // [worker]
-    log_config.info("[worker] WORKER_THREADS={d}", .{cfg.worker_threads});
-    log_config.info("[worker] WORKER_QUEUE_CAPACITY={d}", .{cfg.worker_queue_capacity});
-    log_config.info("[worker] WORKER_MAX_INFLIGHT={d}", .{cfg.worker_max_inflight});
-    log_config.info("[worker] WORKFLOW_DEADLINE_MS={d}", .{cfg.workflow_deadline_ms});
-    log_config.info("[worker] JSON_MAX_BYTES={d}", .{cfg.json_max_bytes});
+    try writer.print("[worker] WORKER_THREADS={d}\n",        .{cfg.worker_threads});
+    try writer.print("[worker] WORKER_QUEUE_CAPACITY={d}\n", .{cfg.worker_queue_capacity});
+    try writer.print("[worker] WORKER_MAX_INFLIGHT={d}\n",   .{cfg.worker_max_inflight});
+    try writer.print("[worker] WORKFLOW_DEADLINE_MS={d}\n",  .{cfg.workflow_deadline_ms});
+    try writer.print("[worker] JSON_MAX_BYTES={d}\n",        .{cfg.json_max_bytes});
 
     // [io]
-    log_config.info("[io] IO_POOL_THREADS={d}", .{cfg.io_pool_threads});
-    log_config.info("[io] IO_QUEUE_CAPACITY={d}", .{cfg.io_queue_capacity});
-    log_config.info("[io] IO_JOB_TIMEOUT_MS={d}", .{cfg.io_job_timeout_ms});
-    log_config.info("[io] PROC_MAX_OUTPUT_BYTES={d}", .{cfg.proc_max_output_bytes});
+    try writer.print("[io] IO_POOL_THREADS={d}\n",         .{cfg.io_pool_threads});
+    try writer.print("[io] IO_QUEUE_CAPACITY={d}\n",       .{cfg.io_queue_capacity});
+    try writer.print("[io] IO_JOB_TIMEOUT_MS={d}\n",       .{cfg.io_job_timeout_ms});
+    try writer.print("[io] PROC_MAX_OUTPUT_BYTES={d}\n",   .{cfg.proc_max_output_bytes});
 
     // [dispatcher]
-    log_config.info("[dispatcher] DISPATCHER_THREADS={d}", .{cfg.dispatcher_threads});
-    log_config.info("[dispatcher] DELAY_QUEUE_CAPACITY={d}", .{cfg.delay_queue_capacity});
-    log_config.info("[dispatcher] RETRY_AFTER_MAX_MS={d}", .{cfg.retry_after_max_ms});
-    log_config.info("[dispatcher] RETRY_AFTER_DEFAULT_MS={d}", .{cfg.retry_after_default_ms});
+    try writer.print("[dispatcher] DISPATCHER_THREADS={d}\n",     .{cfg.dispatcher_threads});
+    try writer.print("[dispatcher] DELAY_QUEUE_CAPACITY={d}\n",   .{cfg.delay_queue_capacity});
+    try writer.print("[dispatcher] RETRY_AFTER_MAX_MS={d}\n",     .{cfg.retry_after_max_ms});
+    try writer.print("[dispatcher] RETRY_AFTER_DEFAULT_MS={d}\n", .{cfg.retry_after_default_ms});
 }
 
 /// Free all string fields previously allocated by loadFromMap().
@@ -284,6 +304,24 @@ fn cpuScaledThreads(multiplier: usize) u8 {
 
 const testing = std.testing;
 
+// --- Output capture for logEffective tests (P3-1, P4-3, P4-43) ---
+//
+// logEffective routes its output through std.log, whose backend in the test
+// runner is owned by the test_runner.zig root and cannot be redirected from a
+// test file. Instead, tests call writeEffective directly with a fixed-buffer
+// writer — the function that logEffective itself delegates to — and inspect
+// the returned slice.
+
+/// Write the full effective-config output for `cfg` into `buf` and return the
+/// populated slice. Used by tests to inspect line content and group prefixes
+/// without intercepting std.log. The buffer need only hold the rendered output;
+/// 2 KB is sufficient for all current fields (the output runs to ~600 bytes).
+fn captureEffective(cfg: Config, buf: []u8) []const u8 {
+    var fw = std.Io.Writer.fixed(buf);
+    writeEffective(cfg, &fw) catch {};
+    return fw.buffered();
+}
+
 /// Build a minimal environment map from a slice of key-value pairs for testing.
 fn makeEnv(allocator: std.mem.Allocator, pairs: []const [2][]const u8) !std.process.Environ.Map {
     var env = std.process.Environ.Map.init(allocator);
@@ -294,35 +332,67 @@ fn makeEnv(allocator: std.mem.Allocator, pairs: []const [2][]const u8) !std.proc
 
 test "loads every field from a fully populated environment" {
     var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",          "tok123" },
-        .{ "WEBHOOK_SECRET",     "sec456" },
-        .{ "LISTEN_ADDR",        "127.0.0.1:9443" },
-        .{ "RULES_FILE",         "custom/rules.lua" },
-        .{ "DB_PATH",            "custom.db" },
-        .{ "WORKER_THREADS",       "8" },
-        .{ "WORKER_QUEUE_CAPACITY",     "512" },
-        .{ "DISPATCHER_THREADS", "2" },
+        .{ "BOT_TOKEN",              "tok123" },
+        .{ "WEBHOOK_SECRET",         "sec456" },
+        .{ "LISTEN_ADDR",            "127.0.0.1:9443" },
+        .{ "RULES_FILE",             "custom/rules.lua" },
+        .{ "DB_PATH",                "custom.db" },
+        .{ "SCHEMA_FILE",            "/etc/zora/api.json" },
+        .{ "API_VALIDATION",         "strict" },
+        .{ "BOT_API_BASE",           "http://127.0.0.1:9000" },
+        .{ "WORKER_THREADS",         "4" },
+        .{ "WORKER_QUEUE_CAPACITY",  "512" },
+        .{ "DISPATCHER_THREADS",     "3" },
+        .{ "WEBHOOK_POOL_THREADS",   "5" },
+        .{ "JSON_MAX_BYTES",         "524288" },
+        .{ "IO_POOL_THREADS",        "6" },
+        .{ "IO_QUEUE_CAPACITY",      "128" },
+        .{ "IO_JOB_TIMEOUT_MS",      "15000" },
+        .{ "PROC_MAX_OUTPUT_BYTES",  "32768" },
+        .{ "WORKER_MAX_INFLIGHT",    "32" },
+        .{ "WORKFLOW_DEADLINE_MS",   "30000" },
+        .{ "METRICS_LOG",            "false" },
+        .{ "DELAY_QUEUE_CAPACITY",   "2048" },
+        .{ "RETRY_AFTER_MAX_MS",     "30000" },
+        .{ "RETRY_AFTER_DEFAULT_MS", "500" },
     });
     defer env.deinit();
 
     const cfg = try loadFromMap(testing.allocator, env);
     defer deinit(cfg, testing.allocator);
 
+    // [bot]
     try testing.expectEqualStrings("tok123", cfg.bot_token);
     try testing.expectEqualStrings("sec456", cfg.webhook_secret);
     try testing.expectEqualStrings("custom/rules.lua", cfg.rules_file);
     try testing.expectEqualStrings("custom.db", cfg.db_path);
-    try testing.expectEqual(@as(u32, 8), cfg.worker_threads);
-    try testing.expectEqual(@as(u32, 512), cfg.worker_queue_capacity);
-    try testing.expectEqual(@as(u32, 2), cfg.dispatcher_threads);
+    try testing.expectEqualStrings("/etc/zora/api.json", cfg.schema_file);
+    try testing.expectEqual(types.ValidationMode.strict, cfg.api_validation);
+    try testing.expectEqualStrings("http://127.0.0.1:9000", cfg.bot_api_base);
+    try testing.expectEqual(false, cfg.metrics_log);
 
-    // Field types: the numeric fields are unsigned ints and the parsed listen
-    // address carries a non-zero port.
-    const wc: u32 = cfg.worker_threads;
-    try testing.expectEqual(@as(u32, 8), wc);
-    const qc: u32 = cfg.worker_queue_capacity;
-    try testing.expectEqual(@as(u32, 512), qc);
-    try testing.expect(cfg.listen_addr.ip4.port != 0);
+    // [server]
+    try testing.expectEqual(@as(u16, 9443), cfg.listen_addr.ip4.port);
+    try testing.expectEqual(@as(u8, 5), cfg.webhook_pool_threads);
+
+    // [worker]
+    try testing.expectEqual(@as(u8, 4), cfg.worker_threads);
+    try testing.expectEqual(@as(u16, 512), cfg.worker_queue_capacity);
+    try testing.expectEqual(@as(u16, 32), cfg.worker_max_inflight);
+    try testing.expectEqual(@as(u64, 30_000), cfg.workflow_deadline_ms);
+    try testing.expectEqual(@as(usize, 524_288), cfg.json_max_bytes);
+
+    // [io]
+    try testing.expectEqual(@as(u8,    6),      cfg.io_pool_threads);
+    try testing.expectEqual(@as(u16,   128),    cfg.io_queue_capacity);
+    try testing.expectEqual(@as(u64,   15_000), cfg.io_job_timeout_ms);
+    try testing.expectEqual(@as(usize, 32_768), cfg.proc_max_output_bytes);
+
+    // [dispatcher]
+    try testing.expectEqual(@as(u8,  3),      cfg.dispatcher_threads);
+    try testing.expectEqual(@as(u16, 2_048),  cfg.delay_queue_capacity);
+    try testing.expectEqual(@as(u64, 30_000), cfg.retry_after_max_ms);
+    try testing.expectEqual(@as(u64, 500),    cfg.retry_after_default_ms);
 }
 
 test "applies defaults when optional fields are absent" {
@@ -335,13 +405,34 @@ test "applies defaults when optional fields are absent" {
     const cfg = try loadFromMap(testing.allocator, env);
     defer deinit(cfg, testing.allocator);
 
+    // [bot]
     try testing.expectEqualStrings("rules/rules.lua", cfg.rules_file);
     try testing.expectEqualStrings("state.db", cfg.db_path);
-    try testing.expectEqual(@as(u32, 1024), cfg.worker_queue_capacity);
-    try testing.expect(cfg.dispatcher_threads >= 2);
-    // LISTEN_ADDR default is 0.0.0.0:8443. In 0.16 IpAddress the port is stored
-    // in native byte order.
+    try testing.expectEqualStrings("schema/botapi.json", cfg.schema_file);
+    try testing.expectEqualStrings("https://api.telegram.org", cfg.bot_api_base);
+    try testing.expectEqual(types.ValidationMode.warn, cfg.api_validation);
+    try testing.expectEqual(true, cfg.metrics_log);
+
+    // [server]: LISTEN_ADDR default is 0.0.0.0:8443. In 0.16 IpAddress the
+    // port is stored in native byte order.
     try testing.expectEqual(@as(u16, 8443), cfg.listen_addr.ip4.port);
+
+    // [worker]: minimum 2 workers; queue capacity 1024.
+    try testing.expect(cfg.worker_threads >= 2);
+    try testing.expectEqual(@as(u16, 1024), cfg.worker_queue_capacity);
+
+    // [io]: IO_POOL_THREADS = 8, IO_QUEUE_CAPACITY = 256, IO_JOB_TIMEOUT_MS =
+    // 30 000, PROC_MAX_OUTPUT_BYTES = 65 536.
+    try testing.expectEqual(@as(u8,    8),      cfg.io_pool_threads);
+    try testing.expectEqual(@as(u16,   256),    cfg.io_queue_capacity);
+    try testing.expectEqual(@as(u64,   30_000), cfg.io_job_timeout_ms);
+    try testing.expectEqual(@as(usize, 65_536), cfg.proc_max_output_bytes);
+
+    // [dispatcher]: at least 2 threads; throttle defaults.
+    try testing.expect(cfg.dispatcher_threads >= 2);
+    try testing.expectEqual(@as(u16, 4_096),  cfg.delay_queue_capacity);
+    try testing.expectEqual(@as(u64, 60_000), cfg.retry_after_max_ms);
+    try testing.expectEqual(@as(u64, 1_000),  cfg.retry_after_default_ms);
 }
 
 test "thread counts scale with CPU and accept explicit overrides" {
@@ -382,7 +473,7 @@ test "thread counts scale with CPU and accept explicit overrides" {
     }
 }
 
-test "WORKER_THREADS trims whitespace and accepts the minimum of 1" {
+test "WORKER_THREADS trims whitespace; minimum is 2, not 1" {
     // Whitespace around the value is trimmed.
     {
         var env = try makeEnv(testing.allocator, &.{
@@ -394,16 +485,25 @@ test "WORKER_THREADS trims whitespace and accepts the minimum of 1" {
         defer deinit(cfg, testing.allocator);
         try testing.expectEqual(@as(u32, 4), cfg.worker_threads);
     }
-    // 1 is accepted (the minimum boundary).
+    // 1 is below the mandated minimum of 2 — must be rejected.
     {
         var env = try makeEnv(testing.allocator, &.{
             .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
             .{ "WORKER_THREADS", "1" },
         });
         defer env.deinit();
+        try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
+    }
+    // 2 is the minimum — must be accepted.
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            .{ "WORKER_THREADS", "2" },
+        });
+        defer env.deinit();
         const cfg = try loadFromMap(testing.allocator, env);
         defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(u32, 1), cfg.worker_threads);
+        try testing.expectEqual(@as(u32, 2), cfg.worker_threads);
     }
 }
 
@@ -689,19 +789,70 @@ test "throttle config defaults and overrides" {
     }
 }
 
-test "logEffective runs over a loaded config without error" {
-    // Smoke test: exercises every group, format string, and the secret-masking
-    // path. A token long enough to be partially revealed; a shorter secret.
+test "logEffective output: subsystem groups, field lines, and secret masking" {
+    // Verifies the formatted output of writeEffective (the function logEffective
+    // delegates to) against the three audit items:
+    //   P3-1: each [subsystem] KEY=value line appears for all five groups.
+    //   P4-3: BOT_TOKEN and WEBHOOK_SECRET lines contain "****" and do NOT
+    //         contain the full secret values (end-to-end masking).
+    //   P4-43: all five group prefixes ([bot], [server], [worker], [io],
+    //          [dispatcher]) appear.
+    //
+    // The token and secret are long enough for maskSecret to produce a partial
+    // reveal (both exceed 12 chars → front 3 + "****" + back 4 visible).
+    //
+    // The production logEffective function calls writeEffective and routes each
+    // line through std.log.  Tests inspect writeEffective directly because the
+    // test_runner.zig root owns std_options and the log backend cannot be
+    // redirected from a test file.
+    const token  = "1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ";
+    const secret = "supersecretvalue";
+
     var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN", "1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ" },
-        .{ "WEBHOOK_SECRET", "supersecretvalue" },
+        .{ "BOT_TOKEN",      token  },
+        .{ "WEBHOOK_SECRET", secret },
     });
     defer env.deinit();
     const cfg = try loadFromMap(testing.allocator, env);
     defer deinit(cfg, testing.allocator);
 
-    logEffective(cfg);
+    var buf: [2048]u8 = undefined;
+    const captured = captureEffective(cfg, &buf);
+
+    // --- P4-43: all five subsystem group prefixes present ---
+    try testing.expect(std.mem.indexOf(u8, captured, "[bot]")        != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[server]")     != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[worker]")     != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[io]")         != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[dispatcher]") != null);
+
+    // --- P3-1: representative field per group ---
+    try testing.expect(std.mem.indexOf(u8, captured, "[bot] BOT_TOKEN=")                != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[bot] WEBHOOK_SECRET=")           != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[bot] BOT_API_BASE=")             != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[bot] RULES_FILE=")               != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[server] LISTEN_ADDR=")           != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[worker] WORKER_THREADS=")        != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[io] IO_POOL_THREADS=")           != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[dispatcher] DISPATCHER_THREADS=") != null);
+
+    // --- P4-3: masking end-to-end ---
+    // The BOT_TOKEN line must contain "****" and must NOT contain the full token.
+    const tok_start = std.mem.indexOf(u8, captured, "[bot] BOT_TOKEN=").?;
+    const tok_end   = std.mem.indexOfPos(u8, captured, tok_start, "\n") orelse captured.len;
+    const tok_line  = captured[tok_start..tok_end];
+    try testing.expect(std.mem.indexOf(u8, tok_line, "****")  != null);
+    try testing.expect(std.mem.indexOf(u8, tok_line, token)   == null);
+
+    // The WEBHOOK_SECRET line must contain "****" and must NOT contain the
+    // full secret.
+    const sec_start = std.mem.indexOf(u8, captured, "[bot] WEBHOOK_SECRET=").?;
+    const sec_end   = std.mem.indexOfPos(u8, captured, sec_start, "\n") orelse captured.len;
+    const sec_line  = captured[sec_start..sec_end];
+    try testing.expect(std.mem.indexOf(u8, sec_line, "****")   != null);
+    try testing.expect(std.mem.indexOf(u8, sec_line, secret)   == null);
 }
+
 
 test "maskSecret reveals a scaled prefix and suffix and hides the middle" {
     var buf: [16]u8 = undefined;
@@ -717,4 +868,17 @@ test "maskSecret reveals a scaled prefix and suffix and hides the middle" {
     // 3 chars and empty: fully masked.
     try testing.expectEqualStrings("****", maskSecret("abc", &buf));
     try testing.expectEqualStrings("****", maskSecret("", &buf));
+}
+
+test "empty WEBHOOK_SECRET is rejected with InvalidConfig" {
+    // An empty WEBHOOK_SECRET is syntactically present but semantically invalid:
+    // the webhook auth check in server.zig compares against this string, and an
+    // empty secret would match any request that omits the header (or sends an
+    // empty one), breaking authentication. loadFromMap rejects it at line 40.
+    var env = try makeEnv(testing.allocator, &.{
+        .{ "BOT_TOKEN",      "tok" },
+        .{ "WEBHOOK_SECRET", "" },
+    });
+    defer env.deinit();
+    try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
 }

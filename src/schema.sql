@@ -19,4 +19,13 @@ CREATE TABLE IF NOT EXISTS global_state (
     value    TEXT NOT NULL
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS schedule (
+    id            INTEGER PRIMARY KEY,           -- rowid; returned by bot.schedule_*
+    fire_at_ms    INTEGER NOT NULL,              -- absolute epoch ms; when to fire
+    payload       TEXT    NOT NULL DEFAULT '{}', -- Lua table -> JSON
+    claimed_at_ms INTEGER                        -- NULL = unclaimed; else lease start (epoch ms)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_schedule_fire ON schedule(fire_at_ms);
+
 INSERT INTO meta VALUES ('schema_version', '1');

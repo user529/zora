@@ -770,6 +770,21 @@ fn pushCall(q: *queue_mod.Queue(types.ApiCall), method: []const u8, body: []cons
     });
 }
 
+/// Poll until the dispatcher has drained its queue (`len() == 0`), bounded by
+/// `timeout_ms`.  A drained queue is a structural signal that the dispatcher
+/// dequeued the pending call — sturdier than a fixed sleep, which races the
+/// ~200 ms retry delay under load.  Returns `true` if the queue emptied in
+/// time, `false` on timeout.
+fn waitForDrain(q: *queue_mod.Queue(types.ApiCall), timeout_ms: u64) bool {
+    var waited: u64 = 0;
+    while (q.len() != 0) {
+        if (waited >= timeout_ms) return false;
+        rt.sleepNs(testing.io, 5 * std.time.ns_per_ms);
+        waited += 5;
+    }
+    return true;
+}
+
 test "ApiCall POSTs to /bot{token}/{method} with verbatim JSON body" {
     const mock = try MockServer.init(testing.allocator);
     defer mock.deinit();
@@ -867,6 +882,66 @@ test "dispatcher retries once after server closes connection; exactly 2 attempts
 
     // Both attempts must have been made — no more, no less.
     try testing.expectEqual(@as(u32, 2), attempt_count.load(.acquire));
+}
+
+test "inter-attempt retry delay is bounded below" {
+    // The dispatcher sleeps between a failed send and its single retry. This
+    // test records the wall-clock at each server accept and asserts the gap
+    // clears a tolerant lower bound, proving the delay is real (not zero) without
+    // pinning the exact duration. The code sleeps ~200 ms; the >= 100 ms bound
+    // holds for that or any larger retry delay.
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    var server = try addr.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+
+    var url_buf: [64]u8 = undefined;
+    const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.2:{d}", .{
+        boundPort(&server),
+    }) catch unreachable;
+
+    // Record the accept time of each attempt. The first connection drops
+    // immediately to force the retry; the second answers so the call completes.
+    var accept1_ms = std.atomic.Value(i64).init(0);
+    var accept2_ms = std.atomic.Value(i64).init(0);
+    const Ctx = struct {
+        server: *std.Io.net.Server,
+        accept1_ms: *std.atomic.Value(i64),
+        accept2_ms: *std.atomic.Value(i64),
+    };
+    const ctx = Ctx{ .server = &server, .accept1_ms = &accept1_ms, .accept2_ms = &accept2_ms };
+    const srv_thread = try std.Thread.spawn(.{}, struct {
+        fn run(c: Ctx) void {
+            const io = testing.io;
+            var c1 = c.server.accept(io) catch return;
+            c.accept1_ms.store(rt.nowMs(io), .release);
+            c1.close(io);
+
+            var c2 = c.server.accept(io) catch return;
+            c.accept2_ms.store(rt.nowMs(io), .release);
+            defer c2.close(io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = c2.reader(io, &rbuf);
+            _ = rd.interface.takeDelimiterInclusive('\n') catch {};
+            var wbuf: [256]u8 = undefined;
+            var wr = c2.writer(io, &wbuf);
+            wr.interface.writeAll(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
+                    "Content-Length: 15\r\n\r\n{\"ok\":true}\r\n\r\n",
+            ) catch {};
+            wr.interface.flush() catch {};
+        }
+    }.run, .{ctx});
+
+    const d = try TestDispatcher.init(testing.allocator, "TOK", api_base);
+    defer d.deinit();
+
+    try pushCall(&d.queue, "sendMessage", "{\"chat_id\":1,\"text\":\"delay test\"}");
+
+    srv_thread.join();
+
+    const gap = accept2_ms.load(.acquire) - accept1_ms.load(.acquire);
+    // Tolerant lower bound: the inter-attempt sleep must be at least 100 ms.
+    try testing.expect(gap >= 100);
 }
 
 test "both attempts fail — call discarded, no third attempt, no crash" {
@@ -1091,7 +1166,10 @@ test "buildMultipartBody rejects CRLF in field name" {
         } },
     });
 
-    rt.sleepNs(testing.io, 300 * std.time.ns_per_ms);
+    // Wait for the dispatcher to dequeue and discard the call, then prove the
+    // rejected request never reached the wire. The queue-drain poll replaces a
+    // fixed sleep whose margin over the ~200 ms retry delay was unreliable.
+    try testing.expect(waitForDrain(&d.queue, 4000));
     try testing.expectEqual(@as(usize, 0), mock.received.len());
 }
 
@@ -1117,7 +1195,9 @@ test "buildMultipartBody rejects CRLF in filename" {
         } },
     });
 
-    rt.sleepNs(testing.io, 300 * std.time.ns_per_ms);
+    // Same poll-then-assert as the field-name case: drain the queue, then
+    // confirm the malformed multipart request never went out.
+    try testing.expect(waitForDrain(&d.queue, 4000));
     try testing.expectEqual(@as(usize, 0), mock.received.len());
 }
 
