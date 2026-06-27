@@ -1,5 +1,10 @@
 .zig-cache/
 zig-out/
+zig-pkg/
 *.o
 .extraignore
 deploy*.sh
+<<<<<<< HEAD
+=======
+*.log
+>>>>>>> dev

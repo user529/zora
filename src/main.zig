@@ -1,0 +1,1104 @@
+/// main.zig — entry point: parse config, verify DB, start all subsystems.
+///
+/// Startup order (log before server accepts):
+///   1. Load Config
+///   2. Open + verify SQLite schema (exit on mismatch)
+///   3. Print startup banner
+///   4. Allocate queues and spawn dispatcher threads
+///   5. Spawn worker threads (each opens its own DB connection)
+///   6. Spawn hot-reload watcher (detached; no graceful shutdown in prototype)
+///   7. Bind HTTP server and start accept loop
+///   8. Block forever
+const std = @import("std");
+const build_opts = @import("build_options");
+
+// Show info/warn in all build modes so soak-test logs and hot-reload events
+// are visible even in ReleaseFast (Zig defaults to .err in release builds).
+pub const std_options: std.Options = .{
+    .log_level = .info,
+    .logFn = timestampedLogFn,
+};
+
+/// Custom log backend: prepends a UTC timestamp (ISO 8601, ms precision) to
+/// every line.  Thread safety is provided by std.debug.lockStderr.
+fn timestampedLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const ms = rt.nowMs(rt.io());
+    const ms_abs: u64 = if (ms >= 0) @intCast(ms) else 0;
+    const secs: u64 = ms_abs / 1000;
+    const millis: u64 = ms_abs % 1000;
+
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = secs };
+    const epoch_day = epoch_secs.getEpochDay();
+    const day_secs = epoch_secs.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    const level_txt = comptime level.asText();
+    const scope_txt = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
+
+    var buffer: [512]u8 = undefined;
+    const locked = std.debug.lockStderr(&buffer);
+    defer std.debug.unlockStderr();
+    const stderr = &locked.file_writer.interface;
+
+    nosuspend stderr.print(
+        "{d:04}-{d:02}-{d:02}T{d:02}:{d:02}:{d:02}.{d:03}Z " ++ level_txt ++ scope_txt,
+        .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_secs.getHoursIntoDay(),
+            day_secs.getMinutesIntoHour(),
+            day_secs.getSecondsIntoMinute(),
+            millis,
+        },
+    ) catch return;
+    nosuspend stderr.print(format ++ "\n", args) catch return;
+}
+const types = @import("types.zig");
+const config_mod = @import("config.zig");
+const state_store = @import("state_store.zig");
+const queue_mod = @import("queue.zig");
+const worker_mod = @import("worker.zig");
+const disp_mod = @import("dispatcher.zig");
+const server_mod = @import("server.zig");
+const watcher = @import("watcher.zig");
+const lua_engine = @import("lua_engine.zig");
+const tg_schema = @import("tg_schema.zig");
+const metrics_mod = @import("metrics.zig");
+const io_pool = @import("io_pool.zig");
+const delay_mod = @import("delay.zig");
+const scheduler_mod = @import("scheduler.zig");
+const rt = @import("rt.zig");
+
+const log = std.log.scoped(.main);
+
+pub const RELEASE: u32 = build_opts.release;
+pub const GIT_BRANCH: []const u8 = build_opts.git_branch;
+
+// ---------------------------------------------------------------------------
+// Signal handling — SIGTERM / SIGINT set this flag; main loop polls it.
+// ---------------------------------------------------------------------------
+
+var g_stop = std.atomic.Value(bool).init(false);
+var g_metrics = metrics_mod.Metrics{};
+var g_schema_slot: tg_schema.SchemaSlot = undefined;
+
+fn sigStop(sig: std.posix.SIG) callconv(std.builtin.CallingConvention.c) void {
+    _ = sig;
+    g_stop.store(true, .release);
+}
+
+// ---------------------------------------------------------------------------
+// Startup banner
+// ---------------------------------------------------------------------------
+
+/// Write the startup banner to `writer`: the five identity fields
+/// (branch, release, schema, rules_api, api_validation). Used by the
+/// production startup path (which formats then `log.info`s the result) and by
+/// tests (which inspect the output directly, since test_runner.zig owns the
+/// std.log backend).
+fn writeBanner(writer: *std.Io.Writer, validation: types.ValidationMode) std.Io.Writer.Error!void {
+    try writer.print(
+        "zora starting (branch={s} release={d} schema={d} rules_api={d} api_validation={s})",
+        .{
+            GIT_BRANCH,
+            RELEASE,
+            state_store.SCHEMA_VERSION,
+            lua_engine.RULES_API_VERSION,
+            @tagName(validation),
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Metrics log thread — emits a snapshot every 60 s when METRICS_LOG=true
+// ---------------------------------------------------------------------------
+
+/// Format all 14 metric counters into `buf`. Returns the written slice.
+/// The throttle group reports reactive rate limiting: 429s seen, calls parked
+/// in the delay queue, calls shed on overflow, and the current queue depth.
+/// The route group reports per-user-affinity relaxations: updates overflowed to
+/// a non-primary worker, and updates dropped with every queue full.
+pub fn fmtMetrics(m: *const metrics_mod.Metrics, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "io_jobs={d} io_inflight={d} io_err={d} io_timeout={d} coros_inflight={d} coros_reaped={d} tracked_fail={d} resp_oversize={d} throttle_429={d} throttle_delayed={d} throttle_shed={d} throttle_depth={d} route_overflow={d} route_drop={d}",
+        .{
+            m.io_jobs_total.load(.monotonic),
+            m.io_jobs_inflight.load(.monotonic),
+            m.io_errors_total.load(.monotonic),
+            m.io_timeouts_total.load(.monotonic),
+            m.coroutines_inflight.load(.monotonic),
+            m.coroutines_reaped_total.load(.monotonic),
+            m.tracked_send_failures_total.load(.monotonic),
+            m.response_oversize_total.load(.monotonic),
+            m.throttle_429_total.load(.monotonic),
+            m.throttle_delayed_total.load(.monotonic),
+            m.throttle_shed_total.load(.monotonic),
+            m.throttle_delay_depth.load(.monotonic),
+            m.route_overflow_total.load(.monotonic),
+            m.route_drop_total.load(.monotonic),
+        },
+    ) catch "[metrics fmt overflow]";
+}
+
+fn metricsLogThread(m: *const metrics_mod.Metrics) void {
+    const metrics_log = std.log.scoped(.metrics);
+    while (true) {
+        rt.sleepNs(rt.io(), 60 * std.time.ns_per_s);
+        var buf: [512]u8 = undefined;
+        metrics_log.info("{s}", .{fmtMetrics(m, &buf)});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+pub fn main(init: std.process.Init) u8 {
+    // Allocator: c_allocator (libc malloc), NOT smp_allocator.
+    //
+    // smp_allocator never returns freed small-allocation slabs to the OS (by
+    // design — it caches them in per-thread, per-size-class freelists for speed).
+    // Under sustained multi-threaded per-message churn that makes RSS ratchet up
+    // unbounded.
+    //
+    // libc malloc returns freed memory to the OS and, crucially, lets operators
+    // pick the malloc implementation at deploy time via LD_PRELOAD without a
+    // rebuild. jemalloc is RECOMMENDED (flat RSS + background decay purging that
+    // reclaims burst spikes). Throughput cost is
+    // negligible and far above Telegram's ~1000 msg/s ceiling.
+    //
+    // To investigate leaks, temporarily swap in DebugAllocator:
+    //   var da = std.heap.DebugAllocator(.{}){};
+    //   defer _ = da.deinit();
+    //   run(da.allocator(), rt.io(), init.environ_map.*) catch return 1;
+    //
+    // The process Io comes from rt (one shared, stateless OS-backed runtime —
+    // see rt.zig); the environment map is supplied by the 0.16 entry (config no
+    // longer self-fetches it).
+    run(std.heap.c_allocator, rt.io(), init.environ_map.*) catch return 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Core startup — separated from main() so tests can drive startup directly
+// ---------------------------------------------------------------------------
+
+fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !void {
+    // ── Config ───────────────────────────────────────────────────────────────
+    const cfg = config_mod.loadFromMap(allocator, env) catch |err| {
+        log.err("configuration: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer config_mod.deinit(cfg, allocator);
+
+    // ── API schema (hot-reloadable; absent file → Tier-0, no validation) ──────
+    // g_schema_slot is a module global so its address is stable for the process
+    // lifetime — the detached schema-watcher thread can safely hold a pointer to
+    // it across run() returning.
+    g_schema_slot = tg_schema.SchemaSlot.init(allocator, io);
+    tg_schema.loadInitial(&g_schema_slot, cfg.schema_file);
+
+    {
+        var db = state_store.StateStore.open(allocator, cfg.db_path) catch |err| {
+            log.err("database '{s}': {s}", .{ cfg.db_path, @errorName(err) });
+            std.process.exit(1);
+        };
+        db.close();
+    }
+
+    // ── Signal handlers (SIGTERM / SIGINT → clean shutdown) ──────────────────
+    // SA.RESTART causes interrupted slow syscalls (nanosleep, accept, poll) to
+    // be restarted automatically rather than returning EINTR.  The server uses
+    // a poll-based accept loop that tolerates EINTR anyway, but SA.RESTART is
+    // the conventional production choice and future-proofs against any blocking
+    // call path added later.
+    const sa = std.posix.Sigaction{
+        .handler = .{ .handler = sigStop },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+    std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+
+    // ── Startup banner — before server.init ───────────────────────────────────
+    var banner_buf: [256]u8 = undefined;
+    var banner_fw = std.Io.Writer.fixed(&banner_buf);
+    writeBanner(&banner_fw, cfg.api_validation) catch {}; // 256 B covers all fields
+    log.info("{s}", .{banner_fw.buffered()});
+
+    // Effective configuration (secrets partially masked) — one line per param.
+    config_mod.logEffective(cfg);
+
+    var stop = std.atomic.Value(bool).init(false);
+
+    // ── Metrics log thread (detached; runs until process exit) ────────────────
+    // g_metrics is module-level, so its lifetime outlives run() and the
+    // detached thread safely reads it after run() returns.
+    if (cfg.metrics_log) {
+        const metrics_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, metricsLogThread, .{&g_metrics});
+        metrics_t.detach();
+    }
+
+    // ── Dispatcher queue + threads ────────────────────────────────────────────
+    var disp_q = try queue_mod.Queue(types.ApiCall).init(allocator, io, 4096);
+    defer disp_q.deinit(allocator);
+    disp_q.kind = .dispatcher;
+
+    // ── Throttle: delay queue + per-chat block map + requeue thread ───────────
+    var delay_q = delay_mod.DelayQueue.init(allocator, io, cfg.delay_queue_capacity);
+    var blocked_until = delay_mod.BlockedMap.init(allocator, io);
+
+    const requeue_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, delay_mod.requeueThread, .{
+        delay_mod.RequeueArgs{
+            .delay_q = &delay_q,
+            .disp_q = &disp_q,
+            .stop = &stop,
+            .metrics = &g_metrics,
+            .allocator = allocator,
+        },
+    });
+
+    const disp_threads = try allocator.alloc(std.Thread, cfg.dispatcher_threads);
+    defer allocator.free(disp_threads);
+
+    for (0..cfg.dispatcher_threads) |i| {
+        disp_threads[i] = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, disp_mod.dispatcherThread, .{
+            disp_mod.DispatcherArgs{
+                .id = @intCast(i),
+                .queue = &disp_q,
+                .bot_token = cfg.bot_token,
+                .api_base = cfg.bot_api_base,
+                .allocator = allocator,
+                .io = io,
+                .stop = &stop,
+                .metrics = &g_metrics,
+                .delay_q = &delay_q,
+                .blocked_until = &blocked_until,
+                .retry_after_default_ms = cfg.retry_after_default_ms,
+                .retry_after_max_ms = cfg.retry_after_max_ms,
+            },
+        });
+    }
+
+    // ── Worker queues + threads ───────────────────────────────────────────────
+    const wqs = try allocator.alloc(queue_mod.Queue(types.WorkItem), cfg.worker_threads);
+    defer {
+        for (wqs) |*q| q.deinit(allocator);
+        allocator.free(wqs);
+    }
+    const wq_ptrs = try allocator.alloc(*queue_mod.Queue(types.WorkItem), cfg.worker_threads);
+    defer allocator.free(wq_ptrs);
+
+    for (0..cfg.worker_threads) |i| {
+        wqs[i] = try queue_mod.Queue(types.WorkItem).init(allocator, io, cfg.worker_queue_capacity);
+        wqs[i].id = i;
+        wqs[i].metrics_log = cfg.metrics_log;
+        wqs[i].kind = .worker;
+        wq_ptrs[i] = &wqs[i];
+    }
+
+    // ── io_pool result queues (one per worker; pool routes by worker_id) ───────
+    const result_qs = try allocator.alloc(queue_mod.Queue(io_pool.IoResult), cfg.worker_threads);
+    errdefer allocator.free(result_qs);
+    var result_qs_init: usize = 0;
+    errdefer for (result_qs[0..result_qs_init]) |*rq| rq.deinit(allocator);
+    for (0..cfg.worker_threads) |i| {
+        result_qs[i] = try queue_mod.Queue(io_pool.IoResult).init(allocator, io, cfg.io_queue_capacity);
+        result_qs[i].id = i;
+        result_qs[i].metrics_log = cfg.metrics_log;
+        result_qs[i].kind = .io_result;
+        result_qs_init += 1;
+    }
+
+    const result_q_ptrs = try allocator.alloc(*queue_mod.Queue(io_pool.IoResult), cfg.worker_threads);
+    errdefer allocator.free(result_q_ptrs);
+    for (0..cfg.worker_threads) |i| result_q_ptrs[i] = &result_qs[i];
+
+    // ── Single shared io_pool that executes blocking I/O for parked coroutines ─
+    var pool: io_pool.IoPool = undefined;
+    try pool.init(allocator, io, io_pool.IoPoolConfig{
+        .thread_count = cfg.io_pool_threads,
+        .queue_capacity = cfg.io_queue_capacity,
+        .timeout_ms = cfg.io_job_timeout_ms,
+        .proc_max_output = cfg.proc_max_output_bytes,
+        .metrics = &g_metrics,
+    }, result_q_ptrs);
+    errdefer pool.deinit();
+
+    // ── Scheduler: own DB connection + timer thread ───────────────────────────
+    // lease_ms must exceed workflow_deadline_ms so a legitimately-slow async job
+    // is never reclaimed and double-fired.
+    std.debug.assert(scheduler_mod.DEFAULT_LEASE_MS > @as(i64, @intCast(cfg.workflow_deadline_ms)));
+    var g_scheduler = scheduler_mod.Scheduler{ .io = io };
+    var sched_db = try state_store.StateStore.open(allocator, cfg.db_path);
+    defer sched_db.close();
+    const scheduler_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, scheduler_mod.schedulerThread, .{
+        scheduler_mod.SchedulerArgs{
+            .db = &sched_db,
+            .worker_qs = wq_ptrs,
+            .sched = &g_scheduler,
+            .stop = &stop,
+            .io = io,
+            .allocator = allocator,
+        },
+    });
+
+    const worker_threads = try allocator.alloc(std.Thread, cfg.worker_threads);
+    defer allocator.free(worker_threads);
+
+    // Track per-worker DB pointers so they can be freed after workers join.
+    const dbs = try allocator.alloc(state_store.StateStore, cfg.worker_threads);
+    defer allocator.free(dbs); // only frees the slice backing array
+
+    var opened_dbs: usize = 0;
+    errdefer for (dbs[0..opened_dbs]) |*db| db.close();
+
+    for (0..cfg.worker_threads) |i| {
+        dbs[i] = try state_store.StateStore.open(allocator, cfg.db_path);
+        opened_dbs += 1;
+        worker_threads[i] = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, worker_mod.workerThread, .{
+            worker_mod.WorkerArgs{
+                .id = @intCast(i),
+                .rules_path = cfg.rules_file,
+                .allocator = allocator,
+                .io = io,
+                .queue = &wqs[i],
+                .dispatcher_queue = &disp_q,
+                .db = &dbs[i],
+                .stop = &stop,
+                .reload_ver = &watcher.reload_version,
+                .schema = &g_schema_slot,
+                .validation = cfg.api_validation,
+                .json_max_bytes = cfg.json_max_bytes,
+                .metrics = &g_metrics,
+                .io_pool_ptr = &pool,
+                .io_result_queue = &result_qs[i],
+                .max_inflight = cfg.worker_max_inflight,
+                .workflow_deadline_ms = cfg.workflow_deadline_ms,
+                .scheduler = &g_scheduler,
+            },
+        });
+    }
+
+    // ── Hot-reload watcher (detached; no graceful shutdown in prototype) ───────
+    {
+        const watcher_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, watcher.watcherThread, .{
+            watcher.WatcherArgs{
+                .rules_path = cfg.rules_file,
+                .allocator = allocator,
+                .io = io,
+            },
+        });
+        watcher_t.detach();
+    }
+
+    // ── Schema-file watcher (detached; mirrors the rules watcher) ─────────────
+    {
+        const schema_watcher_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, tg_schema.schemaWatcherThread, .{
+            tg_schema.SchemaWatcherArgs{
+                .schema_file = cfg.schema_file,
+                .slot = &g_schema_slot,
+                .allocator = allocator,
+            },
+        });
+        schema_watcher_t.detach();
+    }
+
+    // ── HTTP server (accept loop runs in its own thread) ──────────────────────
+    const srv = try server_mod.Server.init(.{
+        .listen_addr = cfg.listen_addr,
+        .webhook_secret = cfg.webhook_secret,
+        .queues = wq_ptrs,
+        .allocator = allocator,
+        .io = io,
+        .pool_threads = cfg.webhook_pool_threads,
+        .metrics = &g_metrics,
+    });
+
+    // ── Block until SIGTERM / SIGINT ──────────────────────────────────────────
+    while (!g_stop.load(.acquire)) rt.sleepNs(io, 100 * std.time.ns_per_ms);
+    log.info("shutdown signal received — draining and stopping", .{});
+
+    // Shutdown order: stop accepting → stop workers (they drain parked coroutines
+    // via the still-alive io_pool) → stop scheduler → deinit pool → free DBs →
+    // stop dispatchers.
+    srv.deinit();
+    stop.store(true, .release);
+    // Wake any workers parked idle in popBlocking so they observe stop and exit
+    // (replaces the old 10 ms update-queue poll).
+    for (wqs) |*q| q.close();
+    for (worker_threads) |t| t.join();
+
+    // Unpark the scheduler timer so it observes stop and exits promptly.
+    // Placed after workers join: workers may still call bot.schedule_* while
+    // draining, so g_scheduler must outlive them. sched_db is closed by its
+    // defer after this join, which is the correct order.
+    g_scheduler.wakeUp();
+    scheduler_t.join();
+
+    // Workers have drained and joined; the pool is now unreferenced. Deinit it
+    // (joins io threads, SIGKILLs any in-flight children), then drain + free the
+    // per-worker result queues (the pool may have pushed results during its drain).
+    pool.deinit();
+    for (result_qs) |*rq| while (rq.popTimeout(0)) |res| io_pool.freeIoResult(res, allocator);
+    for (result_qs) |*rq| rq.deinit(allocator);
+    allocator.free(result_qs);
+    allocator.free(result_q_ptrs);
+
+    // Drain WorkItem entries workers didn't pop before stop (free their bodies).
+    for (wqs) |*q| while (q.popTimeout(0)) |item| allocator.free(item.body);
+    for (dbs) |*db| db.close();
+    // Wake the parked dispatchers so they drain and exit (replaces the old
+    // 10 ms stop-poll). close() is the shutdown signal for the queue consumers.
+    disp_q.close();
+    for (disp_threads) |t| t.join();
+    // Stop the requeue thread before draining either queue so nothing moves
+    // between them during teardown.
+    requeue_t.join();
+    // Drain ApiCall items still parked or queued (free string payloads).
+    delay_q.deinitDrain(allocator);
+    while (disp_q.popTimeout(0)) |action| types.freeApiCall(action, allocator);
+    blocked_until.deinit();
+    // Watcher thread is detached and cannot be joined; its rules_path dupe
+    // is freed by the OS on process exit.
+    log.info("shutdown complete", .{});
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const Queue = queue_mod.Queue;
+
+// ---------------------------------------------------------------------------
+// IntegrationStack — full bot stack for integration tests.
+//
+// Uses std.testing.allocator for queue buffers (tracked).
+// Uses std.heap.page_allocator for server + worker + dispatcher internals.
+// Each Update's Parsed arena is freed by the worker after on_message returns.
+// ApiCall strings are freed by the dispatcher after sending.
+// ---------------------------------------------------------------------------
+
+// Optional subsystems wired into the stack. Each defaults to off so existing
+// tests (which pass no options) keep the original minimal stack; the schema/
+// scheduler integration tests opt in.
+const StackOptions = struct {
+    /// Schema bytes to install for outgoing-call validation. null → no schema.
+    schema_json: ?[]const u8 = null,
+    /// Validation policy. Only meaningful when schema_json is non-null.
+    validation: types.ValidationMode = .off,
+    /// When true, wire a Scheduler so rules can call bot.schedule_*.
+    with_scheduler: bool = false,
+};
+
+const IntegrationStack = struct {
+    // All fields live in heap memory (this struct is heap-allocated so that
+    // pointers passed to spawned threads remain stable).
+
+    stop: std.atomic.Value(bool),
+    worker_q: Queue(types.WorkItem),
+    disp_q: Queue(types.ApiCall),
+    q_ptrs: [1]*Queue(types.WorkItem),
+    db: state_store.StateStore,
+    worker_t: std.Thread,
+    disp_t: std.Thread,
+    srv: *server_mod.Server,
+    tmp: testing.TmpDir,
+    rules_path_buf: [std.fs.max_path_bytes + 1]u8,
+    rules_path: [:0]const u8,
+
+    // Optional subsystems — present in the stack so worker threads see real
+    // (not stubbed) schema/metrics/scheduler wiring. metrics counts through the
+    // full path; schema validates outgoing calls; scheduler accepts schedule_*.
+    metrics: metrics_mod.Metrics,
+    schema_slot: ?tg_schema.SchemaSlot,
+    scheduler: ?scheduler_mod.Scheduler,
+
+    fn init(
+        test_alloc: std.mem.Allocator,
+        api_base: []const u8,
+        rules_lua: []const u8,
+    ) !*IntegrationStack {
+        return initWithOptions(test_alloc, api_base, rules_lua, .{});
+    }
+
+    fn initWithOptions(
+        test_alloc: std.mem.Allocator,
+        api_base: []const u8,
+        rules_lua: []const u8,
+        opts: StackOptions,
+    ) !*IntegrationStack {
+        const self = try test_alloc.create(IntegrationStack);
+        errdefer test_alloc.destroy(self);
+
+        self.tmp = testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+
+        // Write initial rules file.
+        try self.writeRulesImpl(rules_lua);
+
+        // Resolve the absolute path (null-terminated for Lua).
+        const ps_len = try self.tmp.dir.realPathFile(
+            testing.io,
+            "rules.lua",
+            self.rules_path_buf[0..std.fs.max_path_bytes],
+        );
+        self.rules_path_buf[ps_len] = 0;
+        self.rules_path = self.rules_path_buf[0..ps_len :0];
+
+        self.stop = std.atomic.Value(bool).init(false);
+        self.worker_q = try Queue(types.WorkItem).init(test_alloc, testing.io, 64);
+        errdefer self.worker_q.deinit(test_alloc);
+        self.disp_q = try Queue(types.ApiCall).init(test_alloc, testing.io, 256);
+        errdefer self.disp_q.deinit(test_alloc);
+        self.q_ptrs[0] = &self.worker_q;
+
+        self.db = try state_store.StateStore.open(std.heap.page_allocator, ":memory:");
+        errdefer self.db.close();
+
+        // Optional subsystems — construct before spawning the worker so their
+        // addresses are stable for the WorkerArgs pointers.
+        self.metrics = .{};
+
+        self.schema_slot = if (opts.schema_json) |json| blk: {
+            var slot = tg_schema.SchemaSlot.init(std.heap.page_allocator, testing.io);
+            slot.install(try tg_schema.SchemaStore.fromSlice(std.heap.page_allocator, json));
+            break :blk slot;
+        } else null;
+        errdefer if (self.schema_slot) |*s| s.deinit();
+
+        self.scheduler = if (opts.with_scheduler)
+            scheduler_mod.Scheduler{ .io = testing.io }
+        else
+            null;
+
+        self.worker_t = try std.Thread.spawn(.{}, worker_mod.workerThread, .{
+            worker_mod.WorkerArgs{
+                .id = 0,
+                .rules_path = self.rules_path,
+                .allocator = std.heap.page_allocator,
+                .io = testing.io,
+                .queue = &self.worker_q,
+                .dispatcher_queue = &self.disp_q,
+                .db = &self.db,
+                .stop = &self.stop,
+                .reload_ver = &watcher.reload_version,
+                .schema = if (self.schema_slot) |*s| s else null,
+                .validation = opts.validation,
+                .metrics = &self.metrics,
+                .scheduler = if (self.scheduler) |*s| s else null,
+            },
+        });
+
+        self.disp_t = try std.Thread.spawn(.{}, disp_mod.dispatcherThread, .{
+            disp_mod.DispatcherArgs{
+                .id = 0,
+                .queue = &self.disp_q,
+                .bot_token = "TESTTOKEN",
+                .api_base = api_base,
+                .allocator = std.heap.page_allocator,
+                .io = testing.io,
+                .stop = &self.stop,
+                .metrics = &self.metrics,
+            },
+        });
+
+        const srv_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+        self.srv = try server_mod.Server.init(.{
+            .listen_addr = srv_addr,
+            .webhook_secret = "test-secret",
+            .queues = &self.q_ptrs,
+            .allocator = std.heap.page_allocator,
+            .io = testing.io,
+            .pool_threads = 2,
+            .metrics = &self.metrics,
+        });
+
+        return self;
+    }
+
+    fn deinit(self: *IntegrationStack, test_alloc: std.mem.Allocator) void {
+        self.stop.store(true, .release);
+        self.worker_q.close(); // wake the parked worker so it can observe stop
+        // Unpark the scheduler handle (if any) so a worker blocked in
+        // bot.schedule_* wakeUp paths sees no surprise; the worker drains and joins.
+        if (self.scheduler) |*s| s.wakeUp();
+        self.worker_t.join();
+        self.disp_q.close(); // wake the parked dispatcher so it can observe stop
+        self.disp_t.join();
+        self.srv.deinit();
+        self.db.close();
+        if (self.schema_slot) |*s| s.deinit();
+        self.worker_q.deinit(test_alloc);
+        self.disp_q.deinit(test_alloc);
+        self.tmp.cleanup();
+        test_alloc.destroy(self);
+    }
+
+    fn webhookAddr(self: *const IntegrationStack) std.Io.net.IpAddress {
+        return self.srv.listenAddress();
+    }
+
+    fn writeRules(self: *IntegrationStack, lua: []const u8) !void {
+        try self.writeRulesImpl(lua);
+    }
+
+    fn writeRulesImpl(self: *IntegrationStack, lua: []const u8) !void {
+        try self.tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = lua });
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Shared test helpers
+// ---------------------------------------------------------------------------
+
+const WEBHOOK_SECRET = "test-secret";
+
+/// Lua rules v1: emit a single sendMessage call (generic { method, params } form).
+const RULES_V1 =
+    \\function on_message(update)
+    \\  return { { method="sendMessage", params={ chat_id=1, text="v1" } } }
+    \\end
+;
+
+/// Lua rules v2: return no actions (used to verify reload).
+const RULES_V2 =
+    \\function on_message(update)
+    \\  return {}
+    \\end
+;
+
+/// Minimal valid Telegram Update JSON.
+const UPDATE_JSON =
+    \\{"update_id":1,"message":{"message_id":1,"from":{"id":100,"is_bot":false,"first_name":"T"},"chat":{"id":1,"type":"private"},"date":0}}
+;
+
+/// POST `body` to `address/webhook` with the test secret; return status code.
+fn postWebhook(address: std.Io.net.IpAddress, body: []const u8) !u16 {
+    const io = testing.io;
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var wbuf: [1024]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    const w = &sw.interface;
+    try w.print(
+        "POST /webhook HTTP/1.1\r\n" ++
+            "X-Telegram-Bot-Api-Secret-Token: {s}\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n\r\n",
+        .{ WEBHOOK_SECRET, body.len },
+    );
+    try w.writeAll(body);
+    try w.flush();
+
+    var rbuf: [256]u8 = undefined;
+    var net_rdr = stream.reader(io, &rbuf);
+    const line = (try net_rdr.interface.takeDelimiter('\n')) orelse return error.NoResponse;
+    const trimmed = std.mem.trimEnd(u8, line, "\r");
+    var it = std.mem.splitScalar(u8, trimmed, ' ');
+    _ = it.next();
+    const code = it.next() orelse return error.BadResponse;
+    return std.fmt.parseInt(u16, code, 10) catch error.BadResponse;
+}
+
+// ---------------------------------------------------------------------------
+// startup log and server ready
+// ---------------------------------------------------------------------------
+
+test "startup banner contains all five identity fields" {
+    // P4-1 / P3-4: the production startup path formats the banner via writeBanner
+    // then log.info()s it; test_runner.zig owns the std.log backend, so the test
+    // inspects writeBanner's output directly (the same string the banner logs).
+    var buf: [256]u8 = undefined;
+    var fw = std.Io.Writer.fixed(&buf);
+    try writeBanner(&fw, .warn);
+    const banner = fw.buffered();
+
+    // The banner prefix and every field name=value must be present.
+    try testing.expect(std.mem.indexOf(u8, banner, "zora starting") != null);
+
+    var rel_buf: [16]u8 = undefined;
+    const rel = std.fmt.bufPrint(&rel_buf, "release={d}", .{RELEASE}) catch unreachable;
+    var sch_buf: [16]u8 = undefined;
+    const sch = std.fmt.bufPrint(&sch_buf, "schema={d}", .{state_store.SCHEMA_VERSION}) catch unreachable;
+    var api_buf: [20]u8 = undefined;
+    const api = std.fmt.bufPrint(&api_buf, "rules_api={d}", .{lua_engine.RULES_API_VERSION}) catch unreachable;
+
+    var branch_buf: [64]u8 = undefined;
+    const branch = std.fmt.bufPrint(&branch_buf, "branch={s}", .{GIT_BRANCH}) catch unreachable;
+
+    try testing.expect(std.mem.indexOf(u8, banner, branch) != null);
+    try testing.expect(std.mem.indexOf(u8, banner, rel) != null);
+    try testing.expect(std.mem.indexOf(u8, banner, sch) != null);
+    try testing.expect(std.mem.indexOf(u8, banner, api) != null);
+    // api_validation reflects the passed mode (proves the field is not hard-coded).
+    try testing.expect(std.mem.indexOf(u8, banner, "api_validation=warn") != null);
+}
+
+test "startup log line printed before server accepts connections" {
+    // Verified by code structure: log.info(...) appears before server.init()
+    // in run().  This test verifies the stack starts up and accepts connections.
+    // Banner content is asserted in "startup banner contains all five identity
+    // fields" above (P4-1/P3-4).
+    const mock = try disp_mod.MockServer.init(testing.allocator);
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const api_base = mock.baseUrl(&url_buf);
+
+    const stack = try IntegrationStack.init(testing.allocator, api_base, RULES_V1);
+    defer stack.deinit(testing.allocator);
+
+    // Server is up if it can accept a connection and return 200.
+    const status = try postWebhook(stack.webhookAddr(), UPDATE_JSON);
+    try testing.expectEqual(@as(u16, 200), status);
+}
+
+// ---------------------------------------------------------------------------
+// missing BOT_TOKEN → MissingRequiredField (tested via config.zig)
+// ---------------------------------------------------------------------------
+
+test "missing BOT_TOKEN → MissingRequiredField error" {
+    // config_mod.loadFromMap is the error path exercised by run() when
+    // BOT_TOKEN is absent.  run() calls std.process.exit(1) on this error;
+    // the test calls the underlying function directly to avoid killing the test binary.
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    // BOT_TOKEN intentionally absent; WEBHOOK_SECRET present.
+    try env.put("WEBHOOK_SECRET", "s");
+    try testing.expectError(
+        error.MissingRequiredField,
+        config_mod.loadFromMap(testing.allocator, env),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// end-to-end smoke test
+// ---------------------------------------------------------------------------
+
+test "POST webhook → worker processes → dispatcher calls mock Telegram API" {
+    const mock = try disp_mod.MockServer.init(testing.allocator);
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const stack = try IntegrationStack.init(testing.allocator, mock.baseUrl(&url_buf), RULES_V1);
+    defer stack.deinit(testing.allocator);
+
+    // Give worker time to load rules.
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
+
+    const status = try postWebhook(stack.webhookAddr(), UPDATE_JSON);
+    try testing.expectEqual(@as(u16, 200), status);
+
+    // Dispatcher should POST to mock within 2 s.
+    try testing.expect(mock.waitForN(1, 2000));
+    try testing.expectEqual(@as(u32, 1), mock.call_cnt.load(.acquire));
+}
+
+// ---------------------------------------------------------------------------
+// hot-reload integration
+// ---------------------------------------------------------------------------
+
+test "rules.lua updated → next request uses new rules within 2 s" {
+    const mock = try disp_mod.MockServer.init(testing.allocator);
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const stack = try IntegrationStack.init(testing.allocator, mock.baseUrl(&url_buf), RULES_V1);
+    defer stack.deinit(testing.allocator);
+
+    // Spawn the hot-reload watcher for this stack's rules file.
+    // Detached — runs until the test binary exits.
+    const watcher_t = try std.Thread.spawn(.{}, watcher.watcherThread, .{
+        watcher.WatcherArgs{
+            .rules_path = stack.rules_path,
+            .allocator = std.heap.page_allocator,
+            .io = testing.io,
+        },
+    });
+    watcher_t.detach();
+
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms); // let worker load rules
+
+    // Verify v1 behavior: POST → mock receives 1 call.
+    _ = try postWebhook(stack.webhookAddr(), UPDATE_JSON);
+    try testing.expect(mock.waitForN(1, 2000));
+
+    // Record current reload version and overwrite rules with v2 (no actions).
+    const ver_before = watcher.reload_version.load(.acquire);
+    try stack.writeRules(RULES_V2);
+
+    // Wait up to 2 s for inotify to fire and reload_version to increment.
+    const deadline = rt.nowMs(testing.io) + 2000;
+    while (watcher.reload_version.load(.acquire) == ver_before) {
+        if (rt.nowMs(testing.io) >= deadline) {
+            try testing.expect(false); // reload did not fire within 2 s
+            return;
+        }
+        rt.sleepNs(testing.io, 10 * std.time.ns_per_ms);
+    }
+
+    // Give the worker one more iteration to pick up the incremented version.
+    rt.sleepNs(testing.io, 10 * std.time.ns_per_ms);
+
+    // POST again — v2 returns no actions, so mock call count must not increase.
+    _ = try postWebhook(stack.webhookAddr(), UPDATE_JSON);
+    rt.sleepNs(testing.io, 200 * std.time.ns_per_ms); // let dispatcher attempt
+    try testing.expectEqual(@as(u32, 1), mock.call_cnt.load(.acquire));
+}
+
+// ---------------------------------------------------------------------------
+// dispatcher failure does not crash the server
+// ---------------------------------------------------------------------------
+
+test "mock API down → server still returns 200 OK, no crash" {
+    // A live mock exists but the dispatcher is pointed at a *different*, dead
+    // port. Asserting mock.received stays empty proves the dispatcher's retry
+    // path failed to deliver (P3-8) — not merely that the process did not crash.
+    const mock = try disp_mod.MockServer.init(testing.allocator);
+    defer mock.deinit();
+
+    // Point dispatcher at a port that has nothing listening.
+    const dummy_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    // Bind a server to get an ephemeral port, then immediately close it so
+    // the dispatcher finds no listener.
+    var dummy_srv = try dummy_addr.listen(testing.io, .{});
+    var dsa: std.posix.sockaddr.in = undefined;
+    var dsa_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    _ = std.posix.system.getsockname(dummy_srv.socket.handle, @ptrCast(&dsa), &dsa_len);
+    const dead_port = std.mem.bigToNative(u16, dsa.port);
+    dummy_srv.deinit(testing.io); // port is now closed
+
+    var url_buf: [64]u8 = undefined;
+    const dead_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{dead_port}) catch unreachable;
+
+    const stack = try IntegrationStack.init(testing.allocator, dead_url, RULES_V1);
+    defer stack.deinit(testing.allocator);
+
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
+
+    // Server must still accept and return 200 OK even though dispatch fails.
+    const status = try postWebhook(stack.webhookAddr(), UPDATE_JSON);
+    try testing.expectEqual(@as(u16, 200), status);
+
+    // Wait for the dispatcher's send + single-retry cycle to complete
+    // (~200 ms retry delay + connect-failure overhead).
+    rt.sleepNs(testing.io, 500 * std.time.ns_per_ms);
+
+    // The call was never delivered: the live mock received nothing.
+    try testing.expectEqual(@as(usize, 0), mock.received.len());
+}
+
+// ---------------------------------------------------------------------------
+// fmtMetrics emits all 14 counter names in the expected format
+// ---------------------------------------------------------------------------
+
+/// Find token `key=...` in `line` (split on spaces) and return its value slice.
+/// Returns null if the key is absent. Used to assert each pair exactly (P3-7):
+/// substring search alone cannot detect a key/value transposition.
+fn metricValue(line: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, line, ' ');
+    while (it.next()) |tok| {
+        const eq = std.mem.indexOfScalar(u8, tok, '=') orelse continue;
+        if (std.mem.eql(u8, tok[0..eq], key)) return tok[eq + 1 ..];
+    }
+    return null;
+}
+
+test "fmtMetrics emits every counter name and reflects their values" {
+    // P3-7: set all fourteen counters to *distinct* values, then assert each
+    // key=value pair exactly. Distinct values + per-pair matching defeats a
+    // transposition (e.g. io_jobs/io_err swapped) that substring search misses.
+    var m = metrics_mod.Metrics{};
+    _ = m.io_jobs_total.fetchAdd(1, .monotonic);
+    _ = m.io_jobs_inflight.fetchAdd(2, .monotonic);
+    _ = m.io_errors_total.fetchAdd(3, .monotonic);
+    _ = m.io_timeouts_total.fetchAdd(4, .monotonic);
+    _ = m.coroutines_inflight.fetchAdd(5, .monotonic);
+    _ = m.coroutines_reaped_total.fetchAdd(6, .monotonic);
+    _ = m.tracked_send_failures_total.fetchAdd(7, .monotonic);
+    _ = m.response_oversize_total.fetchAdd(8, .monotonic);
+    _ = m.throttle_429_total.fetchAdd(9, .monotonic);
+    _ = m.throttle_delayed_total.fetchAdd(10, .monotonic);
+    _ = m.throttle_shed_total.fetchAdd(11, .monotonic);
+    _ = m.throttle_delay_depth.fetchAdd(12, .monotonic);
+    _ = m.route_overflow_total.fetchAdd(13, .monotonic);
+    _ = m.route_drop_total.fetchAdd(14, .monotonic);
+
+    var buf: [512]u8 = undefined;
+    const line = fmtMetrics(&m, &buf);
+
+    // Each of the 14 emitted keys, in fmtMetrics' output order, paired with the
+    // value its source counter was set to above.
+    const expected = [_]struct { key: []const u8, val: []const u8 }{
+        .{ .key = "io_jobs", .val = "1" },
+        .{ .key = "io_inflight", .val = "2" },
+        .{ .key = "io_err", .val = "3" },
+        .{ .key = "io_timeout", .val = "4" },
+        .{ .key = "coros_inflight", .val = "5" },
+        .{ .key = "coros_reaped", .val = "6" },
+        .{ .key = "tracked_fail", .val = "7" },
+        .{ .key = "resp_oversize", .val = "8" },
+        .{ .key = "throttle_429", .val = "9" },
+        .{ .key = "throttle_delayed", .val = "10" },
+        .{ .key = "throttle_shed", .val = "11" },
+        .{ .key = "throttle_depth", .val = "12" },
+        .{ .key = "route_overflow", .val = "13" },
+        .{ .key = "route_drop", .val = "14" },
+    };
+    inline for (expected) |e| {
+        const got = metricValue(line, e.key) orelse {
+            std.debug.print("missing metric key: {s}\n", .{e.key});
+            return error.MissingMetricKey;
+        };
+        try testing.expectEqualStrings(e.val, got);
+    }
+    // Exactly 14 space-separated tokens — no stray or duplicated pair.
+    try testing.expectEqual(@as(usize, 14), std.mem.count(u8, line, "=") );
+}
+
+// ---------------------------------------------------------------------------
+// metricsLogThread snapshot line (P4-40)
+// ---------------------------------------------------------------------------
+
+test "metrics snapshot line emitted by metricsLogThread is well-formed" {
+    // metricsLogThread sleeps 60 s between emissions and routes its line through
+    // std.log, whose backend is owned by test_runner.zig and cannot be
+    // intercepted from a non-root file. The emitted text is produced verbatim by
+    // fmtMetrics(m, buf) — the same call the thread makes each tick. We exercise
+    // that call against a live-counter instance: a non-empty, parseable snapshot
+    // confirms the thread has a valid line to emit when metrics_log is enabled.
+    var m = metrics_mod.Metrics{};
+    _ = m.io_jobs_total.fetchAdd(42, .monotonic);
+
+    var buf: [512]u8 = undefined;
+    const line = fmtMetrics(&m, &buf);
+
+    try testing.expect(line.len > 0);
+    try testing.expectEqualStrings("42", metricValue(line, "io_jobs").?);
+    // The throttle-depth gauge is always present in a snapshot.
+    try testing.expect(metricValue(line, "throttle_depth") != null);
+}
+
+// ---------------------------------------------------------------------------
+// schema validation fires through the full stack (P4-39)
+// ---------------------------------------------------------------------------
+
+test "strict schema validation drops an invalid call through the stack" {
+    // A minimal schema requiring sendMessage.text; the rule omits it. In strict
+    // mode the worker must drop the call, so the live mock never receives it.
+    const SCHEMA =
+        \\{"methods":{"sendMessage":{"fields":[
+        \\  {"name":"chat_id","types":["Integer","String"],"required":true},
+        \\  {"name":"text","types":["String"],"required":true}
+        \\]}},"types":{}}
+    ;
+    const RULES_INVALID =
+        \\function on_message(update)
+        \\  return { { method="sendMessage", params={ chat_id=1 } } }
+        \\end
+    ;
+    const mock = try disp_mod.MockServer.init(testing.allocator);
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const stack = try IntegrationStack.initWithOptions(
+        testing.allocator,
+        mock.baseUrl(&url_buf),
+        RULES_INVALID,
+        .{ .schema_json = SCHEMA, .validation = .strict },
+    );
+    defer stack.deinit(testing.allocator);
+
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms); // let worker load rules
+
+    const status = try postWebhook(stack.webhookAddr(), UPDATE_JSON);
+    try testing.expectEqual(@as(u16, 200), status);
+
+    // Give the worker + dispatcher time to run; the invalid call must be dropped.
+    rt.sleepNs(testing.io, 300 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 0), mock.received.len());
+}
+
+test "valid call passes strict validation and reaches the mock" {
+    // Control for the drop test: with the same schema and strict mode, a rule
+    // that supplies all required fields delivers through the stack.
+    const SCHEMA =
+        \\{"methods":{"sendMessage":{"fields":[
+        \\  {"name":"chat_id","types":["Integer","String"],"required":true},
+        \\  {"name":"text","types":["String"],"required":true}
+        \\]}},"types":{}}
+    ;
+    const mock = try disp_mod.MockServer.init(testing.allocator);
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const stack = try IntegrationStack.initWithOptions(
+        testing.allocator,
+        mock.baseUrl(&url_buf),
+        RULES_V1, // sends sendMessage with chat_id + text — valid
+        .{ .schema_json = SCHEMA, .validation = .strict },
+    );
+    defer stack.deinit(testing.allocator);
+
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
+
+    const status = try postWebhook(stack.webhookAddr(), UPDATE_JSON);
+    try testing.expectEqual(@as(u16, 200), status);
+    try testing.expect(mock.waitForN(1, 2000));
+}
+
+// ---------------------------------------------------------------------------
+// scheduler row produced by a rule through the full stack (P4-39)
+// ---------------------------------------------------------------------------
+
+test "rule calling bot.schedule_after inserts a scheduler row" {
+    // With a Scheduler wired into the stack, a rule that calls schedule_after
+    // must persist a row in the shared DB. The stack and worker share &self.db
+    // (an in-memory store), so the test reads the row back directly.
+    const RULES_SCHEDULE =
+        \\function on_message(update)
+        \\  bot.schedule_after{ seconds = 3600, payload = { kind = "remind" } }
+        \\  return {}
+        \\end
+    ;
+    const mock = try disp_mod.MockServer.init(testing.allocator);
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const stack = try IntegrationStack.initWithOptions(
+        testing.allocator,
+        mock.baseUrl(&url_buf),
+        RULES_SCHEDULE,
+        .{ .with_scheduler = true },
+    );
+    defer stack.deinit(testing.allocator);
+
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
+
+    // No row before the update is processed.
+    try testing.expectEqual(@as(?i64, null), try stack.db.scheduleMinFire(std.math.maxInt(i64)));
+
+    const status = try postWebhook(stack.webhookAddr(), UPDATE_JSON);
+    try testing.expectEqual(@as(u16, 200), status);
+
+    // Poll up to 2 s for the worker to process the update and insert the row.
+    const deadline = rt.nowMs(testing.io) + 2000;
+    var fire_at: ?i64 = null;
+    while (rt.nowMs(testing.io) < deadline) {
+        fire_at = try stack.db.scheduleMinFire(std.math.maxInt(i64));
+        if (fire_at != null) break;
+        rt.sleepNs(testing.io, 10 * std.time.ns_per_ms);
+    }
+    try testing.expect(fire_at != null); // a future-dated row was inserted
+}
