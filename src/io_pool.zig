@@ -145,6 +145,9 @@ pub const IoPoolConfig = struct {
     timeout_ms:      u64,
     proc_max_output: usize,
     metrics:         ?*metrics_mod.Metrics = null,
+    /// Environment for spawned subprocesses (bot.shell/exec). null inherits the
+    /// parent's environment. Production passes a secret-stripped map.
+    child_env:       ?*const std.process.Environ.Map = null,
 };
 
 pub const IoPool = struct {
@@ -157,6 +160,7 @@ pub const IoPool = struct {
     timeout_ms:      u64,
     proc_max_output: usize,
     metrics:         ?*metrics_mod.Metrics,
+    child_env:       ?*const std.process.Environ.Map,
     /// Per-thread current child PID (0 = idle). Set before child.spawn(),
     /// cleared (to 0) after child.wait(). Allows deinit() to SIGKILL in-flight children.
     current_pids:    []std.atomic.Value(std.posix.pid_t),
@@ -176,6 +180,7 @@ pub const IoPool = struct {
         self.timeout_ms      = config.timeout_ms;
         self.proc_max_output = config.proc_max_output;
         self.metrics         = config.metrics;
+        self.child_env       = config.child_env;
         self.stop            = std.atomic.Value(bool).init(false);
 
         self.job_queue = try queue_mod.Queue(IoJob).init(allocator, io, config.queue_capacity);
@@ -506,9 +511,10 @@ pub const IoPool = struct {
         const alloc = pool.allocator;
 
         var child = std.process.spawn(pool.io, .{
-            .argv   = argv,
-            .stdout = .pipe,
-            .stderr = .close,
+            .argv        = argv,
+            .environ_map = pool.child_env,
+            .stdout      = .pipe,
+            .stderr      = .close,
         }) catch |err| {
             pool.pushErr(job, @errorName(err));
             return;
@@ -1369,4 +1375,29 @@ test "graceful stop — joins threads and kills in-flight children" {
 
     // Drain results pushed by the killed worker (e.g. "timeout" err) to prevent leak.
     while (rq.popTimeout(0)) |r| freeIoResult(r, testing.allocator);
+}
+
+test "io_pool carries a configured child_env" {
+    const alloc = testing.allocator;
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("PATH", "/usr/bin");
+
+    // Build the minimal result-queue plumbing the pool requires (one worker).
+    var rq = try queue_mod.Queue(IoResult).init(alloc, rt.io(), 8);
+    defer rq.deinit(alloc);
+    const rqs = [_]*queue_mod.Queue(IoResult){&rq};
+
+    var pool: IoPool = undefined;
+    try pool.init(alloc, rt.io(), .{
+        .thread_count    = 1,
+        .queue_capacity  = 8,
+        .timeout_ms      = 1_000,
+        .proc_max_output = 1024,
+        .child_env       = &env,
+    }, &rqs);
+    defer pool.deinit();
+
+    try testing.expect(pool.child_env != null);
+    try testing.expectEqualStrings("/usr/bin", pool.child_env.?.get("PATH").?);
 }

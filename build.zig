@@ -92,6 +92,34 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zora");
     run_step.dependOn(&run_cmd.step);
 
+    // --- zora-migrate executable ---
+    // Standalone v1 -> v2 database migration tool. Links the same SQLite C
+    // source as the server and imports state_store; it needs neither ziglua nor
+    // build_options (no version banner).
+    const migrate_mod = b.createModule(.{
+        .root_source_file = b.path("src/migrate.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    migrate_mod.addCSourceFile(.{
+        .file = b.path("vendor/sqlite3.c"),
+        .flags = sqlite_flags,
+    });
+    migrate_mod.addIncludePath(b.path("vendor"));
+
+    const migrate_exe = b.addExecutable(.{
+        .name = "zora-migrate",
+        .root_module = migrate_mod,
+    });
+    b.installArtifact(migrate_exe);
+
+    const migrate_run = b.addRunArtifact(migrate_exe);
+    migrate_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| migrate_run.addArgs(args);
+    const migrate_step = b.step("migrate", "Run the v1 -> v2 state database migration tool");
+    migrate_step.dependOn(&migrate_run.step);
+
     // --- test step ---
     const test_step = b.step("test", "Run all tests");
 
@@ -103,6 +131,7 @@ pub fn build(b: *std.Build) void {
         "src/queue.zig",
         "src/io_pool.zig",
         "src/serializer.zig",
+        "src/state_crypto.zig",
         "src/state_store.zig",
         "src/tg_schema.zig",
         "src/lua_engine.zig",
@@ -113,7 +142,9 @@ pub fn build(b: *std.Build) void {
         "src/scheduler.zig",
         "src/dispatcher.zig",
         "src/server.zig",
+        "src/metrics_server.zig",
         "src/main.zig",
+        "src/migrate.zig",
     };
 
     for (src_files) |src| {

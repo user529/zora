@@ -1,0 +1,865 @@
+{
+  "__inputs": [],
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Build",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "id": 2,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "name"
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "zora_build_info", "legendFormat": "r{{release}} · {{branch}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Updates in",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 0 },
+      "id": 3,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(zora_updates_received_total[$__rate_interval]))", "legendFormat": "__auto", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Lua errors",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 5, "x": 9, "y": 0 },
+      "id": 4,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.0001 }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(zora_updates_processed_total{outcome=\"lua_error\"}[$__rate_interval]))", "legendFormat": "__auto", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "API failures",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
+      "id": 5,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.0001 }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(zora_api_calls_total{outcome=\"failed\"}[$__rate_interval]))", "legendFormat": "__auto", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "429s",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
+      "id": 6,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(zora_throttle_429_total[$__rate_interval]))", "legendFormat": "__auto", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Dropped updates",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 5, "x": 0, "y": 4 },
+      "id": 7,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.0001 }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(zora_route_drop_total[$__rate_interval]))", "legendFormat": "__auto", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Coroutines inflight",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 5, "x": 5, "y": 4 },
+      "id": 8,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "zora_coroutines_inflight", "legendFormat": "__auto", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "I/O inflight",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 5, "x": 10, "y": 4 },
+      "id": 9,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "zora_io_jobs_inflight", "legendFormat": "__auto", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Max queue depth",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 5, "x": 15, "y": 4 },
+      "id": 10,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "max(zora_worker_queue_depth)", "legendFormat": "__auto", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Dispatcher queue",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 4 },
+      "id": 11,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "zora_dispatcher_queue_depth", "legendFormat": "__auto", "refId": "A" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Workflow",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 8 },
+      "id": 100,
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Update pipeline",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+          "id": 101,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_updates_received_total[$__rate_interval]))", "legendFormat": "received", "refId": "A" },
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_updates_processed_total{outcome=\"ok\"}[$__rate_interval]))", "legendFormat": "processed ok", "refId": "B" },
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_updates_processed_total{outcome=\"lua_error\"}[$__rate_interval]))", "legendFormat": "lua_error", "refId": "C" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Rejected before enqueue",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+          "id": 102,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "normal", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum by (reason) (rate(zora_updates_rejected_total[$__rate_interval]))", "legendFormat": "{{reason}}", "refId": "A" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Outbound API calls",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+          "id": 103,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum by (outcome) (rate(zora_api_calls_total[$__rate_interval]))", "legendFormat": "{{outcome}}", "refId": "A" },
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_api_call_retries_total[$__rate_interval]))", "legendFormat": "retries", "refId": "B" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Rules reloads",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+          "id": 104,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "bars",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum by (outcome) (rate(zora_rules_reloads_total[$__rate_interval]))", "legendFormat": "{{outcome}}", "refId": "A" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Scheduler jobs fired",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+          "id": 105,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_scheduler_jobs_fired_total[$__rate_interval]))", "legendFormat": "fired", "refId": "A" }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Routing & affinity",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "id": 200,
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Affinity relaxation",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 11 },
+          "id": 201,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_route_overflow_total[$__rate_interval]))", "legendFormat": "overflow", "refId": "A" },
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_route_drop_total[$__rate_interval]))", "legendFormat": "drop", "refId": "B" }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Throttle",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 10 },
+      "id": 300,
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Throttle events",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+          "id": 301,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_throttle_429_total[$__rate_interval]))", "legendFormat": "429", "refId": "A" },
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_throttle_delayed_total[$__rate_interval]))", "legendFormat": "delayed", "refId": "B" },
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_throttle_shed_total[$__rate_interval]))", "legendFormat": "shed", "refId": "C" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Delay queue depth",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+          "id": 302,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "zora_throttle_delay_depth", "legendFormat": "depth", "refId": "A" }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "I/O pool",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 11 },
+      "id": 400,
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "I/O throughput & errors",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+          "id": 401,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_io_jobs_total[$__rate_interval]))", "legendFormat": "jobs", "refId": "A" },
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_io_errors_total[$__rate_interval]))", "legendFormat": "errors", "refId": "B" },
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_io_timeouts_total[$__rate_interval]))", "legendFormat": "timeouts", "refId": "C" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "I/O jobs inflight",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+          "id": 402,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "zora_io_jobs_inflight", "legendFormat": "inflight", "refId": "A" }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Worker & coroutines",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 },
+      "id": 500,
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Coroutines inflight",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+          "id": 501,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "zora_coroutines_inflight", "legendFormat": "inflight", "refId": "A" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Coroutines reaped",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+          "id": 502,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_coroutines_reaped_total[$__rate_interval]))", "legendFormat": "reaped", "refId": "A" }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Dispatcher",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "id": 600,
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Dispatcher problems",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+          "id": 601,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_tracked_send_failures_total[$__rate_interval]))", "legendFormat": "send failures", "refId": "A" },
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(zora_response_oversize_total[$__rate_interval]))", "legendFormat": "oversize", "refId": "B" }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Queues",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "id": 700,
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Worker queue depth",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+          "id": 701,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "zora_worker_queue_depth", "legendFormat": "worker {{worker}}", "refId": "A" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Dispatcher queue depth",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+          "id": 702,
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "axisPlacement": "auto",
+                "stacking": { "mode": "none", "group": "A" }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "zora_dispatcher_queue_depth", "legendFormat": "depth", "refId": "A" }
+          ]
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["zora"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "zora — overview",
+  "uid": "zora-overview",
+  "version": 1,
+  "weekStart": ""
+}

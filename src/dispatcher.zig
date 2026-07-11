@@ -136,11 +136,13 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
 
         var retry_after_ms: u64 = args.retry_after_default_ms;
         if (sendWithRetry(&client, args.io, call, url_prefix, args.allocator, args.io_result_queues, args.metrics, &retry_after_ms, args.retry_after_default_ms, args.retry_after_max_ms, &resp_buf)) {
+            if (args.metrics) |m| m.incApiCall(.ok);
             types.freeApiCall(call, args.allocator); // sent OK
         } else |err| {
             if (err == error.RateLimited) {
                 parkRateLimited(call, retry_after_ms, args);
             } else {
+                if (args.metrics) |m| m.incApiCall(.failed);
                 log.warn("dispatcher {d}: dropped call after retry failure: {s}", .{ args.id, @errorName(err) });
                 types.freeApiCall(call, args.allocator);
             }
@@ -171,6 +173,7 @@ fn sendWithRetry(
     } else |err| {
         if (err == error.RateLimited) return err; // caller parks; never retry a 429
         log.warn("send failed ({s}), retrying in 200ms", .{@errorName(err)});
+        if (metrics) |m| _ = m.api_call_retries_total.fetchAdd(1, .monotonic);
         rt.sleepNs(io, 200 * std.time.ns_per_ms);
         // Reinitialize the client so the retry always opens a fresh TCP
         // connection — any pooled connection from the failed attempt may be
@@ -1455,5 +1458,102 @@ test "429 parks the call and a blocked chat waits for the window" {
 
         // After the window all three are delivered: 1 (429) + 3 (success) = 4 total.
         try testing.expect(mock.waitForN(4, 4000));
+    }
+}
+
+test "api_calls counts ok after a retry, failed after both attempts fail, and each retry" {
+    // Phase 1 — drop the first connection, serve the second: ok=1, retries=1.
+    {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+        var server = try addr.listen(testing.io, .{ .reuse_address = true });
+        defer server.deinit(testing.io);
+        var url_buf: [64]u8 = undefined;
+        const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.2:{d}", .{boundPort(&server)}) catch unreachable;
+
+        const srv_thread = try std.Thread.spawn(.{}, struct {
+            fn run(s: *std.Io.net.Server) void {
+                const io = testing.io;
+                var c1 = s.accept(io) catch return; // first attempt: drop
+                c1.close(io);
+                var c2 = s.accept(io) catch return; // retry: answer
+                defer c2.close(io);
+                var rbuf: [4096]u8 = undefined;
+                var rd = c2.reader(io, &rbuf);
+                _ = rd.interface.takeDelimiterInclusive('\n') catch {};
+                var wbuf: [256]u8 = undefined;
+                var wr = c2.writer(io, &wbuf);
+                wr.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}") catch {};
+                wr.interface.flush() catch {};
+            }
+        }.run, .{&server});
+
+        var m = metrics_mod.Metrics{};
+        var stop = std.atomic.Value(bool).init(false);
+        var dq = try queue_mod.Queue(types.ApiCall).init(testing.allocator, testing.io, 16);
+        defer dq.deinit(testing.allocator);
+        const disp = try std.Thread.spawn(.{}, dispatcherThread, .{DispatcherArgs{
+            .id = 0, .queue = &dq, .bot_token = "TOK", .api_base = api_base,
+            .allocator = testing.allocator, .io = testing.io, .stop = &stop,
+            .metrics = &m,
+        }});
+
+        try pushCall(&dq, "sendMessage", "{\"chat_id\":1,\"text\":\"x\"}");
+        var waited: u64 = 0;
+        while (waited < 4_000 and m.api_calls[@intFromEnum(metrics_mod.CallOutcome.ok)].load(.monotonic) == 0) {
+            rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
+            waited += 20;
+        }
+        stop.store(true, .release);
+        dq.close();
+        disp.join();
+        srv_thread.join();
+
+        try testing.expectEqual(@as(u64, 1), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.ok)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.failed)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 1), m.api_call_retries_total.load(.monotonic));
+    }
+
+    // Phase 2 — drop both connections: failed=1, one more retry.
+    {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+        var server = try addr.listen(testing.io, .{ .reuse_address = true });
+        defer server.deinit(testing.io);
+        var url_buf: [64]u8 = undefined;
+        const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.2:{d}", .{boundPort(&server)}) catch unreachable;
+
+        const srv_thread = try std.Thread.spawn(.{}, struct {
+            fn run(s: *std.Io.net.Server) void {
+                const io = testing.io;
+                var c1 = s.accept(io) catch return;
+                c1.close(io);
+                var c2 = s.accept(io) catch return;
+                c2.close(io);
+            }
+        }.run, .{&server});
+
+        var m = metrics_mod.Metrics{};
+        var stop = std.atomic.Value(bool).init(false);
+        var dq = try queue_mod.Queue(types.ApiCall).init(testing.allocator, testing.io, 16);
+        defer dq.deinit(testing.allocator);
+        const disp = try std.Thread.spawn(.{}, dispatcherThread, .{DispatcherArgs{
+            .id = 0, .queue = &dq, .bot_token = "TOK", .api_base = api_base,
+            .allocator = testing.allocator, .io = testing.io, .stop = &stop,
+            .metrics = &m,
+        }});
+
+        try pushCall(&dq, "sendMessage", "{\"chat_id\":1,\"text\":\"x\"}");
+        var waited: u64 = 0;
+        while (waited < 4_000 and m.api_calls[@intFromEnum(metrics_mod.CallOutcome.failed)].load(.monotonic) == 0) {
+            rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
+            waited += 20;
+        }
+        stop.store(true, .release);
+        dq.close();
+        disp.join();
+        srv_thread.join();
+
+        try testing.expectEqual(@as(u64, 1), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.failed)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.ok)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 1), m.api_call_retries_total.load(.monotonic));
     }
 }

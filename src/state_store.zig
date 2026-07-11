@@ -10,7 +10,13 @@ const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
-pub const SCHEMA_VERSION: u32 = 1;
+const state_crypto = @import("state_crypto.zig");
+const log = std.log.scoped(.state_store);
+
+pub const EncryptionConfig = struct { passphrase: []const u8, io: std.Io };
+pub const OpenOptions = struct { encryption: ?EncryptionConfig = null };
+
+pub const SCHEMA_VERSION: u32 = 2;
 
 const PRAGMA_SQL: [:0]const u8 = @embedFile("pragma.sql");
 const SCHEMA_SQL: [:0]const u8 = @embedFile("schema.sql");
@@ -67,12 +73,26 @@ pub const StateStore = struct {
     /// `rollback()`). The flag auto-clears so only one commit fails. Default
     /// false — inert in production; no path sets it except tests.
     fail_next_commit: bool = false,
+    /// Set when the database is in encrypted mode; null in plaintext mode.
+    /// Established by openWithOptions and torn down by close().
+    cipher: ?state_crypto.Cipher = null,
+    /// Reusable scratch for encrypt-on-write; grown as needed, freed in close().
+    enc_buf: std.ArrayListUnmanaged(u8) = .empty,
 
-    /// Open (or create) the database at `path`.
+    /// Open (or create) the database at `path` in plaintext mode.
     /// For in-memory databases use path = ":memory:".
-    /// Open schema and verifies schema_version on every open,
-    /// applies schema as fallback.
     pub fn open(allocator: std.mem.Allocator, path: [:0]const u8) !StateStore {
+        return openWithOptions(allocator, path, .{});
+    }
+
+    /// Open (or create) the database, reconciling encryption mode.
+    /// Applies pragmas and schema, verifies schema_version, then either seeds
+    /// (fresh DB) or reconciles (existing DB) the encryption marker against
+    /// `opts`. A configured/stored mode mismatch returns
+    /// error.EncryptionModeMismatch; a wrong passphrase returns
+    /// error.WrongEncryptionKey. On success a non-null `cipher` means
+    /// encrypted mode.
+    pub fn openWithOptions(allocator: std.mem.Allocator, path: [:0]const u8, opts: OpenOptions) !StateStore {
         var raw: ?*c.sqlite3 = null;
         const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE;
         if (c.sqlite3_open_v2(path.ptr, &raw, flags, null) != c.SQLITE_OK) {
@@ -80,20 +100,17 @@ pub const StateStore = struct {
             return error.OpenFailed;
         }
         var store = StateStore{ .db = raw.?, .allocator = allocator };
-        store.applyPragma() catch |err| {
-           _ = c.sqlite3_close(store.db);
-           return err;
-        };
-        store.checkSchemaVersion() catch |err| {
+        errdefer {
+            if (store.cipher) |*cph| cph.deinit();
             _ = c.sqlite3_close(store.db);
-            return err;
-        };
-        store.prepareStatements() catch |err| {
-            // prepareInto already finalized any prepared prefix; the connection
-            // has no live statements, so sqlite3_close is clean here.
-            _ = c.sqlite3_close(store.db);
-            return err;
-        };
+        }
+
+        try store.applyPragma();
+        const fresh = !try store.checkSchemaExistence();
+        if (fresh) try store.applySchema();
+        try store.checkSchemaVersion();
+        if (fresh) try store.seedEncryption(opts) else try store.reconcileEncryption(opts);
+        try store.prepareStatements();
         return store;
     }
 
@@ -106,6 +123,8 @@ pub const StateStore = struct {
         _ = c.sqlite3_finalize(self.stmt_set_chat);
         _ = c.sqlite3_finalize(self.stmt_get_global);
         _ = c.sqlite3_finalize(self.stmt_set_global);
+        self.enc_buf.deinit(self.allocator);
+        if (self.cipher) |*cph| cph.deinit();
         _ = c.sqlite3_close(self.db);
     }
 
@@ -190,13 +209,10 @@ pub const StateStore = struct {
 
         return switch (c.sqlite3_step(stmt)) {
             c.SQLITE_ROW => blk: {
+                if (self.cipher != null) break :blk try self.decodePayload(stmt, 0);
                 const text = c.sqlite3_column_text(stmt, 0);
                 const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-                // dupe BEFORE the deferred reset invalidates the column pointer
-                break :blk if (text != null)
-                    try self.allocator.dupe(u8, text[0..len])
-                else
-                    null;
+                break :blk if (text != null) try self.allocator.dupe(u8, text[0..len]) else null;
             },
             c.SQLITE_DONE => null,
             else => error.SqliteError,
@@ -212,7 +228,7 @@ pub const StateStore = struct {
         }
 
         try sqliteOk(c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null));
-        try sqliteOk(c.sqlite3_bind_text(stmt, 2, value.ptr, @intCast(value.len), null));
+        try self.bindPayload(stmt, 2, value);
         try sqliteDone(c.sqlite3_step(stmt));
     }
 
@@ -225,11 +241,11 @@ pub const StateStore = struct {
     // funnel through prepareBound/execParams instead of repeating the
     // prepare -> bind -> step -> finalize dance.
 
-    /// One positional bind value for a cold-path statement. A `text` slice binds
-    /// with SQLITE_STATIC (the `null` destructor), so its bytes must stay valid
-    /// until the statement is stepped and finalized — true for every caller here,
-    /// which binds slices that outlive the statement.
-    const Param = union(enum) { int: i64, text: []const u8 };
+    /// One positional bind value for a cold-path statement. A `text` or `blob`
+    /// slice binds with SQLITE_STATIC (the `null` destructor), so its bytes must
+    /// stay valid until the statement is stepped and finalized — true for every
+    /// caller here, which binds slices that outlive the statement.
+    const Param = union(enum) { int: i64, text: []const u8, blob: []const u8 };
 
     /// Prepare `sql` and bind `params` positionally (1-based); return the bound,
     /// not-yet-stepped statement — the shared prepare+bind prefix for every
@@ -245,6 +261,7 @@ pub const StateStore = struct {
             switch (p) {
                 .int  => |v| try sqliteOk(c.sqlite3_bind_int64(stmt, idx, v)),
                 .text => |v| try sqliteOk(c.sqlite3_bind_text(stmt, idx, v.ptr, @intCast(v.len), null)),
+                .blob => |v| try sqliteOk(c.sqlite3_bind_blob(stmt, idx, v.ptr, @intCast(v.len), null)),
             }
         }
         return stmt;
@@ -263,10 +280,15 @@ pub const StateStore = struct {
 
     /// Insert a job; returns its rowid.
     pub fn scheduleInsert(self: *StateStore, fire_at_ms: i64, payload: []const u8) !i64 {
-        try self.execParams(
-            "INSERT INTO schedule (fire_at_ms, payload) VALUES (?, ?)",
-            &.{ .{ .int = fire_at_ms }, .{ .text = payload } },
-        );
+        const sql = "INSERT INTO schedule (fire_at_ms, payload) VALUES (?, ?)";
+        if (self.cipher) |cph| {
+            const buf = try self.allocator.alloc(u8, payload.len + state_crypto.overhead);
+            defer self.allocator.free(buf);
+            const blob = cph.encryptInto(buf, payload);
+            try self.execParams(sql, &.{ .{ .int = fire_at_ms }, .{ .blob = blob } });
+        } else {
+            try self.execParams(sql, &.{ .{ .int = fire_at_ms }, .{ .text = payload } });
+        }
         return c.sqlite3_last_insert_rowid(self.db);
     }
 
@@ -331,17 +353,51 @@ pub const StateStore = struct {
 
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const id = c.sqlite3_column_int64(stmt, 0);
-            const text = c.sqlite3_column_text(stmt, 1);
-            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
-            const payload = if (text != null)
-                try allocator.dupe(u8, text[0..len])
-            else
-                try allocator.dupe(u8, "{}");
+            const payload = if (self.cipher) |cph| blk: {
+                const raw = c.sqlite3_column_blob(stmt, 1);
+                const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+                if (raw == null) break :blk try allocator.dupe(u8, "{}");
+                const bytes = @as([*]const u8, @ptrCast(raw))[0..len];
+                break :blk cph.decryptAlloc(allocator, bytes) catch |e| {
+                    log.warn("schedule payload decrypt failed: {s}", .{@errorName(e)});
+                    return error.DecryptFailed;
+                };
+            } else blk: {
+                const text = c.sqlite3_column_text(stmt, 1);
+                const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+                break :blk if (text != null) try allocator.dupe(u8, text[0..len]) else try allocator.dupe(u8, "{}");
+            };
             errdefer allocator.free(payload);
             try list.append(allocator, .{ .id = id, .payload = payload });
         }
 
         return list.toOwnedSlice(allocator);
+    }
+
+    /// Insert one schedule row with its original identity preserved — the
+    /// migration path. Unlike scheduleInsert (fresh rowid, NULL lease), this
+    /// writes the given id and claimed_at_ms verbatim, so rowids that rules may
+    /// have stored and in-flight leases both survive a v1 -> v2 migration. The
+    /// payload encrypts on write when a cipher is set.
+    pub fn insertScheduleRowRaw(
+        self: *StateStore,
+        id: i64,
+        fire_at_ms: i64,
+        claimed_at_ms: ?i64,
+        payload: []const u8,
+    ) !void {
+        const stmt = try self.prepare(
+            "INSERT INTO schedule (id, fire_at_ms, payload, claimed_at_ms) VALUES (?, ?, ?, ?)",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try sqliteOk(c.sqlite3_bind_int64(stmt, 1, id));
+        try sqliteOk(c.sqlite3_bind_int64(stmt, 2, fire_at_ms));
+        try self.bindPayload(stmt, 3, payload);
+        if (claimed_at_ms) |ca|
+            try sqliteOk(c.sqlite3_bind_int64(stmt, 4, ca))
+        else
+            try sqliteOk(c.sqlite3_bind_null(stmt, 4));
+        try sqliteDone(c.sqlite3_step(stmt));
     }
 
     // -----------------------------------------------------------------------
@@ -368,8 +424,6 @@ pub const StateStore = struct {
     }
 
     fn checkSchemaVersion(self: *StateStore) !void {
-        if (!try self.checkSchemaExistence()) try self.applySchema();
-
         const version_stmt = try self.prepare(
             "SELECT value FROM meta WHERE key = 'schema_version'",
         );
@@ -385,10 +439,124 @@ pub const StateStore = struct {
         if (version != SCHEMA_VERSION) return error.SchemaMismatch;
     }
 
+    /// Read a meta value by key. Caller owns the returned slice; null if absent.
+    pub fn getMeta(self: *StateStore, allocator: std.mem.Allocator, key: [:0]const u8) !?[]u8 {
+        const stmt = try self.prepare("SELECT value FROM meta WHERE key = ?");
+        defer _ = c.sqlite3_finalize(stmt);
+        try sqliteOk(c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null));
+        return switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => blk: {
+                const text = c.sqlite3_column_text(stmt, 0);
+                const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+                break :blk if (text != null) try allocator.dupe(u8, text[0..len]) else null;
+            },
+            c.SQLITE_DONE => null,
+            else => error.SqliteError,
+        };
+    }
+
+    fn putMeta(self: *StateStore, key: []const u8, value: []const u8) !void {
+        try self.execParams(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            &.{ .{ .text = key }, .{ .text = value } },
+        );
+    }
+
+    /// Fresh-DB path: write the encryption marker and, in encrypted mode, the
+    /// salt, params, and verifier; establish the cipher.
+    fn seedEncryption(self: *StateStore, opts: OpenOptions) !void {
+        const enc = opts.encryption orelse {
+            try self.putMeta("encryption", "none");
+            return;
+        };
+        const salt = state_crypto.randomSalt(enc.io);
+        const params = state_crypto.default_argon;
+        var cph = try state_crypto.deriveCipher(self.allocator, enc.io, enc.passphrase, salt, params);
+        errdefer cph.deinit();
+
+        var salt_hex: [state_crypto.salt_len * 2]u8 = undefined;
+        _ = std.fmt.bufPrint(&salt_hex, "{x}", .{salt[0..]}) catch unreachable;
+        var pbuf: [64]u8 = undefined;
+        const pstr = try state_crypto.encodeParams(&pbuf, params);
+        const vhex = try state_crypto.makeVerifierHex(cph, self.allocator);
+        defer self.allocator.free(vhex);
+
+        try self.putMeta("encryption", "xchacha20poly1305");
+        try self.putMeta("kdf_salt", &salt_hex);
+        try self.putMeta("kdf_params", pstr);
+        try self.putMeta("enc_verifier", vhex);
+        self.cipher = cph;
+    }
+
+    /// Existing-DB path: the stored marker must match the configured mode. In
+    /// encrypted mode, derive the key from the stored salt/params and verify it
+    /// against the stored verifier.
+    fn reconcileEncryption(self: *StateStore, opts: OpenOptions) !void {
+        const mode = (try self.getMeta(self.allocator, "encryption")) orelse
+            try self.allocator.dupe(u8, "none");
+        defer self.allocator.free(mode);
+
+        const want_enc = opts.encryption != null;
+        const is_enc = std.mem.eql(u8, mode, "xchacha20poly1305");
+        if (want_enc != is_enc) return error.EncryptionModeMismatch;
+        if (!want_enc) return;
+
+        const salt_hex = (try self.getMeta(self.allocator, "kdf_salt")) orelse return error.SchemaError;
+        defer self.allocator.free(salt_hex);
+        var salt: [state_crypto.salt_len]u8 = undefined;
+        _ = std.fmt.hexToBytes(&salt, salt_hex) catch return error.SchemaError;
+
+        const pstr = (try self.getMeta(self.allocator, "kdf_params")) orelse return error.SchemaError;
+        defer self.allocator.free(pstr);
+        const params = state_crypto.parseParams(pstr) catch return error.SchemaError;
+
+        var cph = try state_crypto.deriveCipher(self.allocator, opts.encryption.?.io, opts.encryption.?.passphrase, salt, params);
+        errdefer cph.deinit();
+
+        const vhex = (try self.getMeta(self.allocator, "enc_verifier")) orelse return error.SchemaError;
+        defer self.allocator.free(vhex);
+        try state_crypto.checkVerifierHex(cph, self.allocator, vhex);
+        self.cipher = cph;
+    }
+
     fn prepare(self: *StateStore, sql: [:0]const u8) !*c.sqlite3_stmt {
         var stmt: ?*c.sqlite3_stmt = null;
         try sqliteOk(c.sqlite3_prepare_v2(self.db, sql.ptr, -1, &stmt, null));
         return stmt.?;
+    }
+
+    /// Bind a payload at parameter `idx`: ciphertext BLOB when a cipher is set,
+    /// plaintext TEXT otherwise. The encrypted bytes live in self.enc_buf, which
+    /// stays valid until the statement is stepped (callers step immediately).
+    fn bindPayload(self: *StateStore, stmt: *c.sqlite3_stmt, idx: c_int, data: []const u8) !void {
+        if (self.cipher) |cph| {
+            const n = data.len + state_crypto.overhead;
+            try self.enc_buf.ensureTotalCapacity(self.allocator, n);
+            self.enc_buf.items.len = n;
+            _ = cph.encryptInto(self.enc_buf.items, data);
+            try sqliteOk(c.sqlite3_bind_blob(stmt, idx, self.enc_buf.items.ptr, @intCast(n), null));
+        } else {
+            try sqliteOk(c.sqlite3_bind_text(stmt, idx, data.ptr, @intCast(data.len), null));
+        }
+    }
+
+    /// Decode a payload column read from `stmt` at `col` into owned plaintext:
+    /// decrypt the BLOB when a cipher is set, else dupe the TEXT. Returns
+    /// error.DecryptFailed on a bad ciphertext (logged at warn).
+    fn decodePayload(self: *StateStore, stmt: *c.sqlite3_stmt, col: c_int) ![]u8 {
+        if (self.cipher) |cph| {
+            const raw = c.sqlite3_column_blob(stmt, col);
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+            if (raw == null) return error.DecryptFailed;
+            const bytes = @as([*]const u8, @ptrCast(raw))[0..len];
+            return cph.decryptAlloc(self.allocator, bytes) catch |e| {
+                log.warn("state payload decrypt failed: {s}", .{@errorName(e)});
+                return error.DecryptFailed;
+            };
+        }
+        const text = c.sqlite3_column_text(stmt, col);
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+        return if (text != null) self.allocator.dupe(u8, text[0..len]) else self.allocator.dupe(u8, "{}");
     }
 
     /// Run a cached SELECT-by-integer-id statement, returning a JSON blob.
@@ -402,30 +570,21 @@ pub const StateStore = struct {
         try sqliteOk(c.sqlite3_bind_int64(stmt, 1, id));
 
         return switch (c.sqlite3_step(stmt)) {
-            c.SQLITE_ROW => blk: {
-                const text = c.sqlite3_column_text(stmt, 0);
-                const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-                // dupe BEFORE the deferred reset invalidates the column pointer
-                break :blk if (text != null)
-                    try self.allocator.dupe(u8, text[0..len])
-                else
-                    try self.allocator.dupe(u8, "{}");
-            },
+            c.SQLITE_ROW => try self.decodePayload(stmt, 0),
             c.SQLITE_DONE => try self.allocator.dupe(u8, "{}"),
             else => error.SqliteError,
         };
     }
 
-    /// Run a cached INSERT OR REPLACE with (integer_id, text_data) parameters.
+    /// Run a cached INSERT OR REPLACE with (integer_id, payload) parameters.
     fn setStateById(self: *StateStore, stmt: *c.sqlite3_stmt, id: i64, data: []const u8) !void {
-        _ = self;
         defer {
             _ = c.sqlite3_reset(stmt);
             _ = c.sqlite3_clear_bindings(stmt);
         }
 
         try sqliteOk(c.sqlite3_bind_int64(stmt, 1, id));
-        try sqliteOk(c.sqlite3_bind_text(stmt, 2, data.ptr, @intCast(data.len), null));
+        try self.bindPayload(stmt, 2, data);
         try sqliteDone(c.sqlite3_step(stmt));
     }
 
@@ -494,7 +653,7 @@ test "schema_version is seeded, matched on open, and mismatch is rejected" {
         const text = c.sqlite3_column_text(stmt, 0);
         const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
         try testing.expect(text != null);
-        try testing.expectEqualStrings("1", text[0..len]);
+        try testing.expectEqualStrings("2", text[0..len]);
     }
     // Opening with a matching version succeeds (open() checks implicitly).
     {
@@ -1000,4 +1159,188 @@ test "fail_next_commit seam makes one commit fail, then auto-resets" {
         defer testing.allocator.free(data);
         try testing.expectEqualStrings("{\"v\":\"B\"}", data);
     }
+}
+
+test "fresh plaintext DB records encryption=none" {
+    var store = try StateStore.open(testing.allocator, ":memory:");
+    defer store.close();
+    const mode = try store.getMeta(testing.allocator, "encryption");
+    defer if (mode) |m| testing.allocator.free(m);
+    try testing.expect(mode != null);
+    try testing.expectEqualStrings("none", mode.?);
+}
+
+test "fresh encrypted DB seeds marker, salt, params, verifier and sets cipher" {
+    var store = try StateStore.openWithOptions(testing.allocator, ":memory:", .{
+        .encryption = .{ .passphrase = "pw", .io = testing.io },
+    });
+    defer store.close();
+    try testing.expect(store.cipher != null);
+    const mode = try store.getMeta(testing.allocator, "encryption");
+    defer if (mode) |m| testing.allocator.free(m);
+    try testing.expectEqualStrings("xchacha20poly1305", mode.?);
+    inline for (.{ "kdf_salt", "kdf_params", "enc_verifier" }) |k| {
+        const v = try store.getMeta(testing.allocator, k);
+        defer if (v) |x| testing.allocator.free(x);
+        try testing.expect(v != null);
+    }
+}
+
+test "reopening an encrypted DB with the right passphrase succeeds" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &path_buf);
+    var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&db_buf, "{s}/e.db", .{path_buf[0..dir_len]});
+
+    {
+        var s = try StateStore.openWithOptions(testing.allocator, db_path, .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
+        s.close();
+    }
+    var s2 = try StateStore.openWithOptions(testing.allocator, db_path, .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
+    defer s2.close();
+    try testing.expect(s2.cipher != null);
+}
+
+test "reopening an encrypted DB with the wrong passphrase aborts" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &path_buf);
+    var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&db_buf, "{s}/e.db", .{path_buf[0..dir_len]});
+
+    {
+        var s = try StateStore.openWithOptions(testing.allocator, db_path, .{ .encryption = .{ .passphrase = "right", .io = testing.io } });
+        s.close();
+    }
+    try testing.expectError(error.WrongEncryptionKey, StateStore.openWithOptions(testing.allocator, db_path, .{ .encryption = .{ .passphrase = "wrong", .io = testing.io } }));
+}
+
+test "mode mismatch aborts in both directions" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &path_buf);
+    var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+
+    // Encrypted DB opened without a passphrase → mismatch.
+    const enc_path = try std.fmt.bufPrintZ(&db_buf, "{s}/m1.db", .{path_buf[0..dir_len]});
+    {
+        var s = try StateStore.openWithOptions(testing.allocator, enc_path, .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
+        s.close();
+    }
+    try testing.expectError(error.EncryptionModeMismatch, StateStore.open(testing.allocator, enc_path));
+
+    // Plaintext DB opened with a passphrase → mismatch.
+    var db_buf2: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const plain_path = try std.fmt.bufPrintZ(&db_buf2, "{s}/m2.db", .{path_buf[0..dir_len]});
+    {
+        var s = try StateStore.open(testing.allocator, plain_path);
+        s.close();
+    }
+    try testing.expectError(error.EncryptionModeMismatch, StateStore.openWithOptions(testing.allocator, plain_path, .{ .encryption = .{ .passphrase = "pw", .io = testing.io } }));
+}
+
+test "encrypted mode round-trips user/chat/global/schedule" {
+    var store = try StateStore.openWithOptions(testing.allocator, ":memory:", .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
+    defer store.close();
+
+    try store.setUserState(1, "{\"count\":7}");
+    const u = try store.getUserState(1);
+    defer testing.allocator.free(u);
+    try testing.expectEqualStrings("{\"count\":7}", u);
+
+    try store.setChatState(-100, "{\"muted\":true}");
+    const ch = try store.getChatState(-100);
+    defer testing.allocator.free(ch);
+    try testing.expectEqualStrings("{\"muted\":true}", ch);
+
+    try store.setGlobal("total", "99");
+    const g = try store.getGlobal("total");
+    defer if (g) |v| testing.allocator.free(v);
+    try testing.expectEqualStrings("99", g.?);
+
+    const id = try store.scheduleInsert(1000, "{\"job\":1}");
+    const claimed = try store.scheduleClaimDue(2000, 0, 16, testing.allocator);
+    defer {
+        for (claimed) |j| testing.allocator.free(j.payload);
+        testing.allocator.free(claimed);
+    }
+    try testing.expectEqual(@as(usize, 1), claimed.len);
+    try testing.expectEqual(id, claimed[0].id);
+    try testing.expectEqualStrings("{\"job\":1}", claimed[0].payload);
+}
+
+test "on-disk bytes are not the plaintext in encrypted mode" {
+    var store = try StateStore.openWithOptions(testing.allocator, ":memory:", .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
+    defer store.close();
+    try store.setUserState(1, "{\"secret\":\"swordfish\"}");
+
+    // Read the raw stored column directly (bypassing decryption).
+    const stmt = try store.prepare("SELECT data FROM user_state WHERE user_id = 1");
+    defer _ = c.sqlite3_finalize(stmt);
+    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try testing.expectEqual(c.SQLITE_BLOB, c.sqlite3_column_type(stmt, 0));
+    const raw = c.sqlite3_column_blob(stmt, 0);
+    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    const bytes = @as([*]const u8, @ptrCast(raw))[0..len];
+    try testing.expect(std.mem.indexOf(u8, bytes, "swordfish") == null);
+    try testing.expect(len >= state_crypto.overhead);
+}
+
+test "a corrupted encrypted row reports DecryptFailed" {
+    var store = try StateStore.openWithOptions(testing.allocator, ":memory:", .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
+    defer store.close();
+    try store.setUserState(1, "{\"x\":1}");
+    // Corrupt the stored blob in place.
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(store.db,
+        "UPDATE user_state SET data = X'00000000000000000000000000000000000000000000000000000000' WHERE user_id = 1",
+        null, null, null));
+    try testing.expectError(error.DecryptFailed, store.getUserState(1));
+}
+
+test "insertScheduleRowRaw preserves id and claimed_at_ms (plaintext)" {
+    var store = try openMem();
+    defer store.close();
+
+    try store.insertScheduleRowRaw(5, 1000, null, "{\"job\":\"a\"}");
+    try store.insertScheduleRowRaw(6, 500, 1234, "{\"job\":\"b\"}");
+
+    // Raw read-back on the same connection: ids, lease, and (plaintext) payload.
+    const stmt = try store.prepare(
+        "SELECT id, fire_at_ms, payload, claimed_at_ms FROM schedule ORDER BY id",
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+
+    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try testing.expectEqual(@as(i64, 5), c.sqlite3_column_int64(stmt, 0));
+    try testing.expectEqual(@as(i64, 1000), c.sqlite3_column_int64(stmt, 1));
+    try testing.expectEqual(c.SQLITE_NULL, c.sqlite3_column_type(stmt, 3));
+
+    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try testing.expectEqual(@as(i64, 6), c.sqlite3_column_int64(stmt, 0));
+    try testing.expectEqual(@as(i64, 1234), c.sqlite3_column_int64(stmt, 3));
+}
+
+test "insertScheduleRowRaw payload round-trips under encryption" {
+    var store = try StateStore.openWithOptions(
+        testing.allocator,
+        ":memory:",
+        .{ .encryption = .{ .passphrase = "pw", .io = testing.io } },
+    );
+    defer store.close();
+
+    try store.insertScheduleRowRaw(7, 50, null, "{\"x\":true}");
+
+    // scheduleClaimDue is the only read path that decrypts a schedule payload.
+    const jobs = try store.scheduleClaimDue(100, 0, 10, testing.allocator);
+    defer {
+        for (jobs) |j| testing.allocator.free(j.payload);
+        testing.allocator.free(jobs);
+    }
+    try testing.expectEqual(@as(usize, 1), jobs.len);
+    try testing.expectEqual(@as(i64, 7), jobs[0].id);
+    try testing.expectEqualStrings("{\"x\":true}", jobs[0].payload);
 }

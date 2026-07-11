@@ -54,6 +54,14 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.Environ.Map) C
         return error.OutOfMemory;
     errdefer allocator.free(db_path);
 
+    // Optional: STATE_ENCRYPTION_KEY (passphrase). Presence enables encrypted
+    // state-at-rest; absence keeps the database plaintext.
+    const state_encryption_key: ?[]const u8 = if (env.get("STATE_ENCRYPTION_KEY")) |v|
+        (allocator.dupe(u8, v) catch return error.OutOfMemory)
+    else
+        null;
+    errdefer if (state_encryption_key) |k| allocator.free(k);
+
     // Optional: SCHEMA_FILE
     const schema_file = allocator.dupeZ(u8, env.get("SCHEMA_FILE") orelse "schema/botapi.json") catch
         return error.OutOfMemory;
@@ -98,11 +106,18 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.Environ.Map) C
 
     const worker_max_inflight = try parseUintMin(u16, env, "WORKER_MAX_INFLIGHT", 64, 1);
     const workflow_deadline_ms    = try parseUint(u64, env, "WORKFLOW_DEADLINE_MS", 60_000);
-    const metrics_log             = try parseBool(env, "METRICS_LOG", true);
+    // Deprecated (frozen counter set); off by default — scrape METRICS_ADDR instead.
+    const metrics_log             = try parseBool(env, "METRICS_LOG", false);
 
     const delay_queue_capacity   = try parseUint(u16, env, "DELAY_QUEUE_CAPACITY", 4096);
     const retry_after_max_ms     = try parseUint(u64, env, "RETRY_AFTER_MAX_MS", 60_000);
     const retry_after_default_ms = try parseUint(u64, env, "RETRY_AFTER_DEFAULT_MS", 1_000);
+
+    // Optional: METRICS_ADDR — Prometheus scrape endpoint; unset disables it.
+    const metrics_addr: ?std.Io.net.IpAddress = if (env.get("METRICS_ADDR")) |s|
+        std.Io.net.IpAddress.parseLiteral(s) catch return error.InvalidConfig
+    else
+        null;
 
     return Config{
         .bot_token          = bot_token,
@@ -110,6 +125,7 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.Environ.Map) C
         .listen_addr        = listen_addr,
         .rules_file         = rules_file,
         .db_path            = db_path,
+        .state_encryption_key = state_encryption_key,
         .worker_threads       = worker_threads,
         .worker_queue_capacity     = worker_queue_capacity,
         .dispatcher_threads = dispatcher_threads,
@@ -128,6 +144,7 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.Environ.Map) C
         .delay_queue_capacity    = delay_queue_capacity,
         .retry_after_max_ms      = retry_after_max_ms,
         .retry_after_default_ms  = retry_after_default_ms,
+        .metrics_addr            = metrics_addr,
     };
 }
 
@@ -189,6 +206,10 @@ fn writeEffective(cfg: Config, writer: *std.Io.Writer) std.Io.Writer.Error!void 
     try writer.print("[bot] BOT_API_BASE={s}\n",    .{cfg.bot_api_base});
     try writer.print("[bot] RULES_FILE={s}\n",      .{cfg.rules_file});
     try writer.print("[bot] DB_PATH={s}\n",         .{cfg.db_path});
+    if (cfg.state_encryption_key) |k|
+        try writer.print("[bot] STATE_ENCRYPTION_KEY={s}\n", .{maskSecret(k, &sbuf)})
+    else
+        try writer.print("[bot] STATE_ENCRYPTION_KEY=(unset)\n", .{});
     try writer.print("[bot] SCHEMA_FILE={s}\n",     .{cfg.schema_file});
     try writer.print("[bot] API_VALIDATION={s}\n",  .{@tagName(cfg.api_validation)});
     try writer.print("[bot] METRICS_LOG={}\n",      .{cfg.metrics_log});
@@ -216,6 +237,14 @@ fn writeEffective(cfg: Config, writer: *std.Io.Writer) std.Io.Writer.Error!void 
     try writer.print("[dispatcher] DELAY_QUEUE_CAPACITY={d}\n",   .{cfg.delay_queue_capacity});
     try writer.print("[dispatcher] RETRY_AFTER_MAX_MS={d}\n",     .{cfg.retry_after_max_ms});
     try writer.print("[dispatcher] RETRY_AFTER_DEFAULT_MS={d}\n", .{cfg.retry_after_default_ms});
+
+    // [metrics]
+    if (cfg.metrics_addr) |ma| {
+        const maddr = std.fmt.bufPrint(&abuf, "{f}", .{ma}) catch "?";
+        try writer.print("[metrics] METRICS_ADDR={s}\n", .{maddr});
+    } else {
+        try writer.print("[metrics] METRICS_ADDR=disabled\n", .{});
+    }
 }
 
 /// Free all string fields previously allocated by loadFromMap().
@@ -224,8 +253,35 @@ pub fn deinit(config: Config, allocator: std.mem.Allocator) void {
     allocator.free(config.webhook_secret);
     allocator.free(config.rules_file);
     allocator.free(config.db_path);
+    if (config.state_encryption_key) |k| allocator.free(k);
     allocator.free(config.schema_file);
     allocator.free(config.bot_api_base);
+}
+
+/// Build a child-process environment with the bot's secrets removed. Children
+/// spawned by the io_pool (bot.shell/exec) must not inherit BOT_TOKEN,
+/// WEBHOOK_SECRET, or STATE_ENCRYPTION_KEY. Returns a new map owned by the
+/// caller (deinit it); the source `env` is unchanged.
+pub fn sanitizeChildEnv(
+    allocator: std.mem.Allocator,
+    env: std.process.Environ.Map,
+) !std.process.Environ.Map {
+    const deny = [_][]const u8{ "BOT_TOKEN", "WEBHOOK_SECRET", "STATE_ENCRYPTION_KEY" };
+    var out = std.process.Environ.Map.init(allocator);
+    errdefer out.deinit();
+    var it = env.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        var secret = false;
+        for (deny) |d| {
+            if (std.mem.eql(u8, key, d)) {
+                secret = true;
+                break;
+            }
+        }
+        if (!secret) try out.put(key, entry.value_ptr.*);
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -351,10 +407,11 @@ test "loads every field from a fully populated environment" {
         .{ "PROC_MAX_OUTPUT_BYTES",  "32768" },
         .{ "WORKER_MAX_INFLIGHT",    "32" },
         .{ "WORKFLOW_DEADLINE_MS",   "30000" },
-        .{ "METRICS_LOG",            "false" },
+        .{ "METRICS_LOG",            "true" },
         .{ "DELAY_QUEUE_CAPACITY",   "2048" },
         .{ "RETRY_AFTER_MAX_MS",     "30000" },
         .{ "RETRY_AFTER_DEFAULT_MS", "500" },
+        .{ "METRICS_ADDR",           "127.0.0.1:9100" },
     });
     defer env.deinit();
 
@@ -369,7 +426,7 @@ test "loads every field from a fully populated environment" {
     try testing.expectEqualStrings("/etc/zora/api.json", cfg.schema_file);
     try testing.expectEqual(types.ValidationMode.strict, cfg.api_validation);
     try testing.expectEqualStrings("http://127.0.0.1:9000", cfg.bot_api_base);
-    try testing.expectEqual(false, cfg.metrics_log);
+    try testing.expectEqual(true, cfg.metrics_log);
 
     // [server]
     try testing.expectEqual(@as(u16, 9443), cfg.listen_addr.ip4.port);
@@ -393,6 +450,9 @@ test "loads every field from a fully populated environment" {
     try testing.expectEqual(@as(u16, 2_048),  cfg.delay_queue_capacity);
     try testing.expectEqual(@as(u64, 30_000), cfg.retry_after_max_ms);
     try testing.expectEqual(@as(u64, 500),    cfg.retry_after_default_ms);
+
+    // [metrics]
+    try testing.expectEqual(@as(u16, 9100), cfg.metrics_addr.?.ip4.port);
 }
 
 test "applies defaults when optional fields are absent" {
@@ -411,7 +471,7 @@ test "applies defaults when optional fields are absent" {
     try testing.expectEqualStrings("schema/botapi.json", cfg.schema_file);
     try testing.expectEqualStrings("https://api.telegram.org", cfg.bot_api_base);
     try testing.expectEqual(types.ValidationMode.warn, cfg.api_validation);
-    try testing.expectEqual(true, cfg.metrics_log);
+    try testing.expectEqual(false, cfg.metrics_log);
 
     // [server]: LISTEN_ADDR default is 0.0.0.0:8443. In 0.16 IpAddress the
     // port is stored in native byte order.
@@ -730,7 +790,7 @@ test "WORKER_MAX_INFLIGHT and WORKFLOW_DEADLINE_MS parse and default" {
 
 test "METRICS_LOG parses booleans and rejects invalid values" {
     const ok = [_]struct { val: ?[]const u8, want: bool }{
-        .{ .val = null,    .want = true },  // absent → default true
+        .{ .val = null,    .want = false }, // absent → default false (deprecated)
         .{ .val = "false", .want = false },
         .{ .val = "0",     .want = false },
         .{ .val = "true",  .want = true },
@@ -881,4 +941,72 @@ test "empty WEBHOOK_SECRET is rejected with InvalidConfig" {
     });
     defer env.deinit();
     try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
+}
+
+test "STATE_ENCRYPTION_KEY is parsed when present and null when absent" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("BOT_TOKEN", "t");
+    try env.put("WEBHOOK_SECRET", "s");
+    {
+        const cfg = try loadFromMap(std.testing.allocator, env);
+        defer deinit(cfg, std.testing.allocator);
+        try std.testing.expectEqual(@as(?[]const u8, null), cfg.state_encryption_key);
+    }
+    try env.put("STATE_ENCRYPTION_KEY", "passphrase");
+    {
+        const cfg = try loadFromMap(std.testing.allocator, env);
+        defer deinit(cfg, std.testing.allocator);
+        try std.testing.expect(cfg.state_encryption_key != null);
+        try std.testing.expectEqualStrings("passphrase", cfg.state_encryption_key.?);
+    }
+}
+
+test "sanitizeChildEnv strips secrets and keeps the rest" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("BOT_TOKEN", "t");
+    try env.put("WEBHOOK_SECRET", "s");
+    try env.put("STATE_ENCRYPTION_KEY", "k");
+    try env.put("PATH", "/usr/bin");
+
+    var clean = try sanitizeChildEnv(std.testing.allocator, env);
+    defer clean.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), clean.get("BOT_TOKEN"));
+    try std.testing.expectEqual(@as(?[]const u8, null), clean.get("WEBHOOK_SECRET"));
+    try std.testing.expectEqual(@as(?[]const u8, null), clean.get("STATE_ENCRYPTION_KEY"));
+    try std.testing.expectEqualStrings("/usr/bin", clean.get("PATH").?);
+}
+
+test "METRICS_ADDR parses when set, disables when unset, rejects garbage" {
+    // Unset → disabled (null).
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(?std.Io.net.IpAddress, null), cfg.metrics_addr);
+    }
+    // Set → parsed address.
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            .{ "METRICS_ADDR", "127.0.0.1:9100" },
+        });
+        defer env.deinit();
+        const cfg = try loadFromMap(testing.allocator, env);
+        defer deinit(cfg, testing.allocator);
+        try testing.expectEqual(@as(u16, 9100), cfg.metrics_addr.?.ip4.port);
+    }
+    // Garbage → InvalidConfig.
+    {
+        var env = try makeEnv(testing.allocator, &.{
+            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
+            .{ "METRICS_ADDR", "not-an-address" },
+        });
+        defer env.deinit();
+        try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
+    }
 }
