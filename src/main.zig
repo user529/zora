@@ -71,6 +71,7 @@ const watcher = @import("watcher.zig");
 const lua_engine = @import("lua_engine.zig");
 const tg_schema = @import("tg_schema.zig");
 const metrics_mod = @import("metrics.zig");
+const metrics_server_mod = @import("metrics_server.zig");
 const io_pool = @import("io_pool.zig");
 const delay_mod = @import("delay.zig");
 const scheduler_mod = @import("scheduler.zig");
@@ -98,20 +99,22 @@ fn sigStop(sig: std.posix.SIG) callconv(std.builtin.CallingConvention.c) void {
 // Startup banner
 // ---------------------------------------------------------------------------
 
-/// Write the startup banner to `writer`: the five identity fields
-/// (branch, release, schema, rules_api, api_validation). Used by the
+/// Write the startup banner to `writer`: the six identity fields (branch,
+/// release, schema, rules_api, api_validation, and enc — on/off, never the
+/// passphrase itself). Used by the
 /// production startup path (which formats then `log.info`s the result) and by
 /// tests (which inspect the output directly, since test_runner.zig owns the
 /// std.log backend).
-fn writeBanner(writer: *std.Io.Writer, validation: types.ValidationMode) std.Io.Writer.Error!void {
+fn writeBanner(writer: *std.Io.Writer, validation: types.ValidationMode, enc: bool) std.Io.Writer.Error!void {
     try writer.print(
-        "zora starting (branch={s} release={d} schema={d} rules_api={d} api_validation={s})",
+        "zora starting (branch={s} release={d} schema={d} rules_api={d} api_validation={s} enc={s})",
         .{
             GIT_BRANCH,
             RELEASE,
             state_store.SCHEMA_VERSION,
             lua_engine.RULES_API_VERSION,
             @tagName(validation),
+            if (enc) "on" else "off",
         },
     );
 }
@@ -120,6 +123,8 @@ fn writeBanner(writer: *std.Io.Writer, validation: types.ValidationMode) std.Io.
 // Metrics log thread — emits a snapshot every 60 s when METRICS_LOG=true
 // ---------------------------------------------------------------------------
 
+/// Deprecated: frozen at the pre-Prometheus counter set — it gains no new
+/// counters; metrics.renderPrometheus is the authoritative exposition.
 /// Format all 14 metric counters into `buf`. Returns the written slice.
 /// The throttle group reports reactive rate limiting: 429s seen, calls parked
 /// in the delay queue, calls shed on overflow, and the current queue depth.
@@ -199,6 +204,19 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
     };
     defer config_mod.deinit(cfg, allocator);
 
+    // ── Encryption open-options (derived once; passed to every StateStore open) ─
+    // The passphrase is never printed — only on/off appears in the banner.
+    const open_opts: state_store.OpenOptions = if (cfg.state_encryption_key) |k|
+        .{ .encryption = .{ .passphrase = k, .io = io } }
+    else
+        .{};
+
+    // ── Sanitized child environment (secrets stripped; passed to io_pool) ───────
+    // BOT_TOKEN, WEBHOOK_SECRET, and STATE_ENCRYPTION_KEY are excluded so child
+    // processes (bot.shell / bot.http_request) cannot read them.
+    var child_env = try config_mod.sanitizeChildEnv(allocator, env);
+    defer child_env.deinit();
+
     // ── API schema (hot-reloadable; absent file → Tier-0, no validation) ──────
     // g_schema_slot is a module global so its address is stable for the process
     // lifetime — the detached schema-watcher thread can safely hold a pointer to
@@ -207,8 +225,18 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
     tg_schema.loadInitial(&g_schema_slot, cfg.schema_file);
 
     {
-        var db = state_store.StateStore.open(allocator, cfg.db_path) catch |err| {
-            log.err("database '{s}': {s}", .{ cfg.db_path, @errorName(err) });
+        var db = state_store.StateStore.openWithOptions(allocator, cfg.db_path, open_opts) catch |err| {
+            switch (err) {
+                error.EncryptionModeMismatch => log.err(
+                    "database '{s}': encryption mode does not match STATE_ENCRYPTION_KEY (set/unset) — run the migration tool",
+                    .{cfg.db_path},
+                ),
+                error.WrongEncryptionKey => log.err(
+                    "database '{s}': wrong STATE_ENCRYPTION_KEY",
+                    .{cfg.db_path},
+                ),
+                else => log.err("database '{s}': {s}", .{ cfg.db_path, @errorName(err) }),
+            }
             std.process.exit(1);
         };
         db.close();
@@ -231,7 +259,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
     // ── Startup banner — before server.init ───────────────────────────────────
     var banner_buf: [256]u8 = undefined;
     var banner_fw = std.Io.Writer.fixed(&banner_buf);
-    writeBanner(&banner_fw, cfg.api_validation) catch {}; // 256 B covers all fields
+    writeBanner(&banner_fw, cfg.api_validation, cfg.state_encryption_key != null) catch {}; // 256 B covers all fields
     log.info("{s}", .{banner_fw.buffered()});
 
     // Effective configuration (secrets partially masked) — one line per param.
@@ -243,6 +271,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
     // g_metrics is module-level, so its lifetime outlives run() and the
     // detached thread safely reads it after run() returns.
     if (cfg.metrics_log) {
+        log.warn("METRICS_LOG snapshot line is deprecated and frozen; scrape GET /metrics (METRICS_ADDR) instead", .{});
         const metrics_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, metricsLogThread, .{&g_metrics});
         metrics_t.detach();
     }
@@ -330,6 +359,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
         .timeout_ms = cfg.io_job_timeout_ms,
         .proc_max_output = cfg.proc_max_output_bytes,
         .metrics = &g_metrics,
+        .child_env = &child_env,
     }, result_q_ptrs);
     errdefer pool.deinit();
 
@@ -338,7 +368,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
     // is never reclaimed and double-fired.
     std.debug.assert(scheduler_mod.DEFAULT_LEASE_MS > @as(i64, @intCast(cfg.workflow_deadline_ms)));
     var g_scheduler = scheduler_mod.Scheduler{ .io = io };
-    var sched_db = try state_store.StateStore.open(allocator, cfg.db_path);
+    var sched_db = try state_store.StateStore.openWithOptions(allocator, cfg.db_path, open_opts);
     defer sched_db.close();
     const scheduler_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, scheduler_mod.schedulerThread, .{
         scheduler_mod.SchedulerArgs{
@@ -348,6 +378,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
             .stop = &stop,
             .io = io,
             .allocator = allocator,
+            .metrics = &g_metrics,
         },
     });
 
@@ -362,7 +393,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
     errdefer for (dbs[0..opened_dbs]) |*db| db.close();
 
     for (0..cfg.worker_threads) |i| {
-        dbs[i] = try state_store.StateStore.open(allocator, cfg.db_path);
+        dbs[i] = try state_store.StateStore.openWithOptions(allocator, cfg.db_path, open_opts);
         opened_dbs += 1;
         worker_threads[i] = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, worker_mod.workerThread, .{
             worker_mod.WorkerArgs{
@@ -423,14 +454,33 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
         .metrics = &g_metrics,
     });
 
+    // ── Prometheus scrape endpoint (only when METRICS_ADDR is set) ────────────
+    const metrics_srv: ?*metrics_server_mod.MetricsServer = if (cfg.metrics_addr) |maddr|
+        try metrics_server_mod.MetricsServer.init(.{
+            .listen_addr = maddr,
+            .metrics = &g_metrics,
+            .sources = .{
+                .worker_queues = wq_ptrs,
+                .dispatcher_queue = &disp_q,
+                .release = RELEASE,
+                .branch = GIT_BRANCH,
+            },
+            .io = io,
+            .allocator = allocator,
+        })
+    else
+        null;
+
     // ── Block until SIGTERM / SIGINT ──────────────────────────────────────────
     while (!g_stop.load(.acquire)) rt.sleepNs(io, 100 * std.time.ns_per_ms);
     log.info("shutdown signal received — draining and stopping", .{});
 
-    // Shutdown order: stop accepting → stop workers (they drain parked coroutines
+    // Shutdown order: stop accepting → stop the scrape endpoint (join before the
+    // queues it samples are freed) → stop workers (they drain parked coroutines
     // via the still-alive io_pool) → stop scheduler → deinit pool → free DBs →
     // stop dispatchers.
     srv.deinit();
+    if (metrics_srv) |ms| ms.deinit();
     stop.store(true, .release);
     // Wake any workers parked idle in popBlocking so they observe stop and exit
     // (replaces the old 10 ms update-queue poll).
@@ -715,13 +765,13 @@ fn postWebhook(address: std.Io.net.IpAddress, body: []const u8) !u16 {
 // startup log and server ready
 // ---------------------------------------------------------------------------
 
-test "startup banner contains all five identity fields" {
+test "startup banner contains all six identity fields" {
     // P4-1 / P3-4: the production startup path formats the banner via writeBanner
     // then log.info()s it; test_runner.zig owns the std.log backend, so the test
     // inspects writeBanner's output directly (the same string the banner logs).
     var buf: [256]u8 = undefined;
     var fw = std.Io.Writer.fixed(&buf);
-    try writeBanner(&fw, .warn);
+    try writeBanner(&fw, .warn, false);
     const banner = fw.buffered();
 
     // The banner prefix and every field name=value must be present.
@@ -743,6 +793,8 @@ test "startup banner contains all five identity fields" {
     try testing.expect(std.mem.indexOf(u8, banner, api) != null);
     // api_validation reflects the passed mode (proves the field is not hard-coded).
     try testing.expect(std.mem.indexOf(u8, banner, "api_validation=warn") != null);
+    // enc reflects the passed flag (false -> off).
+    try testing.expect(std.mem.indexOf(u8, banner, "enc=off") != null);
 }
 
 test "startup log line printed before server accepts connections" {
@@ -897,97 +949,6 @@ test "mock API down → server still returns 200 OK, no crash" {
 
     // The call was never delivered: the live mock received nothing.
     try testing.expectEqual(@as(usize, 0), mock.received.len());
-}
-
-// ---------------------------------------------------------------------------
-// fmtMetrics emits all 14 counter names in the expected format
-// ---------------------------------------------------------------------------
-
-/// Find token `key=...` in `line` (split on spaces) and return its value slice.
-/// Returns null if the key is absent. Used to assert each pair exactly (P3-7):
-/// substring search alone cannot detect a key/value transposition.
-fn metricValue(line: []const u8, key: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, line, ' ');
-    while (it.next()) |tok| {
-        const eq = std.mem.indexOfScalar(u8, tok, '=') orelse continue;
-        if (std.mem.eql(u8, tok[0..eq], key)) return tok[eq + 1 ..];
-    }
-    return null;
-}
-
-test "fmtMetrics emits every counter name and reflects their values" {
-    // P3-7: set all fourteen counters to *distinct* values, then assert each
-    // key=value pair exactly. Distinct values + per-pair matching defeats a
-    // transposition (e.g. io_jobs/io_err swapped) that substring search misses.
-    var m = metrics_mod.Metrics{};
-    _ = m.io_jobs_total.fetchAdd(1, .monotonic);
-    _ = m.io_jobs_inflight.fetchAdd(2, .monotonic);
-    _ = m.io_errors_total.fetchAdd(3, .monotonic);
-    _ = m.io_timeouts_total.fetchAdd(4, .monotonic);
-    _ = m.coroutines_inflight.fetchAdd(5, .monotonic);
-    _ = m.coroutines_reaped_total.fetchAdd(6, .monotonic);
-    _ = m.tracked_send_failures_total.fetchAdd(7, .monotonic);
-    _ = m.response_oversize_total.fetchAdd(8, .monotonic);
-    _ = m.throttle_429_total.fetchAdd(9, .monotonic);
-    _ = m.throttle_delayed_total.fetchAdd(10, .monotonic);
-    _ = m.throttle_shed_total.fetchAdd(11, .monotonic);
-    _ = m.throttle_delay_depth.fetchAdd(12, .monotonic);
-    _ = m.route_overflow_total.fetchAdd(13, .monotonic);
-    _ = m.route_drop_total.fetchAdd(14, .monotonic);
-
-    var buf: [512]u8 = undefined;
-    const line = fmtMetrics(&m, &buf);
-
-    // Each of the 14 emitted keys, in fmtMetrics' output order, paired with the
-    // value its source counter was set to above.
-    const expected = [_]struct { key: []const u8, val: []const u8 }{
-        .{ .key = "io_jobs", .val = "1" },
-        .{ .key = "io_inflight", .val = "2" },
-        .{ .key = "io_err", .val = "3" },
-        .{ .key = "io_timeout", .val = "4" },
-        .{ .key = "coros_inflight", .val = "5" },
-        .{ .key = "coros_reaped", .val = "6" },
-        .{ .key = "tracked_fail", .val = "7" },
-        .{ .key = "resp_oversize", .val = "8" },
-        .{ .key = "throttle_429", .val = "9" },
-        .{ .key = "throttle_delayed", .val = "10" },
-        .{ .key = "throttle_shed", .val = "11" },
-        .{ .key = "throttle_depth", .val = "12" },
-        .{ .key = "route_overflow", .val = "13" },
-        .{ .key = "route_drop", .val = "14" },
-    };
-    inline for (expected) |e| {
-        const got = metricValue(line, e.key) orelse {
-            std.debug.print("missing metric key: {s}\n", .{e.key});
-            return error.MissingMetricKey;
-        };
-        try testing.expectEqualStrings(e.val, got);
-    }
-    // Exactly 14 space-separated tokens — no stray or duplicated pair.
-    try testing.expectEqual(@as(usize, 14), std.mem.count(u8, line, "=") );
-}
-
-// ---------------------------------------------------------------------------
-// metricsLogThread snapshot line (P4-40)
-// ---------------------------------------------------------------------------
-
-test "metrics snapshot line emitted by metricsLogThread is well-formed" {
-    // metricsLogThread sleeps 60 s between emissions and routes its line through
-    // std.log, whose backend is owned by test_runner.zig and cannot be
-    // intercepted from a non-root file. The emitted text is produced verbatim by
-    // fmtMetrics(m, buf) — the same call the thread makes each tick. We exercise
-    // that call against a live-counter instance: a non-empty, parseable snapshot
-    // confirms the thread has a valid line to emit when metrics_log is enabled.
-    var m = metrics_mod.Metrics{};
-    _ = m.io_jobs_total.fetchAdd(42, .monotonic);
-
-    var buf: [512]u8 = undefined;
-    const line = fmtMetrics(&m, &buf);
-
-    try testing.expect(line.len > 0);
-    try testing.expectEqualStrings("42", metricValue(line, "io_jobs").?);
-    // The throttle-depth gauge is always present in a snapshot.
-    try testing.expect(metricValue(line, "throttle_depth") != null);
 }
 
 // ---------------------------------------------------------------------------

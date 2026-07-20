@@ -14,6 +14,7 @@ const types = @import("types.zig");
 const queue_mod = @import("queue.zig");
 const state_store = @import("state_store.zig");
 const rt = @import("rt.zig");
+const metrics_mod = @import("metrics.zig");
 
 const log = std.log.scoped(.scheduler);
 
@@ -53,6 +54,8 @@ pub const SchedulerArgs = struct {
     stop: *std.atomic.Value(bool),
     io: std.Io,
     allocator: std.mem.Allocator,
+    /// Optional metrics sink. Null means "don't count" (tests default to null).
+    metrics: ?*metrics_mod.Metrics = null,
 };
 
 pub fn schedulerThread(args: SchedulerArgs) void {
@@ -62,11 +65,16 @@ pub fn schedulerThread(args: SchedulerArgs) void {
         const cutoff = now - args.sched.lease_ms;
 
         const jobs = args.db.scheduleClaimDue(now, cutoff, args.sched.max_batch, args.allocator) catch |err| {
-            log.err("claim failed: {s}", .{@errorName(err)});
+            // Survivable: skip this tick and retry after the wait cap. A handled,
+            // retried failure logs at warn, not err.
+            log.warn("claim failed: {s}", .{@errorName(err)});
             sleepCap(args, now);
             continue;
         };
-        if (jobs.len > 0) log.info("fired {d} job(s)", .{jobs.len});
+        if (jobs.len > 0) {
+            if (args.metrics) |m| _ = m.scheduler_jobs_fired_total.fetchAdd(jobs.len, .monotonic);
+            log.info("fired {d} job(s)", .{jobs.len});
+        }
 
         for (jobs) |job| {
             const q = args.worker_qs[rr % args.worker_qs.len];
@@ -242,11 +250,13 @@ test "schedulerThread round-robins due jobs across worker queues" {
     _ = try store.scheduleInsert(due, "{\"a\":1}");
     _ = try store.scheduleInsert(due, "{\"b\":2}");
 
+    var m = metrics_mod.Metrics{};
     var sched = Scheduler{ .io = rt.io(), .wait_cap_ns = 50 * std.time.ns_per_ms };
     var stop = std.atomic.Value(bool).init(false);
     const t = try std.Thread.spawn(.{}, schedulerThread, .{SchedulerArgs{
         .db = &store, .worker_qs = &qs, .sched = &sched,
         .stop = &stop, .io = rt.io(), .allocator = testing.allocator,
+        .metrics = &m,
     }});
 
     // Both jobs are due at once; round-robin places the first on q0 and the
@@ -265,6 +275,8 @@ test "schedulerThread round-robins due jobs across worker queues" {
     // No third item leaked into either queue.
     try testing.expectEqual(@as(?types.WorkItem, null), q0.popTimeout(0));
     try testing.expectEqual(@as(?types.WorkItem, null), q1.popTimeout(0));
+
+    try testing.expectEqual(@as(u64, 2), m.scheduler_jobs_fired_total.load(.monotonic));
 }
 
 test "schedulerThread caps a single tick at max_batch" {

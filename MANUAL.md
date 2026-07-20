@@ -21,7 +21,10 @@ the startup log mark the current contracts.
 8. [Hot-Reload](#hot-reload)
 9. [State Management](#state-management)
 10. [Database](#database)
-11. [Deployment Notes](#deployment-notes)
+11. [Encrypting State at Rest](#encrypting-state-at-rest)
+12. [Migrating an Existing Database to v2](#migrating-an-existing-database-to-v2)
+13. [Metrics](#metrics)
+14. [Deployment Notes](#deployment-notes)
 
 ---
 
@@ -29,7 +32,7 @@ the startup log mark the current contracts.
 
 | Requirement | Version |
 |---|---|
-| Zig | 0.16.0 |
+| Zig | 0.17.0-dev.1387+01b60634c |
 | Linux | x86_64, kernel ≥ 5.x (inotify) |
 | FreeBSD | x86_64, 14+ (kqueue) |
 
@@ -90,7 +93,8 @@ config file parser — use a shell wrapper, systemd `EnvironmentFile=`, or any
 secret manager that exports env vars.
 
 This manual groups the variables by subsystem in the order an update flows
-through the process: `[bot]`, `[server]`, `[worker]`, `[io]`, `[dispatcher]`.
+through the process: `[bot]`, `[server]`, `[worker]`, `[io]`, `[dispatcher]`,
+`[metrics]`.
 
 ### `[bot]` — token, rules, and storage
 
@@ -101,9 +105,10 @@ through the process: `[bot]`, `[server]`, `[worker]`, `[io]`, `[dispatcher]`.
 | `BOT_API_BASE` | `https://api.telegram.org` | no | Override the Telegram API base URL (useful for testing with a local mock) |
 | `RULES_FILE` | `rules/rules.lua` | no | Path to the Lua rules file |
 | `DB_PATH` | `state.db` | no | Path to the SQLite database file |
+| `STATE_ENCRYPTION_KEY` | — | no | Passphrase for [state-at-rest encryption](#encrypting-state-at-rest). When set, zora encrypts every stored payload; when unset, the database stays plaintext |
 | `SCHEMA_FILE` | `schema/botapi.json` | no | Path to the vendored Telegram Bot API schema used for outgoing-call validation |
 | `API_VALIDATION` | `warn` | no | Outgoing-call validation mode: `off` (disabled), `warn` (log but send), `strict` (drop invalid calls) |
-| `METRICS_LOG` | `true` | no | Emit per-dispatcher stats (sent / discarded / queue depth) every 60 seconds; set to `false` or `0` to suppress |
+| `METRICS_LOG` | `false` | no | **Deprecated.** Set to `true` to emit a counter snapshot to the log every 60 seconds. The snapshot is frozen at an older counter set. Scrape [`METRICS_ADDR`](#metrics) instead |
 
 **`BOT_TOKEN` and `WEBHOOK_SECRET` are mandatory.** The process exits with a
 clear error message if either is absent.
@@ -143,6 +148,12 @@ clear error message if either is absent.
 | `RETRY_AFTER_MAX_MS` | `60000` | Upper bound, in milliseconds, on how long a 429-throttled call waits before retry. Zora caps longer `retry_after` values from Telegram to this |
 | `RETRY_AFTER_DEFAULT_MS` | `1000` | Retry-after wait, in milliseconds, used when a Telegram 429 response omits the duration |
 
+### `[metrics]` — Prometheus scrape endpoint
+
+| Variable | Default | Description |
+|---|---|---|
+| `METRICS_ADDR` | — | `host:port` for the Prometheus scrape endpoint. Unset disables the endpoint. The port carries no authentication, so bind it to `127.0.0.1` or firewall it. See [Metrics](#metrics) |
+
 ### Example
 
 ```bash
@@ -151,7 +162,7 @@ export WEBHOOK_SECRET="my-random-secret-string"
 export LISTEN_ADDR="0.0.0.0:8443"
 export RULES_FILE="/etc/zora/rules.lua"
 export DB_PATH="/var/lib/zora/state.db"
-export METRICS_LOG="true"
+export METRICS_ADDR="127.0.0.1:9100"
 ./zora-run.sh
 ```
 
@@ -222,10 +233,10 @@ after shutdown.
 ### Startup log
 
 ```
-info(main): zora starting (branch=dev release=2 schema=1 rules_api=1 api_validation=warn)
+info(main): zora starting (branch=dev release=2 schema=2 rules_api=1 api_validation=warn enc=off)
 ```
 
-The banner prints five identifiers:
+The banner prints six identifiers:
 
 | Field | Meaning |
 |---|---|
@@ -234,13 +245,14 @@ The banner prints five identifiers:
 | `schema` | SQLite schema contract version |
 | `rules_api` | Lua `bot.*` API contract version |
 | `api_validation` | Active outgoing-call validation mode (`off`, `warn`, or `strict`) |
+| `enc` | Whether state-at-rest encryption is on (`on`) or off (`off`) |
 
 ### Effective configuration dump
 
 After the banner, zora prints every effective setting, one line per variable,
 under the `config` scope. It groups the lines by subsystem — `[bot]`,
-`[server]`, `[worker]`, `[io]`, `[dispatcher]` — in the order an update flows
-through the process. Each value is the one in force after zora applies its
+`[server]`, `[worker]`, `[io]`, `[dispatcher]`, `[metrics]` — in the order an
+update flows through the process. Each value is the one in force after zora applies its
 defaults, so the dump is the quickest way to confirm what the process loaded.
 
 ```
@@ -251,10 +263,11 @@ info(config): [server] LISTEN_ADDR=0.0.0.0:8443
 info(config): [worker] WORKER_THREADS=8
 info(config): [io] IO_POOL_THREADS=8
 info(config): [dispatcher] DISPATCHER_THREADS=16
+info(config): [metrics] METRICS_ADDR=disabled
 ```
 
-Zora masks `BOT_TOKEN` and `WEBHOOK_SECRET`: it prints a short prefix and
-suffix and replaces the rest with `****`. The mask hides a value of three
+Zora masks `BOT_TOKEN`, `WEBHOOK_SECRET`, and `STATE_ENCRYPTION_KEY`: it prints a
+short prefix and suffix and replaces the rest with `****`. The mask hides a value of three
 characters or fewer in full. It reveals at most the first three and last four
 characters, never more than half the value, and never its length — so the dump
 is safe to leave in a log. Zora prints every other value in full.
@@ -606,6 +619,190 @@ sqlite3 state.db "SELECT * FROM user_state LIMIT 10;"
 sqlite3 state.db "PRAGMA integrity_check;"
 ```
 
+The current schema version is 2. A database created by an earlier zora (schema 1)
+needs a one-time upgrade before this release will open it; see [Migrating an
+Existing Database to v2](#migrating-an-existing-database-to-v2). When encryption
+is on, the payload columns hold ciphertext, so `.dump` and `SELECT` return BLOBs
+rather than readable JSON; see [Encrypting State at Rest](#encrypting-state-at-rest).
+
+---
+
+## Encrypting State at Rest
+
+By default zora stores state as plaintext JSON. Set `STATE_ENCRYPTION_KEY` to a
+passphrase and zora encrypts every stored payload instead. The feature is off
+unless the variable is set, and plaintext databases are unchanged.
+
+### What it protects
+
+Encryption guards the database file at rest — a copy, a backup, or a stolen disk
+— against someone who does not hold the passphrase. It does not protect state
+while a rule runs: zora decrypts a value to process it, so the value lives in
+process memory, and inside Lua, in the clear. It is also not a defence against a
+strong attacker with a large offline budget against a weak passphrase. Pick a
+long, high-entropy passphrase and store it in the same secret manager you use for
+`BOT_TOKEN`.
+
+### What is and is not encrypted
+
+Zora encrypts the payload of every state row: user state, chat state, global
+values, and scheduler payloads. It does not encrypt the keys (user id, chat id,
+global key, schedule id, and fire time) or the table structure, so row counts and
+timing stay visible. Each encrypted value carries a fixed 40-byte envelope (a
+24-byte nonce and a 16-byte tag); there is no other size change.
+
+### How it works
+
+- **Cipher.** XChaCha20-Poly1305, an authenticated cipher. Zora draws a fresh
+  24-byte nonce from the system CSPRNG for every write, so two encryptions of the
+  same value differ.
+- **Key.** Argon2id derives a 32-byte key from the passphrase and a random
+  16-byte salt. Zora stores the salt and the Argon2id cost parameters in the
+  database, so a later parameter change does not lock out an existing database.
+- **Verifier.** On first run zora encrypts a known constant and stores it. On a
+  later open it checks the passphrase against that verifier and fails fast on a
+  mismatch, before it reads or writes any user data.
+
+### Key hygiene
+
+Zora holds the derived key in a locked memory page (`mlock`, best-effort) so it
+does not reach swap, and wipes the key on shutdown. It strips
+`STATE_ENCRYPTION_KEY` — along with `BOT_TOKEN` and `WEBHOOK_SECRET` — from the
+environment of any child process a rule spawns through `bot.shell`, `bot.exec`,
+or `bot.http_request`. The configuration dump masks the passphrase like the other
+secrets, and the startup banner shows only `enc=on` or `enc=off`, never the value.
+
+### Enabling it
+
+- **New database.** Set `STATE_ENCRYPTION_KEY` before the first run. Zora creates
+  the database encrypted and records the salt, parameters, and verifier.
+- **Existing plaintext database.** The running server does not encrypt in place.
+  Convert the database with `zora-migrate` (see [Migrating an Existing Database to
+  v2](#migrating-an-existing-database-to-v2)).
+
+### Operational behaviour
+
+- A wrong passphrase on startup exits with `WrongEncryptionKey`, before any read
+  or write.
+- A mode mismatch — the key is set but the database is plaintext, or the key is
+  unset but the database is encrypted — exits with `EncryptionModeMismatch` and
+  points to the migration tool.
+- **The passphrase is not recoverable.** If you lose it, the encrypted data is
+  gone; there is no backdoor.
+- An encrypted database inspected with `sqlite3` shows ciphertext BLOBs in the
+  payload columns, not readable JSON.
+
+---
+
+## Migrating an Existing Database to v2
+
+The state-at-rest encryption feature raised the schema version from 1 to 2 and
+changed how payloads are stored. The server refuses to open a v1 database and
+exits with `SchemaMismatch`; the `zora-migrate` tool upgrades it. The source file
+is never modified — the tool writes a new v2 file, which you swap in once you are
+satisfied.
+
+```bash
+# Plaintext v1 -> plaintext v2
+zora-migrate --in state.db --out state.v2.db
+
+# Plaintext v1 -> encrypted v2 (the same variable the server uses)
+STATE_ENCRYPTION_KEY=… zora-migrate --in state.db --out state.v2.db
+
+mv state.v2.db state.db   # once you are satisfied
+```
+
+The presence of `STATE_ENCRYPTION_KEY` selects the output: set, the new database
+is encrypted (see [Encrypting State at Rest](#encrypting-state-at-rest)); unset,
+it is plaintext v2. The tool copies every user, chat, global, and scheduler row —
+preserving scheduler ids and pending leases — then reopens the result to confirm
+it is valid before finishing. It refuses to overwrite an existing `--out` file and
+refuses a source that is not schema v1. Like the server, it hardens its own
+process — it locks memory and suppresses core dumps — so the passphrase and the
+decrypted data do not reach swap or a core file.
+
+The tool builds with the rest of zora; the binary is `zig-out/bin/zora-migrate`.
+
+---
+
+## Metrics
+
+Zora exposes runtime counters over a Prometheus scrape endpoint. Set
+`METRICS_ADDR` to a `host:port` and zora serves the metrics there; leave it
+unset and the endpoint does not start. The endpoint runs on its own thread and
+touches nothing on the update path, so a scrape never slows the bot. A scrape
+that fails is logged at `warn` and dropped.
+
+### The endpoint
+
+```bash
+export METRICS_ADDR="127.0.0.1:9100"
+./zora-run.sh
+
+# Scrape it:
+curl http://127.0.0.1:9100/metrics
+```
+
+`GET /metrics` returns the counter set in the Prometheus text exposition
+format (version 0.0.4). Every other path and method returns `404`.
+
+The port carries **no authentication**. Anyone who reaches it reads the
+counters. Bind it to `127.0.0.1`, or firewall the port so only the scraper
+reaches it. A Prometheus scrape job needs only the target address:
+
+```yaml
+scrape_configs:
+  - job_name: zora
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+```
+
+### Exposed metrics
+
+Every metric name carries the `zora_` prefix. Counters only rise; gauges rise
+and fall. Zora samples the queue depths at scrape time, so they cost nothing
+between scrapes.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `zora_updates_received_total` | counter | Webhook updates accepted and enqueued |
+| `zora_updates_rejected_total{reason}` | counter | Webhook requests rejected before enqueue. `reason`: `forbidden`, `oversize`, `malformed` |
+| `zora_updates_processed_total{outcome}` | counter | Handler runs completed. `outcome`: `ok`, `lua_error` |
+| `zora_api_calls_total{outcome}` | counter | Outbound Telegram API calls. `outcome`: `ok`, `failed` |
+| `zora_api_call_retries_total` | counter | Retry attempts after a failed API send |
+| `zora_rules_reloads_total{outcome}` | counter | Hot reloads of the rules file. `outcome`: `ok`, `failed` |
+| `zora_scheduler_jobs_fired_total` | counter | Scheduled jobs claimed and dispatched to workers |
+| `zora_route_overflow_total` | counter | Updates placed on a non-primary worker because the primary queue was full |
+| `zora_route_drop_total` | counter | Updates dropped because every worker queue was full |
+| `zora_throttle_429_total` | counter | HTTP 429 responses observed from the Telegram API |
+| `zora_throttle_delayed_total` | counter | Calls parked in the delay queue by rate limiting |
+| `zora_throttle_shed_total` | counter | Calls dropped on delay-queue overflow |
+| `zora_throttle_delay_depth` | gauge | Calls currently parked in the delay queue |
+| `zora_io_jobs_total` | counter | I/O jobs executed by the io_pool |
+| `zora_io_errors_total` | counter | I/O jobs that ended in an error |
+| `zora_io_timeouts_total` | counter | I/O jobs killed at `IO_JOB_TIMEOUT_MS` |
+| `zora_io_jobs_inflight` | gauge | I/O jobs currently executing |
+| `zora_coroutines_inflight` | gauge | Lua coroutines parked on I/O across all workers |
+| `zora_coroutines_reaped_total` | counter | Coroutines dropped at `WORKFLOW_DEADLINE_MS` |
+| `zora_tracked_send_failures_total` | counter | Tracked sends that failed or lacked a `message_id` |
+| `zora_dispatch_timeouts_total` | counter | Sends abandoned at the dispatcher's per-attempt poll-gate deadline (30 s); a rising rate means a middlebox is dropping idle keep-alive connections |
+| `zora_response_oversize_total` | counter | API replies dropped for exceeding the response ceiling |
+| `zora_worker_queue_depth{worker}` | gauge | Updates waiting in each worker queue, one series per worker |
+| `zora_dispatcher_queue_depth` | gauge | API calls waiting in the dispatcher queue |
+| `zora_build_info{release,branch}` | gauge | Build identity; the value is always `1` |
+
+The `route_overflow` and `route_drop` counters record where the
+`hash(user_id) % worker_count` affinity relaxes under load — see
+[State Management](#concurrency).
+
+### The deprecated `METRICS_LOG` snapshot
+
+`METRICS_LOG` predates the scrape endpoint and is off by default. When set to
+`true`, zora writes a one-line counter snapshot to the log every 60 seconds and
+logs a deprecation warning at startup. The snapshot is frozen at an older,
+smaller counter set and does not grow with new metrics. Prefer the scrape
+endpoint; `METRICS_LOG` stays only for setups without a Prometheus scraper.
+
 ---
 
 ## Deployment Notes
@@ -618,9 +815,12 @@ sqlite3 state.db "PRAGMA integrity_check;"
   set `Restart=on-failure`. For `ExecStart`, prefer the `zora-run.sh`
   wrapper over the bare binary (see below).
 - **Database backups**: `state.db` is a standard SQLite WAL file. Copy it
-  with `sqlite3 state.db ".backup backup.db"` while the bot is running.
-- **Metrics**: Set `METRICS_LOG=true` to emit per-dispatcher stats every
-  60 seconds to the log. Redirect to a file or pipe to a log aggregator.
+  with `sqlite3 state.db ".backup backup.db"` while the bot is running. When
+  encryption is on, the backup is ciphertext too, so it carries the same
+  protection as the live file.
+- **Metrics**: Set `METRICS_ADDR` to expose a Prometheus scrape endpoint;
+  bind it to `127.0.0.1` or firewall the port, since it carries no auth. See
+  [Metrics](#metrics). The older `METRICS_LOG` snapshot line is deprecated.
 - **Multiple instances**: Not supported in this beta. A single instance
   handles all traffic.
 - **CPU target**: A binary built with the default `native` target may use

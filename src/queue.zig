@@ -394,7 +394,7 @@ test "4 producers x 1000 items — all 4000 received exactly once" {
     }
 
     // Consume all items and record which values were received.
-    var received = [_]bool{false} ** TOTAL;
+    var received: [TOTAL]bool = @splat(false);
     for (0..TOTAL) |_| {
         const v = q.pop();
         try testing.expect(v < TOTAL);
@@ -431,7 +431,7 @@ test "4 producers x 1000 items, capacity 64 — no deadlock, completes" {
         }});
     }
 
-    var received = [_]bool{false} ** TOTAL;
+    var received: [TOTAL]bool = @splat(false);
     for (0..TOTAL) |_| {
         const v = q.pop();
         try testing.expect(v < TOTAL);

@@ -158,7 +158,7 @@ pub fn validate(
         }
 
         var namebuf: [128]u8 = undefined;
-        const key: [:0]const u8 = std.fmt.bufPrintZ(&namebuf, "{s}", .{f.name}) catch {
+        const key: [:0]const u8 = std.mem.printSentinel(&namebuf, "{s}", .{f.name}, 0) catch {
             // Implausible for a real Telegram API name; skip conservatively
             // (no false rejections) but log so it's visible if it ever fires.
             log.warn("validate: field name '{s}' exceeds buffer, skipping check", .{f.name});

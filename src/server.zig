@@ -290,6 +290,7 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
     const path_ok = std.mem.eql(u8, path, "/webhook");
 
     if (!method_ok or !path_ok) {
+        if (srv.metrics) |m| m.incReject(.forbidden);
         try sendStatus(srv.io, stream, "403 Forbidden");
         return;
     }
@@ -317,6 +318,7 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
     }
 
     if (!secret_valid) {
+        if (srv.metrics) |m| m.incReject(.forbidden);
         try sendStatus(srv.io, stream, "403 Forbidden");
         return;
     }
@@ -324,6 +326,7 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
     // ── Body ─────────────────────────────────────────────────────────────────
     if (content_length > MAX_BODY_BYTES) {
         log.warn("rejected oversized body: Content-Length={d} > {d}", .{ content_length, MAX_BODY_BYTES });
+        if (srv.metrics) |m| m.incReject(.oversize);
         try sendStatus(srv.io, stream, "413 Request Entity Too Large");
         return;
     }
@@ -340,6 +343,7 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
     // no identifiable sender routes to worker 0 (user_id 0).
     const user_id = extractUserId(la, body) catch {
         log.warn("rejected request: malformed JSON body", .{});
+        if (srv.metrics) |m| m.incReject(.malformed);
         try sendStatus(srv.io, stream, "400 Bad Request");
         return;
     };
@@ -376,6 +380,7 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
     }
 
     // ── Respond 200 immediately ───────────────────────────────────────────────
+    if (srv.metrics) |m| _ = m.updates_received_total.fetchAdd(1, .monotonic);
     try sendStatus(srv.io, stream, "200 OK");
 }
 
@@ -975,4 +980,25 @@ test "stalled client (sends nothing) is reclaimed by the read timeout" {
 
     try testing.expect(elapsed < 5_000); // reclaimed well within the 15 s default
     _ = n;
+}
+
+test "workflow counters: received and rejected by reason" {
+    var m = metrics_mod.Metrics{};
+    const ts = try TestSetup.initFull(1, TEST_SECRET, DEFAULT_READ_IDLE_TIMEOUT_MS, 512, &m);
+    defer ts.deinit();
+
+    // Accepted update → received.
+    try testing.expectEqual(@as(u16, 200), try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, VALID_UPDATE));
+    // Wrong method and bad secret → forbidden (2×).
+    try testing.expectEqual(@as(u16, 403), try httpReq("GET", ts.serverAddr(), "/webhook", TEST_SECRET, ""));
+    try testing.expectEqual(@as(u16, 403), try httpReq("POST", ts.serverAddr(), "/webhook", "wrong", VALID_UPDATE));
+    // Declared-oversize body → oversize.
+    try testing.expectEqual(@as(u16, 413), try httpOversizeBody(ts.serverAddr(), TEST_SECRET));
+    // Malformed JSON body → malformed.
+    try testing.expectEqual(@as(u16, 400), try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, "{not json}"));
+
+    try testing.expectEqual(@as(u64, 1), m.updates_received_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), m.updates_rejected[@intFromEnum(metrics_mod.RejectReason.forbidden)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@intFromEnum(metrics_mod.RejectReason.oversize)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@intFromEnum(metrics_mod.RejectReason.malformed)].load(.monotonic));
 }

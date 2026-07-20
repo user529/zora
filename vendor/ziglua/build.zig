@@ -1,0 +1,224 @@
+const std = @import("std");
+
+const Build = std.Build;
+const Step = std.Build.Step;
+const Translator = @import("translate_c").Translator;
+
+const lua_setup = @import("build/lua.zig");
+const luau_setup = @import("build/luau.zig");
+const luajit_setup = @import("build/luajit.zig");
+
+/// The Lua version to compile and link.
+pub const Language = enum {
+    lua51,
+    lua52,
+    lua53,
+    lua54,
+    lua55,
+    luajit,
+    luau,
+};
+
+pub const ApiCheck = enum {
+    /// Enables apicheck in debug builds.
+    debug,
+    /// Enables apicheck.
+    on,
+    /// Disables apicheck.
+    off,
+};
+
+pub fn build(b: *Build) void {
+    // Remove the default install and uninstall steps
+    b.top_level_steps = .{};
+
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const lang = b.option(Language, "lang", "Lua language version to build") orelse .lua55;
+    const library_name = b.option([]const u8, "library_name", "Library name for lua linking, default is `lua`") orelse "lua";
+    const shared = b.option(bool, "shared", "Build shared library instead of static") orelse false;
+    const system_lua = b.option(bool, "system_lua", "Use system lua") orelse false;
+    const luau_use_4_vector = b.option(bool, "luau_use_4_vector", "Build Luau to use 4-vectors instead of the default 3-vector.") orelse false;
+    const lua_user_h = b.option(Build.LazyPath, "lua_user_h", "Lazy path to user supplied c header file") orelse null;
+    const additional_system_headers = b.option([]Build.LazyPath, "additional_system_headers", "Slice of Lazy paths to additional system headers to include when building Lua") orelse null;
+    const api_check = b.option(ApiCheck, "apicheck", "Enable parameter checks in the Lua API") orelse .debug;
+
+    if (lang == .luau and shared) {
+        std.debug.panic("Luau does not support compiling or loading shared modules", .{});
+    }
+
+    if (lua_user_h != null and (lang == .luajit or lang == .luau)) {
+        std.debug.panic("Only basic lua supports a user provided header file", .{});
+    }
+
+    // Zig module
+    const zlua = if (system_lua) b.addModule("zlua", .{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+    }) else b.addModule("zlua", .{
+        .root_source_file = b.path("src/lib.zig"),
+    });
+
+    // Expose build configuration to the ziglua module
+    const config = b.addOptions();
+    config.addOption(Language, "lang", lang);
+    config.addOption(bool, "luau_use_4_vector", luau_use_4_vector);
+    zlua.addOptions("config", config);
+
+    if (lang == .luau) {
+        const vector_size: usize = if (luau_use_4_vector) 4 else 3;
+        zlua.addCMacro("LUA_VECTOR_SIZE", b.fmt("{}", .{vector_size}));
+    }
+
+    // Translate the Lua C headers in to Zig code.
+    const translate_c = b.dependency("translate_c", .{});
+
+    const c_header_path = switch (lang) {
+        .luajit => b.path("build/include/luajit_all.h"),
+        .luau => b.path("build/include/luau_all.h"),
+        else => b.path("build/include/lua_all.h"),
+    };
+
+    // Zig 0.17: the pinned translate-c moved system-library linking from a
+    // post-init `Translator.linkSystemLibrary` method (removed) onto
+    // `Translator.Options.link_system_libs`, supplied at `.init()` time. The
+    // library name/link mode are therefore computed up front instead of
+    // inside the `system_lua` branch below.
+    const system_link_mode: std.builtin.LinkMode = if (shared) .dynamic else .static;
+    const system_library_name: ?[]const u8 = if (system_lua) switch (lang) {
+        .lua51 => "lua5.1",
+        .lua52 => "lua5.2",
+        .lua53 => "lua5.3",
+        .lua54 => "lua5.4",
+        .lua55 => "lua5.5",
+        .luajit => "luajit",
+        .luau => @panic("luau not supported for system lua"),
+    } else null;
+    const link_system_libs: []const Translator.LinkSystemLib = if (system_library_name) |name|
+        &.{.{ .name = name, .options = .{ .preferred_link_mode = system_link_mode } }}
+    else
+        &.{};
+
+    const t: Translator = .init(translate_c, .{
+        .c_source_file = c_header_path,
+        .target = target,
+        .optimize = optimize,
+        .link_system_libs = link_system_libs,
+    });
+
+    // If we've been given additional system headers, add them now.
+    // Useful for things like linking Emscripten headers by including a new sysroot
+    if (additional_system_headers) |include_paths| for (include_paths) |include_path| {
+        t.addSystemIncludePath(include_path);
+    };
+
+    zlua.addImport("c", t.mod);
+
+    if (system_lua) {
+        zlua.linkSystemLibrary(system_library_name.?, .{ .preferred_link_mode = system_link_mode });
+    } else if (b.lazyDependency(@tagName(lang), .{})) |upstream| {
+        const lib = switch (lang) {
+            .luajit => luajit_setup.configure(b, target, optimize, upstream, shared),
+            .luau => luau_setup.configure(b, target, optimize, upstream, luau_use_4_vector),
+            else => lua_setup.configure(b, target, optimize, upstream, .{
+                .lang = lang,
+                .shared = shared,
+                .library_name = library_name,
+                .lua_user_h = lua_user_h,
+                .api_check = api_check,
+            }),
+        };
+
+        // Expose the Lua artifact.
+        const install_lib = b.addInstallArtifact(lib, .{});
+        b.getInstallStep().dependOn(&install_lib.step);
+
+        zlua.linkLibrary(lib);
+
+        // Ensure translate C can find the Lua headers.
+        t.addIncludePath(lib.getEmittedIncludeTree());
+    }
+
+    // Tests
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    tests.root_module.addImport("zlua", zlua);
+
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run ziglua tests");
+    test_step.dependOn(&run_tests.step);
+
+    // Examples
+    var common_examples = [_]struct { []const u8, []const u8 }{
+        .{ "interpreter", "examples/interpreter.zig" },
+        .{ "zig-function", "examples/zig-fn.zig" },
+        .{ "multithreaded", "examples/multithreaded.zig" },
+    };
+    const luau_examples = [_]struct { []const u8, []const u8 }{
+        .{ "luau-bytecode", "examples/luau-bytecode.zig" },
+    };
+    const examples = if (lang == .luau) &common_examples ++ luau_examples else &common_examples;
+
+    for (examples) |example| {
+        const exe = b.addExecutable(.{
+            .name = example[0],
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(example[1]),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addImport("zlua", zlua);
+
+        const artifact = b.addInstallArtifact(exe, .{});
+        const exe_step = b.step(b.fmt("install-example-{s}", .{example[0]}), b.fmt("Install {s} example", .{example[0]}));
+        exe_step.dependOn(&artifact.step);
+
+        const run_cmd = b.addRunArtifact(exe);
+        run_cmd.step.dependOn(b.getInstallStep());
+        run_cmd.addPassthruArgs();
+
+        const run_step = b.step(b.fmt("run-example-{s}", .{example[0]}), b.fmt("Run {s} example", .{example[0]}));
+        run_step.dependOn(&run_cmd.step);
+    }
+
+    // definitions example
+    const def_exe = b.addExecutable(.{
+        .name = "define-zig-types",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/define-exe.zig"),
+            .target = target,
+        }),
+    });
+    def_exe.root_module.addImport("zlua", zlua);
+    var run_def_exe = b.addRunArtifact(def_exe);
+    run_def_exe.addFileArg(b.path("definitions.lua"));
+
+    const define_step = b.step("define", "Generate definitions.lua file");
+    define_step.dependOn(&run_def_exe.step);
+
+    // Documentation.
+    const docs = b.addObject(.{
+        .name = "zlua",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = docs.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+
+    const docs_step = b.step("docs", "Build and install the documentation");
+    docs_step.dependOn(&install_docs.step);
+}

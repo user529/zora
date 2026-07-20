@@ -135,7 +135,7 @@ pub fn watchInotify(t: WatchTarget) void {
 
     // inotify_add_watch needs a null-terminated path.
     var dirz_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dirz = std.fmt.bufPrintZ(&dirz_buf, "{s}", .{dir_path}) catch {
+    const dirz = std.mem.printSentinel(&dirz_buf, "{s}", .{dir_path}, 0) catch {
         log.err("inotify watch path too long: '{s}'", .{dir_path});
         return;
     };
@@ -218,7 +218,7 @@ pub fn watchKqueue(t: WatchTarget) void {
 
     // open needs a null-terminated path.
     var pathz_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const pathz = std.fmt.bufPrintZ(&pathz_buf, "{s}", .{t.path}) catch {
+    const pathz = std.mem.printSentinel(&pathz_buf, "{s}", .{t.path}, 0) catch {
         log.err("kqueue watch path too long: '{s}'", .{t.path});
         return;
     };

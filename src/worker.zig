@@ -138,6 +138,22 @@ fn dropInflight(
     return false;
 }
 
+/// Reload the rules file when the watcher has bumped the shared version.
+/// Counts the outcome; a failed load keeps the previous rules and still
+/// advances `local_ver`, so one broken file is logged once, not every loop.
+fn maybeReloadRules(engine: *lua_engine.LuaEngine, args: *const WorkerArgs, local_ver: *u64) void {
+    const global_ver = args.reload_ver.load(.acquire);
+    if (global_ver <= local_ver.*) return;
+    if (engine.loadFile(args.rules_path)) {
+        if (args.metrics) |m| m.incReload(.ok);
+    } else |_| {
+        log.warn("worker {d}: reload failed", .{args.id});
+        if (args.metrics) |m| m.incReload(.failed);
+    }
+    local_ver.* = global_ver;
+    log.info("worker {d}: reloaded rules (v{d})", .{ args.id, local_ver.* });
+}
+
 // ---------------------------------------------------------------------------
 // Worker thread entry point
 // ---------------------------------------------------------------------------
@@ -219,7 +235,7 @@ pub fn workerThread(args: WorkerArgs) void {
                     // not make a cross-yield read-modify-write atomic.
                     var in_txn = true;
                     args.db.beginDeferred() catch |err| {
-                        log.err("worker {d}: BEGIN before resume failed: {s} — resuming in autocommit", .{ args.id, @errorName(err) });
+                        log.warn("worker {d}: BEGIN before resume failed: {s} — resuming in autocommit", .{ args.id, @errorName(err) });
                         in_txn = false;
                     };
                     // resumeHandler always frees `owned` and calls lua.unref
@@ -239,6 +255,7 @@ pub fn workerThread(args: WorkerArgs) void {
 
                     switch (outcome) {
                         .done => |actions| {
+                            if (args.metrics) |m| m.incProcessed(.ok);
                             // resumeHandler already called lua.unref + freeOwnedStrings.
                             const sid = entry.schedule_id;
                             _ = inflight.remove(cid);
@@ -285,7 +302,7 @@ pub fn workerThread(args: WorkerArgs) void {
                             // failure, log and proceed — the next segment opens a
                             // fresh transaction on resume.
                             if (in_txn) args.db.commit() catch |err| {
-                                log.err("worker {d}: COMMIT before re-yield failed: {s}", .{ args.id, @errorName(err) });
+                                log.warn("worker {d}: COMMIT before re-yield failed: {s}", .{ args.id, @errorName(err) });
                             };
                             // resumeHandler freed old owned_strings; new ones are in y.
                             // Update the inflight entry for the next yield type.
@@ -315,6 +332,7 @@ pub fn workerThread(args: WorkerArgs) void {
                             }
                         },
                         .err => {
+                            if (args.metrics) |m| m.incProcessed(.lua_error);
                             // resumeHandler already called lua.unref + freeOwnedStrings.
                             if (in_txn) args.db.rollback();
                             _ = inflight.remove(cid);
@@ -363,14 +381,7 @@ pub fn workerThread(args: WorkerArgs) void {
         if (inflight.count() >= args.max_inflight) {
             // At ceiling: sleep briefly (avoids busy-spin) and check hot-reload
             // so rules changes are not blocked indefinitely by a full inflight map.
-            const global_ver = args.reload_ver.load(.acquire);
-            if (global_ver > local_ver) {
-                engine.loadFile(args.rules_path) catch {
-                    log.warn("worker {d}: reload failed", .{args.id});
-                };
-                local_ver = global_ver;
-                log.info("worker {d}: reloaded rules (v{d})", .{ args.id, local_ver });
-            }
+            maybeReloadRules(&engine, &args, &local_ver);
             rt.sleepNs(args.io, 1 * std.time.ns_per_ms);
             continue;
         }
@@ -389,16 +400,7 @@ pub fn workerThread(args: WorkerArgs) void {
             const item = maybe_item.?;
             defer args.allocator.free(item.body);
 
-            {
-                const global_ver = args.reload_ver.load(.acquire);
-                if (global_ver > local_ver) {
-                    engine.loadFile(args.rules_path) catch {
-                        log.warn("worker {d}: reload failed", .{args.id});
-                    };
-                    local_ver = global_ver;
-                    log.info("worker {d}: reloaded rules (v{d})", .{ args.id, local_ver });
-                }
-            }
+            maybeReloadRules(&engine, &args, &local_ver);
 
             const cid = coro_id_counter;
             coro_id_counter +%= 1;
@@ -421,6 +423,7 @@ pub fn workerThread(args: WorkerArgs) void {
 
             switch (outcome) {
                 .done => |actions| {
+                    if (args.metrics) |m| m.incProcessed(.ok);
                     if (item.schedule_id) |sid| _ = args.db.scheduleDelete(sid) catch |err| {
                         log.warn("worker {d}: schedule delete failed (will re-fire): {s}", .{ args.id, @errorName(err) });
                     };
@@ -446,7 +449,7 @@ pub fn workerThread(args: WorkerArgs) void {
                 },
                 .yielded => |y| {
                     args.db.commit() catch |err| {
-                        log.err("worker {d}: COMMIT before yield failed: {s}", .{ args.id, @errorName(err) });
+                        log.warn("worker {d}: COMMIT before yield failed: {s}", .{ args.id, @errorName(err) });
                     };
                     const deadline = workerNowMs(&args) +
                         @as(i64, @intCast(args.workflow_deadline_ms));
@@ -495,6 +498,7 @@ pub fn workerThread(args: WorkerArgs) void {
                     }
                 },
                 .err => {
+                    if (args.metrics) |m| m.incProcessed(.lua_error);
                     args.db.rollback();
                 },
             }
@@ -725,6 +729,8 @@ const AsyncTestCtx = struct {
     path_buf: [std.fs.max_path_bytes + 1]u8,
     rules_path: [:0]const u8,
     allocator: std.mem.Allocator,
+    /// Optional metrics sink passed to the spawned worker (null = don't count).
+    metrics: ?*metrics_mod.Metrics,
 
     /// Initialise in-place.  `self` must already be at its final stack address.
     fn init(
@@ -766,6 +772,7 @@ const AsyncTestCtx = struct {
         self.stop = std.atomic.Value(bool).init(false);
         self.reload_ver = std.atomic.Value(u64).init(0);
         self.clock = std.atomic.Value(i64).init(0);
+        self.metrics = null;
     }
 
     fn spawnWorker(self: *AsyncTestCtx, max_inflight: u16, workflow_deadline_ms: u64) !std.Thread {
@@ -795,6 +802,7 @@ const AsyncTestCtx = struct {
             .max_inflight = max_inflight,
             .workflow_deadline_ms = workflow_deadline_ms,
             .clock_ms = clock,
+            .metrics = self.metrics,
         }});
     }
 
@@ -1126,7 +1134,7 @@ test "hashUserId is deterministic — 10k ids × 8 workers always same index" {
     const N: u32 = 10_000;
 
     // First pass: record each id's assigned worker.
-    var assignments = [_]u32{0} ** N;
+    var assignments: [N]u32 = @splat(0);
     for (0..N) |i| {
         const id: i64 = @as(i64, @intCast(i)) - 5000; // range: -5000 … 4999
         assignments[i] = hashUserId(id, WORKERS);
@@ -2322,7 +2330,7 @@ test "scheduled job fires on_schedule and deletes its row (at-least-once happy p
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const plen = try tmp.dir.realPathFile(testing.io, ".", pbuf[0..std.fs.max_path_bytes]);
     var dbbuf: [std.fs.max_path_bytes + 8]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&dbbuf, "{s}/s.db", .{pbuf[0..plen]});
+    const db_path = try std.mem.printSentinel(&dbbuf, "{s}/s.db", .{pbuf[0..plen]}, 0);
 
     // Seed a due job through one connection.
     {
@@ -2386,7 +2394,7 @@ test "scheduled job whose handler COMMIT fails keeps its row (delete atomic with
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const plen = try tmp.dir.realPathFile(testing.io, ".", pbuf[0..std.fs.max_path_bytes]);
     var dbbuf: [std.fs.max_path_bytes + 8]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&dbbuf, "{s}/s.db", .{pbuf[0..plen]});
+    const db_path = try std.mem.printSentinel(&dbbuf, "{s}/s.db", .{pbuf[0..plen]}, 0);
 
     // Seed one due job through a throwaway connection so the row is durable in
     // the file DB before the worker fires it.
@@ -2438,4 +2446,85 @@ test "scheduled job whose handler COMMIT fails keeps its row (delete atomic with
     try testing.expect((try check.scheduleMinFire(rt.nowMs(testing.io) + 1_000_000)) != null);
     // And no action escaped the failed firing.
     try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
+}
+
+test "updates_processed counts ok and lua_error final outcomes" {
+    var ctx: AsyncTestCtx = undefined;
+    try ctx.init(testing.allocator,
+        \\function on_message(update)
+        \\    if update.message and update.message.text == "boom" then
+        \\        error("boom")
+        \\    end
+        \\    return {}
+        \\end
+    , .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 2_000, .proc_max_output = 4096 });
+    var m = metrics_mod.Metrics{};
+    ctx.metrics = &m;
+    const t = try ctx.spawnWorker(64, 60_000);
+
+    try ctx.input_q.push(.{
+        .body = try testing.allocator.dupe(u8, "{\"message\":{\"text\":\"boom\",\"from\":{\"id\":1},\"chat\":{\"id\":1}}}"),
+        .user_id = 1,
+    });
+    try ctx.input_q.push(.{
+        .body = try testing.allocator.dupe(u8, "{\"message\":{\"text\":\"fine\",\"from\":{\"id\":1},\"chat\":{\"id\":1}}}"),
+        .user_id = 1,
+    });
+
+    // Wait for both outcomes (up to 4 s).
+    var waited: u64 = 0;
+    while (waited < 4_000 and
+        (m.updates_processed[@intFromEnum(metrics_mod.ProcessOutcome.ok)].load(.monotonic) < 1 or
+         m.updates_processed[@intFromEnum(metrics_mod.ProcessOutcome.lua_error)].load(.monotonic) < 1))
+    {
+        rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
+        waited += 20;
+    }
+    ctx.deinit(t);
+
+    try testing.expectEqual(@as(u64, 1), m.updates_processed[@intFromEnum(metrics_mod.ProcessOutcome.ok)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_processed[@intFromEnum(metrics_mod.ProcessOutcome.lua_error)].load(.monotonic));
+}
+
+test "rules_reloads counts hot-reload success and failure" {
+    var ctx: AsyncTestCtx = undefined;
+    try ctx.init(testing.allocator,
+        \\function on_message(update) return {} end
+    , .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 2_000, .proc_max_output = 4096 });
+    var m = metrics_mod.Metrics{};
+    ctx.metrics = &m;
+    const t = try ctx.spawnWorker(64, 60_000);
+
+    // Let the worker load initial rules and record local_ver (see
+    // "reload_version incremented → worker reloads before on_message" above)
+    // before this test's own reload_ver bump — otherwise the bump can land
+    // before the worker's startup snapshot, making the worker believe the
+    // reload already happened and silently skip the counted reload path.
+    rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
+
+    const UPDATE = "{\"message\":{\"text\":\"x\",\"from\":{\"id\":1},\"chat\":{\"id\":1}}}";
+
+    // Successful reload: rewrite valid rules, bump the version, deliver work.
+    try ctx.tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = "function on_message(update) return {} end" });
+    _ = ctx.reload_ver.fetchAdd(1, .release);
+    try ctx.input_q.push(.{ .body = try testing.allocator.dupe(u8, UPDATE), .user_id = 1 });
+    var waited: u64 = 0;
+    while (waited < 4_000 and m.rules_reloads[@intFromEnum(metrics_mod.ReloadOutcome.ok)].load(.monotonic) == 0) {
+        rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
+        waited += 20;
+    }
+
+    // Failed reload: rewrite invalid Lua, bump again, deliver work.
+    try ctx.tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = "function on_message(" });
+    _ = ctx.reload_ver.fetchAdd(1, .release);
+    try ctx.input_q.push(.{ .body = try testing.allocator.dupe(u8, UPDATE), .user_id = 1 });
+    waited = 0;
+    while (waited < 4_000 and m.rules_reloads[@intFromEnum(metrics_mod.ReloadOutcome.failed)].load(.monotonic) == 0) {
+        rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
+        waited += 20;
+    }
+    ctx.deinit(t);
+
+    try testing.expectEqual(@as(u64, 1), m.rules_reloads[@intFromEnum(metrics_mod.ReloadOutcome.ok)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.rules_reloads[@intFromEnum(metrics_mod.ReloadOutcome.failed)].load(.monotonic));
 }

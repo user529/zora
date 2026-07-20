@@ -101,6 +101,8 @@ pub const Config = struct {
     listen_addr:        std.Io.net.IpAddress,
     rules_file:         [:0]const u8,
     db_path:            [:0]const u8,
+    /// Passphrase enabling encrypted state-at-rest; null = plaintext mode.
+    state_encryption_key: ?[]const u8 = null,
     worker_threads:       u8,
     worker_queue_capacity:     u16,
     dispatcher_threads: u8,
@@ -119,6 +121,8 @@ pub const Config = struct {
     delay_queue_capacity:    u16,
     retry_after_max_ms:      u64,
     retry_after_default_ms:  u64,
+    /// Scrape-endpoint bind address; null disables the endpoint entirely.
+    metrics_addr:            ?std.Io.net.IpAddress,
 };
 
 // ---------------------------------------------------------------------------
