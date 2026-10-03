@@ -34,6 +34,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "text", "types": ["String"], "required": true},
         {"name": "parse_mode", "types": ["String"], "required": false},
         {"name": "entities", "types": ["Array of MessageEntity"], "required": false},
@@ -111,6 +112,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "photo", "types": ["InputFile", "String"], "required": true},
         {"name": "caption", "types": ["String"], "required": false},
         {"name": "parse_mode", "types": ["String"], "required": false},
@@ -132,6 +134,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "live_photo", "types": ["InputFile", "String"], "required": true},
         {"name": "photo", "types": ["InputFile", "String"], "required": true},
         {"name": "caption", "types": ["String"], "required": false},
@@ -154,6 +157,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "audio", "types": ["InputFile", "String"], "required": true},
         {"name": "caption", "types": ["String"], "required": false},
         {"name": "parse_mode", "types": ["String"], "required": false},
@@ -177,6 +181,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "document", "types": ["InputFile", "String"], "required": true},
         {"name": "thumbnail", "types": ["InputFile", "String"], "required": false},
         {"name": "caption", "types": ["String"], "required": false},
@@ -198,6 +203,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "video", "types": ["InputFile", "String"], "required": true},
         {"name": "duration", "types": ["Integer"], "required": false},
         {"name": "width", "types": ["Integer"], "required": false},
@@ -226,6 +232,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "animation", "types": ["InputFile", "String"], "required": true},
         {"name": "duration", "types": ["Integer"], "required": false},
         {"name": "width", "types": ["Integer"], "required": false},
@@ -251,6 +258,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "voice", "types": ["InputFile", "String"], "required": true},
         {"name": "caption", "types": ["String"], "required": false},
         {"name": "parse_mode", "types": ["String"], "required": false},
@@ -271,6 +279,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "video_note", "types": ["InputFile", "String"], "required": true},
         {"name": "duration", "types": ["Integer"], "required": false},
         {"name": "length", "types": ["Integer"], "required": false},
@@ -325,6 +334,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "latitude", "types": ["Float"], "required": true},
         {"name": "longitude", "types": ["Float"], "required": true},
         {"name": "horizontal_accuracy", "types": ["Float"], "required": false},
@@ -346,6 +356,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "latitude", "types": ["Float"], "required": true},
         {"name": "longitude", "types": ["Float"], "required": true},
         {"name": "title", "types": ["String"], "required": true},
@@ -369,6 +380,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "phone_number", "types": ["String"], "required": true},
         {"name": "first_name", "types": ["String"], "required": true},
         {"name": "last_name", "types": ["String"], "required": false},
@@ -455,7 +467,9 @@
         {"name": "draft_id", "types": ["Integer"], "required": true},
         {"name": "text", "types": ["String"], "required": false},
         {"name": "parse_mode", "types": ["String"], "required": false},
-        {"name": "entities", "types": ["Array of MessageEntity"], "required": false}
+        {"name": "entities", "types": ["Array of MessageEntity"], "required": false},
+        {"name": "can_stop", "types": ["Boolean"], "required": false},
+        {"name": "keep_on_stop", "types": ["Boolean"], "required": false}
       ]
     },
     "sendChatAction": {
@@ -544,7 +558,8 @@
         {"name": "can_pin_messages", "types": ["Boolean"], "required": false},
         {"name": "can_manage_topics", "types": ["Boolean"], "required": false},
         {"name": "can_manage_direct_messages", "types": ["Boolean"], "required": false},
-        {"name": "can_manage_tags", "types": ["Boolean"], "required": false}
+        {"name": "can_manage_tags", "types": ["Boolean"], "required": false},
+        {"name": "can_send_welcome_messages", "types": ["Boolean"], "required": false}
       ]
     },
     "setChatAdministratorCustomTitle": {
@@ -1257,6 +1272,48 @@
         {"name": "reply_markup", "types": ["InlineKeyboardMarkup"], "required": false}
       ]
     },
+    "editEphemeralMessageText": {
+      "fields": [
+        {"name": "chat_id", "types": ["Integer", "String"], "required": true},
+        {"name": "receiver_user_id", "types": ["Integer"], "required": true},
+        {"name": "ephemeral_message_id", "types": ["Integer"], "required": true},
+        {"name": "text", "types": ["String"], "required": false},
+        {"name": "parse_mode", "types": ["String"], "required": false},
+        {"name": "entities", "types": ["Array of MessageEntity"], "required": false},
+        {"name": "rich_message", "types": ["InputRichMessage"], "required": false},
+        {"name": "link_preview_options", "types": ["LinkPreviewOptions"], "required": false},
+        {"name": "reply_markup", "types": ["InlineKeyboardMarkup"], "required": false}
+      ]
+    },
+    "editEphemeralMessageMedia": {
+      "fields": [
+        {"name": "chat_id", "types": ["Integer", "String"], "required": true},
+        {"name": "receiver_user_id", "types": ["Integer"], "required": true},
+        {"name": "ephemeral_message_id", "types": ["Integer"], "required": true},
+        {"name": "media", "types": ["InputMedia"], "required": true},
+        {"name": "reply_markup", "types": ["InlineKeyboardMarkup"], "required": false}
+      ]
+    },
+    "editEphemeralMessageCaption": {
+      "fields": [
+        {"name": "chat_id", "types": ["Integer", "String"], "required": true},
+        {"name": "receiver_user_id", "types": ["Integer"], "required": true},
+        {"name": "ephemeral_message_id", "types": ["Integer"], "required": true},
+        {"name": "caption", "types": ["String"], "required": false},
+        {"name": "parse_mode", "types": ["String"], "required": false},
+        {"name": "caption_entities", "types": ["Array of MessageEntity"], "required": false},
+        {"name": "show_caption_above_media", "types": ["Boolean"], "required": false},
+        {"name": "reply_markup", "types": ["InlineKeyboardMarkup"], "required": false}
+      ]
+    },
+    "editEphemeralMessageReplyMarkup": {
+      "fields": [
+        {"name": "chat_id", "types": ["Integer", "String"], "required": true},
+        {"name": "receiver_user_id", "types": ["Integer"], "required": true},
+        {"name": "ephemeral_message_id", "types": ["Integer"], "required": true},
+        {"name": "reply_markup", "types": ["InlineKeyboardMarkup"], "required": false}
+      ]
+    },
     "approveSuggestedPost": {
       "fields": [
         {"name": "chat_id", "types": ["Integer"], "required": true},
@@ -1283,6 +1340,13 @@
         {"name": "message_ids", "types": ["Array of Integer"], "required": true}
       ]
     },
+    "deleteEphemeralMessage": {
+      "fields": [
+        {"name": "chat_id", "types": ["Integer", "String"], "required": true},
+        {"name": "receiver_user_id", "types": ["Integer"], "required": true},
+        {"name": "ephemeral_message_id", "types": ["Integer"], "required": true}
+      ]
+    },
     "deleteMessageReaction": {
       "fields": [
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
@@ -1304,6 +1368,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "sticker", "types": ["InputFile", "String"], "required": true},
         {"name": "emoji", "types": ["String"], "required": false},
         {"name": "disable_notification", "types": ["Boolean"], "required": false},
@@ -1417,6 +1482,7 @@
         {"name": "chat_id", "types": ["Integer", "String"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "direct_messages_topic_id", "types": ["Integer"], "required": false},
+        {"name": "ephemeral_message_parameters", "types": ["EphemeralMessageParameters"], "required": false},
         {"name": "rich_message", "types": ["InputRichMessage"], "required": true},
         {"name": "disable_notification", "types": ["Boolean"], "required": false},
         {"name": "protect_content", "types": ["Boolean"], "required": false},
@@ -1432,7 +1498,9 @@
         {"name": "chat_id", "types": ["Integer"], "required": true},
         {"name": "message_thread_id", "types": ["Integer"], "required": false},
         {"name": "draft_id", "types": ["Integer"], "required": true},
-        {"name": "rich_message", "types": ["InputRichMessage"], "required": true}
+        {"name": "rich_message", "types": ["InputRichMessage"], "required": true},
+        {"name": "can_stop", "types": ["Boolean"], "required": false},
+        {"name": "keep_on_stop", "types": ["Boolean"], "required": false}
       ]
     },
     "answerInlineQuery": {

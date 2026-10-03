@@ -23,6 +23,5 @@ validate outgoing calls. It is vendored from
 (`api.json`), pinned to commit `9dca8b0ecbf37af83615fc4563db3523a98d182f`.
 
 To update the supported API surface, replace the file with a newer `api.json`
-from that repository and update the pinned commit above. No rebuild is
-required — the running process hot-reloads the file (see `SCHEMA_FILE` /
-`API_VALIDATION` in the configuration table).
+from that repository. No rebuild is required — the running process hot-reloads
+the file (see `SCHEMA_FILE` / `API_VALIDATION` in the configuration table).

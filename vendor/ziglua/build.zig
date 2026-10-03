@@ -79,32 +79,10 @@ pub fn build(b: *Build) void {
         .luau => b.path("build/include/luau_all.h"),
         else => b.path("build/include/lua_all.h"),
     };
-
-    // Zig 0.17: the pinned translate-c moved system-library linking from a
-    // post-init `Translator.linkSystemLibrary` method (removed) onto
-    // `Translator.Options.link_system_libs`, supplied at `.init()` time. The
-    // library name/link mode are therefore computed up front instead of
-    // inside the `system_lua` branch below.
-    const system_link_mode: std.builtin.LinkMode = if (shared) .dynamic else .static;
-    const system_library_name: ?[]const u8 = if (system_lua) switch (lang) {
-        .lua51 => "lua5.1",
-        .lua52 => "lua5.2",
-        .lua53 => "lua5.3",
-        .lua54 => "lua5.4",
-        .lua55 => "lua5.5",
-        .luajit => "luajit",
-        .luau => @panic("luau not supported for system lua"),
-    } else null;
-    const link_system_libs: []const Translator.LinkSystemLib = if (system_library_name) |name|
-        &.{.{ .name = name, .options = .{ .preferred_link_mode = system_link_mode } }}
-    else
-        &.{};
-
     const t: Translator = .init(translate_c, .{
         .c_source_file = c_header_path,
         .target = target,
         .optimize = optimize,
-        .link_system_libs = link_system_libs,
     });
 
     // If we've been given additional system headers, add them now.
@@ -116,7 +94,18 @@ pub fn build(b: *Build) void {
     zlua.addImport("c", t.mod);
 
     if (system_lua) {
-        zlua.linkSystemLibrary(system_library_name.?, .{ .preferred_link_mode = system_link_mode });
+        const link_mode: std.builtin.LinkMode = if (shared) .dynamic else .static;
+        const system_library_name = switch (lang) {
+            .lua51 => "lua5.1",
+            .lua52 => "lua5.2",
+            .lua53 => "lua5.3",
+            .lua54 => "lua5.4",
+            .lua55 => "lua5.5",
+            .luajit => "luajit",
+            .luau => @panic("luau not supported for system lua"),
+        };
+        zlua.linkSystemLibrary(system_library_name, .{ .preferred_link_mode = link_mode });
+        t.mod.linkSystemLibrary(system_library_name, .{ .preferred_link_mode = link_mode });
     } else if (b.lazyDependency(@tagName(lang), .{})) |upstream| {
         const lib = switch (lang) {
             .luajit => luajit_setup.configure(b, target, optimize, upstream, shared),
