@@ -316,7 +316,7 @@ pub const IoPool = struct {
         // redirects for it; match fetch's choice of redirect behaviour.
         const has_payload = req_job.body.len > 0;
         const redirect_behavior: std.http.Client.Request.RedirectBehavior =
-            if (has_payload) .unhandled else @enumFromInt(3);
+            if (has_payload) .unhandled else .init(3);
 
         var request = client.request(method, uri, .{
             .redirect_behavior = redirect_behavior,
@@ -336,6 +336,12 @@ pub const IoPool = struct {
         // timer in executeProc. Caveat: the connect and TLS handshake run inside
         // client.request above, before the socket is reachable here, so those
         // phases are bounded by the kernel connect timeout, not this watchdog.
+        //
+        // A native read deadline would remove this watchdog thread: on an
+        // evented std.Io backend the response read can carry a timeout
+        // (net receiveTimeout / operateTimeout) instead. Not usable yet — the
+        // io_uring net_receive/net_read batch path is an unimplemented panic
+        // upstream.
         var wd_done = std.atomic.Value(bool).init(false);
         var wd_timed_out = std.atomic.Value(bool).init(false);
         const watchdog: ?std.Thread = std.Thread.spawn(
@@ -394,7 +400,7 @@ pub const IoPool = struct {
             return;
         };
 
-        const status: u16 = @intFromEnum(response.head.status);
+        const status: u16 = @backingInt(response.head.status);
         const content_encoding = response.head.content_encoding;
 
         // Capture headers now, before any reader invalidates head.bytes.
@@ -526,6 +532,11 @@ pub const IoPool = struct {
         defer pool.current_pids[thread_idx].store(0, .release);
 
         // Start timeout timer.
+        //
+        // A native bound would remove this timer thread: on an evented std.Io
+        // backend the child wait can run as a cancelable task capped by a
+        // timeout (the SIGKILL below still reaps the child). Not usable yet —
+        // io_uring process spawn is an unimplemented panic upstream.
         var timer_done = std.atomic.Value(bool).init(false);
         const timer = std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, timerThread, .{TimerCtx{
             .pid        = child_pid,
@@ -589,7 +600,7 @@ pub const IoPool = struct {
 
         const exit_code: i32 = switch (term) {
             .exited => |code| @as(i32, code),
-            .signal => |sig|  -@as(i32, @intCast(@intFromEnum(sig))),
+            .signal => |sig|  -@as(i32, @intCast(@backingInt(sig))),
             else    => -1,
         };
 
@@ -833,7 +844,7 @@ test "IoJob payload variants each drive a real pool to their IoResult" {
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
     defer stub.thread.join();
 
-    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
+    const url = try testing.allocator.print("http://127.0.0.2:{d}/", .{stub.port});
     defer testing.allocator.free(url);
 
     var pool: IoPool = undefined;
@@ -881,7 +892,7 @@ test "http_request POST sends the body to the server and reports status" {
         "HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
     defer stub.thread.join();
 
-    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
+    const url = try testing.allocator.print("http://127.0.0.2:{d}/", .{stub.port});
     defer testing.allocator.free(url);
 
     var pool: IoPool = undefined;
@@ -901,8 +912,8 @@ test "http_request POST sends the body to the server and reports status" {
     try testing.expectEqual(@as(u16, 201), result.outcome.http.status);
 
     // The request line carries POST, and the captured body holds the payload.
-    try testing.expect(std.mem.indexOf(u8, req_bytes.items, "POST ") != null);
-    try testing.expect(std.mem.indexOf(u8, req_bytes.items, body) != null);
+    try testing.expect(std.mem.find(u8, req_bytes.items, "POST ") != null);
+    try testing.expect(std.mem.find(u8, req_bytes.items, body) != null);
 }
 
 test "http_request with unsupported method → IoResult.err unsupported_http_method" {
@@ -936,7 +947,7 @@ test "http_request to a stalled peer times out instead of pinning the pool threa
 
     var hang = try spawnHangStub();
 
-    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{hang.port});
+    const url = try testing.allocator.print("http://127.0.0.2:{d}/", .{hang.port});
     defer testing.allocator.free(url);
 
     var m = metrics_mod.Metrics{};
@@ -982,7 +993,7 @@ test "http_request forwards extra headers to the server" {
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
     defer stub.thread.join();
 
-    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
+    const url = try testing.allocator.print("http://127.0.0.2:{d}/", .{stub.port});
     defer testing.allocator.free(url);
 
     var pool: IoPool = undefined;
@@ -1004,8 +1015,8 @@ test "http_request forwards extra headers to the server" {
     defer freeIoResult(result, testing.allocator);
     try testing.expectEqual(@as(u16, 200), result.outcome.http.status);
 
-    try testing.expect(std.mem.indexOf(u8, req_bytes.items, "X-Custom: hello-world") != null);
-    try testing.expect(std.mem.indexOf(u8, req_bytes.items, "Authorization: Bearer tok123") != null);
+    try testing.expect(std.mem.find(u8, req_bytes.items, "X-Custom: hello-world") != null);
+    try testing.expect(std.mem.find(u8, req_bytes.items, "Authorization: Bearer tok123") != null);
 }
 
 test "http_request captures response headers, original casing, last-wins dup" {
@@ -1022,7 +1033,7 @@ test "http_request captures response headers, original casing, last-wins dup" {
         "\r\nOK");
     defer stub.thread.join();
 
-    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
+    const url = try testing.allocator.print("http://127.0.0.2:{d}/", .{stub.port});
     defer testing.allocator.free(url);
 
     var pool: IoPool = undefined;
@@ -1094,7 +1105,7 @@ test "http_request decompresses gzip response body" {
     const stub = try spawnStub(resp.items);
     defer stub.thread.join();
 
-    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
+    const url = try testing.allocator.print("http://127.0.0.2:{d}/", .{stub.port});
     defer testing.allocator.free(url);
 
     var pool: IoPool = undefined;
@@ -1126,8 +1137,8 @@ test "http_request GET to local stub → status 200, body matches" {
         "\r\nhello");
     defer stub.thread.join();
 
-    const url = try std.fmt.allocPrint(
-        testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
+    const url = try testing.allocator.print(
+        "http://127.0.0.2:{d}/", .{stub.port});
     defer testing.allocator.free(url);
 
     var pool: IoPool = undefined;

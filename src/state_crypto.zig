@@ -111,7 +111,7 @@ pub fn parseParams(s: []const u8) error{BadParams}!ArgonParams {
             saw_algo = true;
             continue;
         }
-        const eq = std.mem.indexOfScalar(u8, field, '=') orelse return error.BadParams;
+        const eq = std.mem.findScalar(u8, field, '=') orelse return error.BadParams;
         const name = field[0..eq];
         const val = field[eq + 1 ..];
         if (std.mem.eql(u8, name, "t")) {
@@ -240,7 +240,7 @@ pub fn checkVerifierHex(
 const testing = std.testing;
 
 test "encrypt/decrypt round-trips" {
-    const key = [_]u8{7} ** key_len;
+    const key: [key_len]u8 = @splat(7);
     const msg = "{\"count\":42}";
     var buf: [128]u8 = undefined;
     const blob = sealInto(testing.io, key, &buf, msg);
@@ -252,7 +252,7 @@ test "encrypt/decrypt round-trips" {
 }
 
 test "a wrong key fails to decrypt" {
-    const key = [_]u8{1} ** key_len;
+    const key: [key_len]u8 = @splat(1);
     var wrong = key;
     wrong[0] = 2;
     var buf: [64]u8 = undefined;
@@ -261,7 +261,7 @@ test "a wrong key fails to decrypt" {
 }
 
 test "a tampered envelope fails to decrypt" {
-    const key = [_]u8{3} ** key_len;
+    const key: [key_len]u8 = @splat(3);
     var buf: [64]u8 = undefined;
     const blob = sealInto(testing.io, key, &buf, "secret");
     blob[blob.len - 1] ^= 0xFF; // flip a tag byte
@@ -269,7 +269,7 @@ test "a tampered envelope fails to decrypt" {
 }
 
 test "the same plaintext yields distinct ciphertext (random nonce)" {
-    const key = [_]u8{9} ** key_len;
+    const key: [key_len]u8 = @splat(9);
     var a: [64]u8 = undefined;
     var b: [64]u8 = undefined;
     const ba = sealInto(testing.io, key, &a, "same");
@@ -278,12 +278,12 @@ test "the same plaintext yields distinct ciphertext (random nonce)" {
 }
 
 test "a too-short blob fails cleanly" {
-    const key = [_]u8{0} ** key_len;
+    const key: [key_len]u8 = @splat(0);
     try testing.expectError(error.DecryptFailed, openAlloc(testing.allocator, key, "short"));
 }
 
 test "deriveCipher is deterministic for the same passphrase and salt" {
-    const salt = [_]u8{5} ** salt_len;
+    const salt: [salt_len]u8 = @splat(5);
     var c1 = try deriveCipher(testing.allocator, testing.io, "hunter2", salt, default_argon);
     defer c1.deinit();
     var c2 = try deriveCipher(testing.allocator, testing.io, "hunter2", salt, default_argon);
@@ -292,7 +292,7 @@ test "deriveCipher is deterministic for the same passphrase and salt" {
 }
 
 test "a different passphrase derives a different key" {
-    const salt = [_]u8{5} ** salt_len;
+    const salt: [salt_len]u8 = @splat(5);
     var c1 = try deriveCipher(testing.allocator, testing.io, "right", salt, default_argon);
     defer c1.deinit();
     var c2 = try deriveCipher(testing.allocator, testing.io, "wrong", salt, default_argon);

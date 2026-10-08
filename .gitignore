@@ -4,7 +4,4 @@ zig-pkg/
 *.o
 .extraignore
 deploy*.sh
-<<<<<<< HEAD
-=======
 *.log
->>>>>>> dev

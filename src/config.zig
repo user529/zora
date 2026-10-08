@@ -45,12 +45,12 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.Environ.Map) C
         return error.InvalidConfig;
 
     // Optional: RULES_FILE
-    const rules_file = allocator.dupeZ(u8, env.get("RULES_FILE") orelse "rules/rules.lua") catch
+    const rules_file = allocator.dupeSentinel(u8, env.get("RULES_FILE") orelse "rules/rules.lua", 0) catch
         return error.OutOfMemory;
     errdefer allocator.free(rules_file);
 
     // Optional: DB_PATH
-    const db_path = allocator.dupeZ(u8, env.get("DB_PATH") orelse "state.db") catch
+    const db_path = allocator.dupeSentinel(u8, env.get("DB_PATH") orelse "state.db", 0) catch
         return error.OutOfMemory;
     errdefer allocator.free(db_path);
 
@@ -63,7 +63,7 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.Environ.Map) C
     errdefer if (state_encryption_key) |k| allocator.free(k);
 
     // Optional: SCHEMA_FILE
-    const schema_file = allocator.dupeZ(u8, env.get("SCHEMA_FILE") orelse "schema/botapi.json") catch
+    const schema_file = allocator.dupeSentinel(u8, env.get("SCHEMA_FILE") orelse "schema/botapi.json", 0) catch
         return error.OutOfMemory;
     errdefer allocator.free(schema_file);
 
@@ -880,37 +880,37 @@ test "logEffective output: subsystem groups, field lines, and secret masking" {
     const captured = captureEffective(cfg, &buf);
 
     // --- P4-43: all five subsystem group prefixes present ---
-    try testing.expect(std.mem.indexOf(u8, captured, "[bot]")        != null);
-    try testing.expect(std.mem.indexOf(u8, captured, "[server]")     != null);
-    try testing.expect(std.mem.indexOf(u8, captured, "[worker]")     != null);
-    try testing.expect(std.mem.indexOf(u8, captured, "[io]")         != null);
-    try testing.expect(std.mem.indexOf(u8, captured, "[dispatcher]") != null);
+    try testing.expect(std.mem.find(u8, captured, "[bot]")        != null);
+    try testing.expect(std.mem.find(u8, captured, "[server]")     != null);
+    try testing.expect(std.mem.find(u8, captured, "[worker]")     != null);
+    try testing.expect(std.mem.find(u8, captured, "[io]")         != null);
+    try testing.expect(std.mem.find(u8, captured, "[dispatcher]") != null);
 
     // --- P3-1: representative field per group ---
-    try testing.expect(std.mem.indexOf(u8, captured, "[bot] BOT_TOKEN=")                != null);
-    try testing.expect(std.mem.indexOf(u8, captured, "[bot] WEBHOOK_SECRET=")           != null);
-    try testing.expect(std.mem.indexOf(u8, captured, "[bot] BOT_API_BASE=")             != null);
-    try testing.expect(std.mem.indexOf(u8, captured, "[bot] RULES_FILE=")               != null);
-    try testing.expect(std.mem.indexOf(u8, captured, "[server] LISTEN_ADDR=")           != null);
-    try testing.expect(std.mem.indexOf(u8, captured, "[worker] WORKER_THREADS=")        != null);
-    try testing.expect(std.mem.indexOf(u8, captured, "[io] IO_POOL_THREADS=")           != null);
-    try testing.expect(std.mem.indexOf(u8, captured, "[dispatcher] DISPATCHER_THREADS=") != null);
+    try testing.expect(std.mem.find(u8, captured, "[bot] BOT_TOKEN=")                != null);
+    try testing.expect(std.mem.find(u8, captured, "[bot] WEBHOOK_SECRET=")           != null);
+    try testing.expect(std.mem.find(u8, captured, "[bot] BOT_API_BASE=")             != null);
+    try testing.expect(std.mem.find(u8, captured, "[bot] RULES_FILE=")               != null);
+    try testing.expect(std.mem.find(u8, captured, "[server] LISTEN_ADDR=")           != null);
+    try testing.expect(std.mem.find(u8, captured, "[worker] WORKER_THREADS=")        != null);
+    try testing.expect(std.mem.find(u8, captured, "[io] IO_POOL_THREADS=")           != null);
+    try testing.expect(std.mem.find(u8, captured, "[dispatcher] DISPATCHER_THREADS=") != null);
 
     // --- P4-3: masking end-to-end ---
     // The BOT_TOKEN line must contain "****" and must NOT contain the full token.
-    const tok_start = std.mem.indexOf(u8, captured, "[bot] BOT_TOKEN=").?;
-    const tok_end   = std.mem.indexOfPos(u8, captured, tok_start, "\n") orelse captured.len;
+    const tok_start = std.mem.find(u8, captured, "[bot] BOT_TOKEN=").?;
+    const tok_end   = std.mem.findPos(u8, captured, tok_start, "\n") orelse captured.len;
     const tok_line  = captured[tok_start..tok_end];
-    try testing.expect(std.mem.indexOf(u8, tok_line, "****")  != null);
-    try testing.expect(std.mem.indexOf(u8, tok_line, token)   == null);
+    try testing.expect(std.mem.find(u8, tok_line, "****")  != null);
+    try testing.expect(std.mem.find(u8, tok_line, token)   == null);
 
     // The WEBHOOK_SECRET line must contain "****" and must NOT contain the
     // full secret.
-    const sec_start = std.mem.indexOf(u8, captured, "[bot] WEBHOOK_SECRET=").?;
-    const sec_end   = std.mem.indexOfPos(u8, captured, sec_start, "\n") orelse captured.len;
+    const sec_start = std.mem.find(u8, captured, "[bot] WEBHOOK_SECRET=").?;
+    const sec_end   = std.mem.findPos(u8, captured, sec_start, "\n") orelse captured.len;
     const sec_line  = captured[sec_start..sec_end];
-    try testing.expect(std.mem.indexOf(u8, sec_line, "****")   != null);
-    try testing.expect(std.mem.indexOf(u8, sec_line, secret)   == null);
+    try testing.expect(std.mem.find(u8, sec_line, "****")   != null);
+    try testing.expect(std.mem.find(u8, sec_line, secret)   == null);
 }
 
 

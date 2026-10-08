@@ -348,19 +348,19 @@ pub fn buildApiCall(
         // Scalar value — stringify into a text part, or skip unsupported types.
         const val_type = lua.typeOf(-1);
         const scalar: []const u8 = switch (val_type) {
-            .string  => alloc.dupe(u8, lua.toString(-1) catch "") catch |err| return err,
+            .string  => try alloc.dupe(u8, lua.toString(-1) catch ""),
             .number  => blk: {
                 if (lua.isInteger(-1)) {
                     const n = lua.toInteger(-1) catch 0;
-                    break :blk std.fmt.allocPrint(alloc, "{d}", .{n}) catch |err| return err;
+                    break :blk try alloc.print("{d}", .{n});
                 } else {
                     const f = lua.toNumber(-1) catch 0;
-                    break :blk std.fmt.allocPrint(alloc, "{d}", .{f}) catch |err| return err;
+                    break :blk try alloc.print("{d}", .{f});
                 }
             },
             .boolean => blk: {
                 const b = lua.toBoolean(-1);
-                break :blk alloc.dupe(u8, if (b) "true" else "false") catch |err| return err;
+                break :blk try alloc.dupe(u8, if (b) "true" else "false");
             },
             else => continue, // skip nil, tables, etc. — defer frees key
         };
@@ -780,8 +780,6 @@ const HeaderError = error{ EmptyName, BadNameByte, BadValueByte };
 /// A header name must be a non-empty RFC-7230-ish token: every byte printable
 /// ASCII (0x21..0x7e) and not ':'. Rejects controls, space, CRLF, NUL, DEL,
 /// high bytes — the set std.http would assert on, plus stricter cleanliness.
-/// A plain byte loop avoids relying on std.mem.indexOf* so it is immune to
-/// stdlib naming changes in that family of helpers.
 fn validateHeaderName(name: []const u8) HeaderError!void {
     if (name.len == 0) return error.EmptyName;
     for (name) |c| {
@@ -1354,8 +1352,8 @@ test "tg.<method>{...} == bot.emit{method=...,params=...}" {
     try testing.expectEqual(@as(usize, 1), actions.len);
     try testing.expectEqualStrings("sendMessage", actions[0].method);
     const json_body = actions[0].payload.json;
-    try testing.expect(std.mem.indexOf(u8, json_body, "\"chat_id\":7") != null);
-    try testing.expect(std.mem.indexOf(u8, json_body, "\"text\":\"via facade\"") != null);
+    try testing.expect(std.mem.find(u8, json_body, "\"chat_id\":7") != null);
+    try testing.expect(std.mem.find(u8, json_body, "\"text\":\"via facade\"") != null);
     try testing.expect(actions[0].route != null);
     try testing.expectEqual(@as(i64, 7), actions[0].route.?.chat_id);
 }
@@ -1667,8 +1665,8 @@ test "bot.send_message produces a tracked send with merged opts" {
                         try testing.expect(call.tracking != null);
                         try testing.expectEqual(@as(u8, 3),  call.tracking.?.worker_id);
                         try testing.expectEqual(@as(u32, 7), call.tracking.?.coro_id);
-                        try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"chat_id\":1") != null);
-                        try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"text\":\"hi\"") != null);
+                        try testing.expect(std.mem.find(u8, call.payload.json, "\"chat_id\":1") != null);
+                        try testing.expect(std.mem.find(u8, call.payload.json, "\"text\":\"hi\"") != null);
                         try testing.expect(call.route != null);
                         try testing.expectEqual(@as(i64, 1), call.route.?.chat_id);
                     },
@@ -1705,8 +1703,8 @@ test "bot.send_message produces a tracked send with merged opts" {
                 switch (y.pending_job) {
                     .tracked_send => |call| {
                         defer types.freeApiCall(call, testing.allocator);
-                        try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"parse_mode\":\"HTML\"") != null);
-                        try testing.expect(std.mem.indexOf(u8, call.payload.json, "\"chat_id\":5") != null);
+                        try testing.expect(std.mem.find(u8, call.payload.json, "\"parse_mode\":\"HTML\"") != null);
+                        try testing.expect(std.mem.find(u8, call.payload.json, "\"chat_id\":5") != null);
                     },
                     .io => return error.ExpectedTrackedSend,
                 }

@@ -9,12 +9,11 @@ const builtin = @import("builtin");
 
 const state_store = @import("state_store.zig");
 
-// The tool's own SQLite binding for the read-only source connection. This is a
-// distinct type from state_store's internal `c`: this file reads the source and
-// writes the output only through StateStore's public API — the two never mix.
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+// The tool's own SQLite binding for the read-only source connection, sharing
+// the same translated `"c"` module as state_store.zig — but a separate
+// connection: this file reads the source and writes the output only through
+// StateStore's public API, so the two connections never mix.
+const c = @import("c");
 
 const log = std.log.scoped(.migrate);
 
@@ -61,8 +60,8 @@ fn harden() void {
     std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch
         log.warn("setrlimit(RLIMIT_CORE, 0) failed — core dumps not suppressed", .{});
 
-    if (builtin.os.tag == .linux) {
-        const rc = std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
+    if (builtin.target.os.tag == .linux) {
+        const rc = std.os.linux.prctl(@backingInt(std.os.linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
         if (rc != 0) log.warn("prctl(PR_SET_DUMPABLE, 0) failed", .{});
     }
 }
@@ -241,7 +240,7 @@ pub fn migrate(
 
     // Build to a temp sibling; rename only on full success.
     var tmp_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
-    const out_tmp = try std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{out_path});
+    const out_tmp = try std.mem.printSentinel(&tmp_buf, "{s}.tmp", .{out_path}, 0);
     deleteTempSet(cwd, io, out_tmp); // clear any stale temp (and WAL sidecars) from a prior run
     errdefer deleteTempSet(cwd, io, out_tmp);
 
@@ -393,7 +392,7 @@ fn writeV1Fixture(path: [:0]const u8) !void {
 
 /// Resolve a tmpDir to an absolute path and join `name` onto it, NUL-terminated.
 fn joinZ(buf: []u8, dir_path: []const u8, name: []const u8) [:0]const u8 {
-    return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir_path, name }) catch unreachable;
+    return std.mem.printSentinel(buf, "{s}/{s}", .{ dir_path, name }, 0) catch unreachable;
 }
 
 test "migrate v1 plaintext -> v2 plaintext preserves every row" {

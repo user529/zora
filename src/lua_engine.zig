@@ -146,14 +146,25 @@ pub const LuaEngine = struct {
         };
     }
 
-    /// Load and execute a Lua string (used in tests and for hot-reload).
-    /// Returns error.LuaError on syntax or runtime error (caller should log).
+    /// Load and execute a Lua string, normalizing any syntax/runtime failure to
+    /// error.LuaError. Test-facing only: production loads rules from a file
+    /// (loadFile), and hot-reload re-reads the file — nothing loads rules from
+    /// memory. Retained (and `pub`) because the test suites across lua_engine.zig
+    /// and lua_api.zig rely on the error normalization; there is no production
+    /// caller.
     pub fn loadString(self: *LuaEngine, src: [:0]const u8) !void {
         self.lua.doString(src) catch {
             return error.LuaError;
         };
     }
 
+    /// Synchronous, non-coroutine-multiplexed convenience wrapper around
+    /// startHandler for `on_message`. Test-facing only: the production worker
+    /// drives the engine via startHandler/resumeHandler directly (worker.zig) so
+    /// yielding rules run on the io_pool. Here a rule that yields cannot be
+    /// serviced (no io_pool wired), so callOnMessage tears it down and returns an
+    /// empty action list. Retained (and `pub`) as the tested single-shot entry
+    /// point; there is no production caller.
     pub fn callOnMessage(
         self:      *LuaEngine,
         allocator: std.mem.Allocator,
@@ -168,7 +179,7 @@ pub const LuaEngine = struct {
                     .tracked_send => |call| types.freeApiCall(call, allocator),
                 }
                 teardownCoro(self.lua, y.handle);
-                log.err("callOnMessage: rule called a yield-ing function — no io_pool wired", .{});
+                log.warn("callOnMessage: rule called a yield-ing function — no io_pool wired", .{});
                 return try allocator.alloc(types.ApiCall, 0);
             },
             .err => return try allocator.alloc(types.ApiCall, 0),
@@ -223,7 +234,11 @@ pub const LuaEngine = struct {
 
         // Decode JSON body → Lua table (the first handler argument).
         serializer.jsonToLuaTable(thread, body, allocator) catch |e| {
-            log.err("startHandler: body decode failed: {s}", .{@errorName(e)});
+            // Malformed external input (the server point-scans only for the
+            // routing user_id, so a well-formed-prefix/garbage-suffix body
+            // reaches here). Expected at a trust boundary, not an internal
+            // fault — warn, not err.
+            log.warn("startHandler: body decode failed: {s}", .{@errorName(e)});
             thread.pop(1); // pop handler
             teardownCoro(main, handle);
             return .err;
@@ -709,15 +724,15 @@ test "return-list — six method shapes parse to ApiCalls" {
     // Bodies carry the expected fields (key order from luaTableToJson is
     // unspecified — assert by substring, or parse for the {chat_id,text} shape).
     try expectMsgBody(actions[0].payload.json, 1, "m"); // sendMessage chat_id+text
-    try testing.expect(std.mem.indexOf(u8, actions[1].payload.json, "\"parse_mode\":\"HTML\"") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[1].payload.json, "\"message_id\":2") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[2].payload.json, "\"callback_data\":\"d\"") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[2].payload.json, "\"inline_keyboard\"") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[3].payload.json, "\"callback_query_id\":\"cq\"") != null);
+    try testing.expect(std.mem.find(u8, actions[1].payload.json, "\"parse_mode\":\"HTML\"") != null);
+    try testing.expect(std.mem.find(u8, actions[1].payload.json, "\"message_id\":2") != null);
+    try testing.expect(std.mem.find(u8, actions[2].payload.json, "\"callback_data\":\"d\"") != null);
+    try testing.expect(std.mem.find(u8, actions[2].payload.json, "\"inline_keyboard\"") != null);
+    try testing.expect(std.mem.find(u8, actions[3].payload.json, "\"callback_query_id\":\"cq\"") != null);
     // deleteMessage carries chat_id and message_id (no text field).
-    try testing.expect(std.mem.indexOf(u8, actions[4].payload.json, "\"chat_id\":1") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[4].payload.json, "\"message_id\":2") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[5].payload.json, "\"chat_id\":1") != null);
+    try testing.expect(std.mem.find(u8, actions[4].payload.json, "\"chat_id\":1") != null);
+    try testing.expect(std.mem.find(u8, actions[4].payload.json, "\"message_id\":2") != null);
+    try testing.expect(std.mem.find(u8, actions[5].payload.json, "\"chat_id\":1") != null);
 }
 
 test "bot.emit calls precede the return-list, in call order" {
@@ -857,7 +872,7 @@ test "shipped rules/rules.lua produces sendMessage calls (generic form)" {
     // `zig build test`).
     const raw = try std.Io.Dir.cwd().readFileAlloc(testing.io, "rules/rules.lua", testing.allocator, .limited(64 * 1024));
     defer testing.allocator.free(raw);
-    const src = try testing.allocator.dupeZ(u8, raw);
+    const src = try testing.allocator.dupeSentinel(u8, raw, 0);
     defer testing.allocator.free(src);
     try engine.loadString(src);
 
@@ -1015,8 +1030,8 @@ test "startHandler dispatches on_schedule with payload and id" {
             }
             try testing.expectEqual(@as(usize, 1), actions.len);
             try testing.expectEqualStrings("noteId", actions[0].method);
-            try testing.expect(std.mem.indexOf(u8, actions[0].payload.json, "\"got\":77") != null);
-            try testing.expect(std.mem.indexOf(u8, actions[0].payload.json, "\"n\":5") != null);
+            try testing.expect(std.mem.find(u8, actions[0].payload.json, "\"got\":77") != null);
+            try testing.expect(std.mem.find(u8, actions[0].payload.json, "\"n\":5") != null);
         },
         else => return error.UnexpectedOutcome,
     }

@@ -6,9 +6,7 @@
 
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+const c = @import("c");
 
 const state_crypto = @import("state_crypto.zig");
 const log = std.log.scoped(.state_store);
@@ -668,7 +666,7 @@ test "schema_version is seeded, matched on open, and mismatch is rejected" {
         const dir_path_len = try tmp.dir.realPath(testing.io, &path_buf);
         const dir_path = path_buf[0..dir_path_len];
         var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-        const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/v.db", .{dir_path});
+        const db_path = try std.mem.printSentinel(&db_path_buf, "{s}/v.db", .{dir_path}, 0);
 
         // First open creates and seeds schema_version = '1'.
         var store = try StateStore.open(testing.allocator, db_path);
@@ -732,7 +730,7 @@ test "3 connections on same file-based DB, concurrent reads, WAL confirmed" {
     const dir_path_len = try tmp.dir.realPath(testing.io, &path_buf);
     const dir_path = path_buf[0..dir_path_len];
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/wal.db", .{dir_path});
+    const db_path = try std.mem.printSentinel(&db_path_buf, "{s}/wal.db", .{dir_path}, 0);
 
     // Seed via first connection
     var s1 = try StateStore.open(testing.allocator, db_path);
@@ -803,7 +801,7 @@ test "an immediate transaction commits and rolls back" {
     {
         const data = try store.getUserState(1);
         defer store.allocator.free(data);
-        try testing.expect(std.mem.indexOf(u8, data, "\"x\":42") != null);
+        try testing.expect(std.mem.find(u8, data, "\"x\":42") != null);
     }
 
     // rollback reverts the write to the last committed value.
@@ -814,8 +812,8 @@ test "an immediate transaction commits and rolls back" {
     {
         const data = try store.getUserState(2);
         defer store.allocator.free(data);
-        try testing.expect(std.mem.indexOf(u8, data, "\"x\":0") != null);
-        try testing.expect(std.mem.indexOf(u8, data, "\"x\":99") == null);
+        try testing.expect(std.mem.find(u8, data, "\"x\":0") != null);
+        try testing.expect(std.mem.find(u8, data, "\"x\":99") == null);
     }
 }
 
@@ -954,7 +952,7 @@ test "busy_timeout set — concurrent writers complete without BUSY error" {
     const dir_path_len = try tmp.dir.realPath(testing.io, &path_buf);
     const dir_path = path_buf[0..dir_path_len];
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/busy.db", .{dir_path});
+    const db_path = try std.mem.printSentinel(&db_path_buf, "{s}/busy.db", .{dir_path}, 0);
 
     var s1 = try StateStore.open(testing.allocator, db_path);
     var s2 = try StateStore.open(testing.allocator, db_path);
@@ -1192,7 +1190,7 @@ test "reopening an encrypted DB with the right passphrase succeeds" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(testing.io, &path_buf);
     var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_buf, "{s}/e.db", .{path_buf[0..dir_len]});
+    const db_path = try std.mem.printSentinel(&db_buf, "{s}/e.db", .{path_buf[0..dir_len]}, 0);
 
     {
         var s = try StateStore.openWithOptions(testing.allocator, db_path, .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
@@ -1209,7 +1207,7 @@ test "reopening an encrypted DB with the wrong passphrase aborts" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(testing.io, &path_buf);
     var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_buf, "{s}/e.db", .{path_buf[0..dir_len]});
+    const db_path = try std.mem.printSentinel(&db_buf, "{s}/e.db", .{path_buf[0..dir_len]}, 0);
 
     {
         var s = try StateStore.openWithOptions(testing.allocator, db_path, .{ .encryption = .{ .passphrase = "right", .io = testing.io } });
@@ -1226,7 +1224,7 @@ test "mode mismatch aborts in both directions" {
     var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
 
     // Encrypted DB opened without a passphrase → mismatch.
-    const enc_path = try std.fmt.bufPrintZ(&db_buf, "{s}/m1.db", .{path_buf[0..dir_len]});
+    const enc_path = try std.mem.printSentinel(&db_buf, "{s}/m1.db", .{path_buf[0..dir_len]}, 0);
     {
         var s = try StateStore.openWithOptions(testing.allocator, enc_path, .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
         s.close();
@@ -1235,7 +1233,7 @@ test "mode mismatch aborts in both directions" {
 
     // Plaintext DB opened with a passphrase → mismatch.
     var db_buf2: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const plain_path = try std.fmt.bufPrintZ(&db_buf2, "{s}/m2.db", .{path_buf[0..dir_len]});
+    const plain_path = try std.mem.printSentinel(&db_buf2, "{s}/m2.db", .{path_buf[0..dir_len]}, 0);
     {
         var s = try StateStore.open(testing.allocator, plain_path);
         s.close();
@@ -1286,7 +1284,7 @@ test "on-disk bytes are not the plaintext in encrypted mode" {
     const raw = c.sqlite3_column_blob(stmt, 0);
     const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
     const bytes = @as([*]const u8, @ptrCast(raw))[0..len];
-    try testing.expect(std.mem.indexOf(u8, bytes, "swordfish") == null);
+    try testing.expect(std.mem.find(u8, bytes, "swordfish") == null);
     try testing.expect(len >= state_crypto.overhead);
 }
 

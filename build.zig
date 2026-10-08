@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -7,7 +8,7 @@ pub fn build(b: *std.Build) void {
     // --- release: read from RELEASE file ---
     const release_number: u32 = blk: {
         const io = b.graph.io;
-        const content = b.build_root.handle.readFileAlloc(io, "RELEASE", b.allocator, .limited(16)) catch break :blk 0;
+        const content = b.root.root_dir.handle.readFileAlloc(io, "RELEASE", b.allocator, .limited(16)) catch break :blk 0;
         defer b.allocator.free(content);
         const n = std.fmt.parseInt(u32, std.mem.trim(u8, content, " \n\r\t"), 10) catch break :blk 0;
         break :blk n;
@@ -17,7 +18,7 @@ pub fn build(b: *std.Build) void {
     const git_branch: []const u8 = blk: {
         const result = std.process.run(b.allocator, b.graph.io, .{
             .argv = &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
-            .cwd = .{ .path = b.build_root.path orelse "." },
+            .cwd = .{ .path = b.root.root_dir.path orelse "." },
         }) catch break :blk "unknown";
         const trimmed = std.mem.trim(u8, result.stdout, " \n\r\t");
         if (trimmed.len == 0) break :blk "unknown";
@@ -36,6 +37,19 @@ pub fn build(b: *std.Build) void {
     // SQLite C code is excluded via -fno-sanitize=thread to avoid false
     // positives from SQLITE_THREADSAFE=2 global-init (safe but unguarded).
     const sanitize_thread: ?bool = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer (TSan); forces LLVM backend");
+
+    // Shared C-header translation base (aro-based translate-c package).
+    // Replaces the removed @cImport builtin; the same package translates
+    // ziglua's Lua headers. sqlite3.h -> a "c" module imported by the
+    // SQLite-using Zig modules; sqlite3.c is still compiled/linked separately.
+    const translate_c_dep = b.dependency("translate_c", .{});
+    const sqlite_translated: Translator = .init(translate_c_dep, .{
+        .c_source_file = b.path("vendor/sqlite3.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_system_libs = &.{},
+    });
+    const sqlite_mod = sqlite_translated.mod;
 
     // --- ziglua dependency ---
     const ziglua_dep = b.dependency("ziglua", .{
@@ -68,6 +82,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addOptions("build_options", options);
     exe_mod.addImport("ziglua", ziglua_mod);
+    exe_mod.addImport("c", sqlite_mod);
     exe_mod.addCSourceFile(.{
         .file = b.path("vendor/sqlite3.c"),
         .flags = sqlite_flags,
@@ -88,7 +103,7 @@ pub fn build(b: *std.Build) void {
     // --- run step ---
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run zora");
     run_step.dependOn(&run_cmd.step);
 
@@ -102,6 +117,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    migrate_mod.addImport("c", sqlite_mod);
     migrate_mod.addCSourceFile(.{
         .file = b.path("vendor/sqlite3.c"),
         .flags = sqlite_flags,
@@ -116,7 +132,7 @@ pub fn build(b: *std.Build) void {
 
     const migrate_run = b.addRunArtifact(migrate_exe);
     migrate_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| migrate_run.addArgs(args);
+    migrate_run.addPassthruArgs();
     const migrate_step = b.step("migrate", "Run the v1 -> v2 state database migration tool");
     migrate_step.dependOn(&migrate_run.step);
 
@@ -156,6 +172,7 @@ pub fn build(b: *std.Build) void {
         });
         test_mod.addOptions("build_options", options);
         test_mod.addImport("ziglua", ziglua_mod);
+        test_mod.addImport("c", sqlite_mod);
         test_mod.addCSourceFile(.{
             .file = b.path("vendor/sqlite3.c"),
             .flags = sqlite_flags,

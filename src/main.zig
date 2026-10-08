@@ -90,7 +90,7 @@ var g_stop = std.atomic.Value(bool).init(false);
 var g_metrics = metrics_mod.Metrics{};
 var g_schema_slot: tg_schema.SchemaSlot = undefined;
 
-fn sigStop(sig: std.posix.SIG) callconv(std.builtin.CallingConvention.c) void {
+fn sigStop(sig: std.posix.SIG) callconv(std.lang.CallingConvention.c) void {
     _ = sig;
     g_stop.store(true, .release);
 }
@@ -180,8 +180,8 @@ pub fn main(init: std.process.Init) u8 {
     // reclaims burst spikes). Throughput cost is
     // negligible and far above Telegram's ~1000 msg/s ceiling.
     //
-    // To investigate leaks, temporarily swap in DebugAllocator:
-    //   var da = std.heap.DebugAllocator(.{}){};
+    // To investigate leaks, temporarily swap in SafeAllocator:
+    //   var da: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     //   defer _ = da.deinit();
     //   run(da.allocator(), rt.io(), init.environ_map.*) catch return 1;
     //
@@ -775,7 +775,7 @@ test "startup banner contains all six identity fields" {
     const banner = fw.buffered();
 
     // The banner prefix and every field name=value must be present.
-    try testing.expect(std.mem.indexOf(u8, banner, "zora starting") != null);
+    try testing.expect(std.mem.find(u8, banner, "zora starting") != null);
 
     var rel_buf: [16]u8 = undefined;
     const rel = std.fmt.bufPrint(&rel_buf, "release={d}", .{RELEASE}) catch unreachable;
@@ -787,14 +787,14 @@ test "startup banner contains all six identity fields" {
     var branch_buf: [64]u8 = undefined;
     const branch = std.fmt.bufPrint(&branch_buf, "branch={s}", .{GIT_BRANCH}) catch unreachable;
 
-    try testing.expect(std.mem.indexOf(u8, banner, branch) != null);
-    try testing.expect(std.mem.indexOf(u8, banner, rel) != null);
-    try testing.expect(std.mem.indexOf(u8, banner, sch) != null);
-    try testing.expect(std.mem.indexOf(u8, banner, api) != null);
+    try testing.expect(std.mem.find(u8, banner, branch) != null);
+    try testing.expect(std.mem.find(u8, banner, rel) != null);
+    try testing.expect(std.mem.find(u8, banner, sch) != null);
+    try testing.expect(std.mem.find(u8, banner, api) != null);
     // api_validation reflects the passed mode (proves the field is not hard-coded).
-    try testing.expect(std.mem.indexOf(u8, banner, "api_validation=warn") != null);
+    try testing.expect(std.mem.find(u8, banner, "api_validation=warn") != null);
     // enc reflects the passed flag (false -> off).
-    try testing.expect(std.mem.indexOf(u8, banner, "enc=off") != null);
+    try testing.expect(std.mem.find(u8, banner, "enc=off") != null);
 }
 
 test "startup log line printed before server accepts connections" {

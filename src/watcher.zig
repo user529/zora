@@ -80,7 +80,7 @@ pub fn watcherThread(args: WatcherArgs) void {
         return;
     };
     defer args.allocator.free(owned);
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux   => watcherInotify(owned, &reload_version),
         .freebsd => watcherKqueue(owned, &reload_version),
         else     => watcherPoll(owned, &reload_version, args.io, 500, null),
@@ -111,7 +111,7 @@ fn logRulesDeleted(context: *anyopaque) void {
 /// Generic inotify watcher. Watches the parent directory and filters by
 /// basename so it survives delete + recreate. Never returns.
 pub fn watchInotify(t: WatchTarget) void {
-    if (comptime builtin.os.tag != .linux) {
+    if (comptime builtin.target.os.tag != .linux) {
         unreachable;
     }
     const posix = std.posix;
@@ -135,7 +135,7 @@ pub fn watchInotify(t: WatchTarget) void {
 
     // inotify_add_watch needs a null-terminated path.
     var dirz_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dirz = std.fmt.bufPrintZ(&dirz_buf, "{s}", .{dir_path}) catch {
+    const dirz = std.mem.printSentinel(&dirz_buf, "{s}", .{dir_path}, 0) catch {
         log.err("inotify watch path too long: '{s}'", .{dir_path});
         return;
     };
@@ -199,7 +199,7 @@ fn watcherInotify(rules_path: []const u8, counter: *std.atomic.Value(u64)) void 
 
 /// Generic kqueue watcher (FreeBSD). Never returns.
 pub fn watchKqueue(t: WatchTarget) void {
-    if (comptime builtin.os.tag != .freebsd) {
+    if (comptime builtin.target.os.tag != .freebsd) {
         unreachable;
     }
     const c = std.c;
@@ -218,7 +218,7 @@ pub fn watchKqueue(t: WatchTarget) void {
 
     // open needs a null-terminated path.
     var pathz_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const pathz = std.fmt.bufPrintZ(&pathz_buf, "{s}", .{t.path}) catch {
+    const pathz = std.mem.printSentinel(&pathz_buf, "{s}", .{t.path}, 0) catch {
         log.err("kqueue watch path too long: '{s}'", .{t.path});
         return;
     };
@@ -415,7 +415,7 @@ test "watcherPoll detects file write within 1500ms" {
 }
 
 test "(Linux) inotify detects CLOSE_WRITE within 1000ms" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -452,7 +452,7 @@ test "(Linux) inotify detects CLOSE_WRITE within 1000ms" {
 }
 
 test "(Linux) 3 writes 200ms apart → counter >= 3 within 2s of last write" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -489,7 +489,7 @@ test "(Linux) 3 writes 200ms apart → counter >= 3 within 2s of last write" {
 }
 
 test "(Linux) atomic rename (tmp → rules.lua) → counter incremented within 2000ms" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -530,7 +530,7 @@ test "(Linux) atomic rename (tmp → rules.lua) → counter incremented within 2
 }
 
 test "(Linux) file deletion fires the on_delete callback exactly once" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -596,7 +596,7 @@ test "(Linux) file deletion fires the on_delete callback exactly once" {
 }
 
 test "(Linux) watcherThread returns when the path dupe fails — no reload bump" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

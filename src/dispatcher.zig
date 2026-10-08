@@ -34,6 +34,14 @@ const log = std.log.scoped(.dispatcher);
 /// 64 KB state ceiling in serializer.zig; real send* replies are far smaller.
 const RESPONSE_CEILING: usize = 64 * 1024;
 
+/// Hard upper bound on how long one send attempt waits for the response.
+/// A silently dead keep-alive connection (NAT/firewall idle drop) otherwise
+/// hangs the read until the ~15-minute kernel retransmission timeout; a
+/// poll-gate on the connection fd converts that into a fast, retryable
+/// failure the fresh-connection retry acts on. Tests override via
+/// DispatcherArgs.
+pub const SEND_DEADLINE_MS: u64 = 30_000;
+
 // ---------------------------------------------------------------------------
 // Public: DispatcherArgs — all parameters for one dispatcher thread
 // ---------------------------------------------------------------------------
@@ -62,6 +70,7 @@ pub const DispatcherArgs = struct {
     blocked_until: ?*delay.BlockedMap = null,
     retry_after_default_ms: u64 = 1000,
     retry_after_max_ms: u64 = 60000,
+    send_deadline_ms: u64 = SEND_DEADLINE_MS,
 };
 
 // ---------------------------------------------------------------------------
@@ -113,8 +122,7 @@ fn parkAt(dq: *delay.DelayQueue, ready: i64, call: types.ApiCall, args: Dispatch
 pub fn dispatcherThread(args: DispatcherArgs) void {
     var client = std.http.Client{ .allocator = args.allocator, .io = args.io };
     defer client.deinit();
-    const url_prefix = std.fmt.allocPrint(
-        args.allocator,
+    const url_prefix = args.allocator.print(
         "{s}/bot{s}/",
         .{ args.api_base, args.bot_token },
     ) catch unreachable;
@@ -124,6 +132,23 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
     // heap allocation for the reply). Body bytes captured here stay valid only
     // until the next send overwrites them.
     var resp_buf: [RESPONSE_CEILING]u8 = undefined;
+
+    // Per-thread send context: the constants send()/sendWithRetry() need on
+    // every call, bundled so those hot-path signatures stay small. `client` and
+    // `resp_buf` are addresses of the locals above — the retry reinitializes the
+    // client through the pointer; the rest are copied from args once.
+    const sctx = SendCtx{
+        .client = &client,
+        .io = args.io,
+        .url_prefix = url_prefix,
+        .allocator = args.allocator,
+        .result_queues = args.io_result_queues,
+        .metrics = args.metrics,
+        .default_ms = args.retry_after_default_ms,
+        .max_ms = args.retry_after_max_ms,
+        .deadline_ms = args.send_deadline_ms,
+        .resp_buf = &resp_buf,
+    };
 
     while (!args.stop.load(.acquire)) {
         // Park indefinitely until a call arrives or the queue is closed at
@@ -135,7 +160,7 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
         if (divertIfBlocked(call, args)) continue;
 
         var retry_after_ms: u64 = args.retry_after_default_ms;
-        if (sendWithRetry(&client, args.io, call, url_prefix, args.allocator, args.io_result_queues, args.metrics, &retry_after_ms, args.retry_after_default_ms, args.retry_after_max_ms, &resp_buf)) {
+        if (sendWithRetry(&sctx, call, &retry_after_ms)) {
             if (args.metrics) |m| m.incApiCall(.ok);
             types.freeApiCall(call, args.allocator); // sent OK
         } else |err| {
@@ -155,35 +180,41 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
 // Private: send with one retry on failure
 // ---------------------------------------------------------------------------
 
-fn sendWithRetry(
+/// Per-thread constants for send()/sendWithRetry(). Built once in
+/// dispatcherThread and passed by const pointer; only `client` and `resp_buf`
+/// are mutated (through their pointers), never the struct itself. The two
+/// per-call values (the ApiCall and the retry_after out-pointer) stay explicit
+/// parameters.
+const SendCtx = struct {
     client: *std.http.Client,
     io: std.Io,
-    call: types.ApiCall,
     url_prefix: []const u8,
     allocator: std.mem.Allocator,
     result_queues: ?[]*queue_mod.Queue(io_pool.IoResult),
     metrics: ?*metrics_mod.Metrics,
-    retry_after_out: *u64,
     default_ms: u64,
     max_ms: u64,
-    resp_buf: []u8,
-) !void {
-    if (send(client, io, call, url_prefix, allocator, result_queues, metrics, retry_after_out, default_ms, max_ms, resp_buf)) {
+    deadline_ms: u64, // hard per-attempt response deadline enforced by the poll-gate
+    resp_buf: []u8, // reused across sends; the response ceiling = its len
+};
+
+fn sendWithRetry(ctx: *const SendCtx, call: types.ApiCall, retry_after_out: *u64) !void {
+    if (send(ctx, call, retry_after_out)) {
         return;
     } else |err| {
         if (err == error.RateLimited) return err; // caller parks; never retry a 429
         log.warn("send failed ({s}), retrying in 200ms", .{@errorName(err)});
-        if (metrics) |m| _ = m.api_call_retries_total.fetchAdd(1, .monotonic);
-        rt.sleepNs(io, 200 * std.time.ns_per_ms);
+        if (ctx.metrics) |m| _ = m.api_call_retries_total.fetchAdd(1, .monotonic);
+        rt.sleepNs(ctx.io, 200 * std.time.ns_per_ms);
         // Reinitialize the client so the retry always opens a fresh TCP
         // connection — any pooled connection from the failed attempt may be
         // broken and would cause a second WriteFailed/ReadFailed.
-        client.deinit();
-        client.* = std.http.Client{ .allocator = allocator, .io = io };
-        send(client, io, call, url_prefix, allocator, result_queues, metrics, retry_after_out, default_ms, max_ms, resp_buf) catch |retry_err| {
+        ctx.client.deinit();
+        ctx.client.* = std.http.Client{ .allocator = ctx.allocator, .io = ctx.io };
+        send(ctx, call, retry_after_out) catch |retry_err| {
             if (retry_err == error.RateLimited) return retry_err;
             if (call.tracking) |tracking| {
-                pushTrackedErr(result_queues, tracking.worker_id, tracking.coro_id, @errorName(retry_err), allocator);
+                pushTrackedErr(ctx.result_queues, tracking.worker_id, tracking.coro_id, @errorName(retry_err), ctx.allocator);
             }
             return retry_err;
         };
@@ -202,7 +233,7 @@ fn sendWithRetry(
 /// Returns error.TelegramApiError so sendWithRetry triggers the single retry.
 fn checkStatus(status: std.http.Status, method: []const u8) !void {
     if (status.class() != .success) {
-        log.warn("Telegram API returned HTTP {d} for {s}", .{ @intFromEnum(status), method });
+        log.warn("Telegram API returned HTTP {d} for {s}", .{ @backingInt(status), method });
         return error.TelegramApiError;
     }
 }
@@ -220,83 +251,133 @@ fn fetchErr(err: anyerror, fw: *const std.Io.Writer, method: []const u8, metrics
     return err;
 }
 
-fn send(
-    client: *std.http.Client,
-    io: std.Io,
-    call: types.ApiCall,
-    url_prefix: []const u8,
-    allocator: std.mem.Allocator,
-    result_queues: ?[]*queue_mod.Queue(io_pool.IoResult),
-    metrics: ?*metrics_mod.Metrics,
-    retry_after_out: *u64, // set only when returning error.RateLimited
-    default_ms: u64,
-    max_ms: u64,
-    resp_buf: []u8, // caller-owned, reused across sends; ceiling = its len
-) !void {
-    const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ url_prefix, call.method });
+/// Send the HTTP head and `payload` as the request body, then flush. Mirrors
+/// std.http.Client.fetch's own body-send, so a const payload needs no copy.
+fn sendRequestBody(req: *std.http.Client.Request, payload: []const u8) !void {
+    req.transfer_encoding = .{ .content_length = payload.len };
+    var bw = try req.sendBodyUnflushed(&.{});
+    try bw.writer.writeAll(payload);
+    try bw.end();
+    try req.connection.?.flush();
+}
+
+fn send(ctx: *const SendCtx, call: types.ApiCall, retry_after_out: *u64) !void {
+    // Locals for the fields referenced repeatedly below; the remaining ctx
+    // fields are read as ctx.<field> at their single use sites.
+    const client = ctx.client;
+    const io = ctx.io;
+    const allocator = ctx.allocator;
+    const metrics = ctx.metrics;
+
+    const url = try allocator.print("{s}{s}", .{ ctx.url_prefix, call.method });
     defer allocator.free(url);
+    const uri = try std.Uri.parse(url);
 
     // Capture the response body for every send: a 429 carries retry_after, and
     // tracked sends need message_id. The fixed buffer is reused across sends
     // (no per-request allocation) and caps the reply at its length.
-    var fw = std.Io.Writer.fixed(resp_buf);
+    var fw = std.Io.Writer.fixed(ctx.resp_buf);
 
-    const result = switch (call.payload) {
+    // Multipart resources (body bytes + Content-Type header value) must outlive
+    // the request: extra_headers is externally owned, and the body is read while
+    // sending. Freed on function exit, after the response has been read.
+    var mp_bytes: ?[]u8 = null;
+    defer if (mp_bytes) |b| allocator.free(b);
+    var mp_ct: ?[]u8 = null;
+    defer if (mp_ct) |c| allocator.free(c);
+
+    // Open the connection and stream the request body. The manual request flow
+    // (instead of client.fetch) is what lets the response read be poll-gated
+    // below while still returning a healthy connection to the keep-alive pool.
+    var req = switch (call.payload) {
         .json => |body| blk: {
             log.debug("→ {s} (json) {s}", .{ call.method, body });
-            break :blk client.fetch(.{
-                .location = .{ .url = url },
-                .payload = body,
+            var r = client.request(.POST, uri, .{
                 .keep_alive = true,
+                .redirect_behavior = .unhandled,
                 .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-                // Ask for an uncompressed response. With a response_writer set,
-                // std.http.Client.fetch heap-allocates a 64 KB flate window per
-                // call for any gzip/deflate body and then gunzips it. Telegram's
-                // reply bodies are tiny, so identity encoding skips both the
-                // per-call allocation and the decompression entirely.
+                // Ask for an uncompressed response. With decompression a gzip/
+                // deflate body would force a 64 KB flate-window heap allocation
+                // per call; Telegram's replies are tiny, so identity encoding
+                // skips both the allocation and the decompression entirely.
                 .headers = .{ .accept_encoding = .{ .override = "identity" } },
-                .response_writer = &fw,
             }) catch |err| return fetchErr(err, &fw, call.method, metrics);
+            errdefer r.deinit();
+            sendRequestBody(&r, body) catch |err| return fetchErr(err, &fw, call.method, metrics);
+            break :blk r;
         },
         .multipart => |parts| blk: {
             const mb = try buildMultipartBody(io, parts, allocator);
-            defer allocator.free(mb.bytes);
+            mp_bytes = mb.bytes;
             log.debug("→ {s} (multipart, {d} parts)", .{ call.method, parts.len });
-            const ct = try std.fmt.allocPrint(allocator, "multipart/form-data; boundary={s}", .{mb.boundary[0..mb.blen]});
-            defer allocator.free(ct);
-            break :blk client.fetch(.{
-                .location = .{ .url = url },
-                .payload = mb.bytes,
+            const ct = try allocator.print("multipart/form-data; boundary={s}", .{mb.boundary[0..mb.blen]});
+            mp_ct = ct;
+            var r = client.request(.POST, uri, .{
                 .keep_alive = true,
+                .redirect_behavior = .unhandled,
                 .extra_headers = &.{.{ .name = "Content-Type", .value = ct }},
                 // Identity encoding — see the json branch above for the rationale.
                 .headers = .{ .accept_encoding = .{ .override = "identity" } },
-                .response_writer = &fw,
             }) catch |err| return fetchErr(err, &fw, call.method, metrics);
+            errdefer r.deinit();
+            sendRequestBody(&r, mb.bytes) catch |err| return fetchErr(err, &fw, call.method, metrics);
+            break :blk r;
         },
     };
+    defer req.deinit();
+
+    // Poll the connection socket before the first buffered read. A silently dead
+    // keep-alive peer (NAT/firewall idle drop) would otherwise block the response
+    // read until the ~15-minute kernel retransmission timeout; the poll-gate
+    // turns that into a fast, retryable failure. The poll MUST precede
+    // receiveHead — a raw-fd poll cannot see bytes the client already buffered.
+    const fd: std.posix.socket_t = req.connection.?.stream_reader.stream.socket.handle;
+    var pfd: std.posix.pollfd = .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
+    const timeout_ms: i32 = @intCast(@min(ctx.deadline_ms, @as(u64, std.math.maxInt(i32))));
+    const nready = std.posix.poll(@as(*[1]std.posix.pollfd, &pfd)[0..1], timeout_ms) catch 0;
+    if (nready == 0 or (pfd.revents & std.posix.POLL.IN) == 0) {
+        if (metrics) |m| _ = m.dispatch_timeouts_total.fetchAdd(1, .monotonic);
+        log.warn("send exceeded {d}ms deadline for {s}; abandoning stale connection", .{ ctx.deadline_ms, call.method });
+        // Abandon the dead connection so req.deinit() closes it instead of
+        // returning a corpse to the keep-alive pool.
+        req.connection.?.closing = true;
+        return error.Timeout;
+    }
+
+    // Redirects are unhandled (matching the previous fetch path for a POST
+    // body), so receiveHead never consults the redirect buffer.
+    var redirect_buf: [0]u8 = .{};
+    var response = req.receiveHead(&redirect_buf) catch |err| return fetchErr(err, &fw, call.method, metrics);
+
+    // Drain the body into the fixed writer. Reading to completion leaves the
+    // reader ready so req.deinit() can return the connection to the pool
+    // (keep-alive). identity encoding ⇒ the plain reader needs no decompressor.
+    var transfer_buf: [64]u8 = undefined;
+    const body_reader = response.reader(&transfer_buf);
+    _ = body_reader.streamRemaining(&fw) catch |err| return fetchErr(err, &fw, call.method, metrics);
 
     const resp = fw.buffered();
+    const status = response.head.status;
 
     // 429 → signal RateLimited so the caller parks the call (no inline retry).
-    if (result.status == .too_many_requests) {
-        retry_after_out.* = parseRetryAfter(resp, default_ms, max_ms, allocator);
+    if (status == .too_many_requests) {
+        retry_after_out.* = parseRetryAfter(resp, ctx.default_ms, ctx.max_ms, allocator);
         return error.RateLimited;
     }
 
-    try checkStatus(result.status, call.method); // other non-2xx ⇒ retryable error
+    try checkStatus(status, call.method); // other non-2xx ⇒ retryable error
 
-    log.debug("← {d} {s}", .{ @intFromEnum(result.status), call.method });
+    log.debug("← {d} {s}", .{ @backingInt(status), call.method });
 
     // Tracked sends: extract message_id from the captured body.
     if (call.tracking) |tracking| {
         const message_id = parseMessageId(resp, allocator) catch {
             log.warn("tracked send: missing message_id in response for {s}", .{call.method});
             if (metrics) |m| _ = m.tracked_send_failures_total.fetchAdd(1, .monotonic);
-            pushTrackedErr(result_queues, tracking.worker_id, tracking.coro_id, "missing message_id in response", allocator);
+            pushTrackedErr(ctx.result_queues, tracking.worker_id, tracking.coro_id, "missing message_id in response", allocator);
             return;
         };
-        pushTrackedSend(result_queues, tracking.worker_id, tracking.coro_id, message_id);
+        pushTrackedSend(ctx.result_queues, tracking.worker_id, tracking.coro_id, message_id);
         log.debug("← tracked message_id={d} for {s}", .{ message_id, call.method });
     }
 }
@@ -347,15 +428,14 @@ fn buildMultipartBody(
 
         if (p.filename) |fname| {
             try validateHeaderValue(fname);
-            const hdr = try std.fmt.allocPrint(
-                allocator,
+            const hdr = try allocator.print(
                 "Content-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: application/octet-stream\r\n",
                 .{ p.name, fname },
             );
             defer allocator.free(hdr);
             try buf.appendSlice(allocator, hdr);
         } else {
-            const hdr = try std.fmt.allocPrint(allocator, "Content-Disposition: form-data; name=\"{s}\"\r\n", .{p.name});
+            const hdr = try allocator.print("Content-Disposition: form-data; name=\"{s}\"\r\n", .{p.name});
             defer allocator.free(hdr);
             try buf.appendSlice(allocator, hdr);
         }
@@ -620,7 +700,7 @@ fn mockHandle(srv: *MockServer, stream: std.Io.net.Stream) void {
             const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
                 "Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{big_len}) catch unreachable;
             sw.interface.writeAll(hdr) catch return;
-            const chunk = [_]u8{'a'} ** 4096;
+            const chunk: [4096]u8 = @splat('a');
             var written: usize = 0;
             while (written < big_len) {
                 const n = @min(chunk.len, big_len - written);
@@ -678,7 +758,7 @@ fn parseHttpRequest(r: *std.Io.Reader, allocator: std.mem.Allocator) !?MockServe
     }
 
     // Parse request line: "POST /path HTTP/1.1"
-    const rl_end = std.mem.indexOf(u8, header_section.items, "\r\n") orelse return null;
+    const rl_end = std.mem.find(u8, header_section.items, "\r\n") orelse return null;
     var parts = std.mem.splitScalar(u8, header_section.items[0..rl_end], ' ');
     _ = parts.next() orelse return null; // skip method
     const raw_path = parts.next() orelse return null;
@@ -690,7 +770,7 @@ fn parseHttpRequest(r: *std.Io.Reader, allocator: std.mem.Allocator) !?MockServe
     var content_type_raw: []const u8 = "";
     var lines = std.mem.splitSequence(u8, header_section.items[rl_end + 2 ..], "\r\n");
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const name = line[0..colon];
         const value = std.mem.trim(u8, line[colon + 1 ..], " ");
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
@@ -729,10 +809,24 @@ const TestDispatcher = struct {
     thread: std.Thread,
     allocator: std.mem.Allocator,
 
+    const InitOpts = struct {
+        send_deadline_ms: u64 = SEND_DEADLINE_MS,
+        metrics: ?*metrics_mod.Metrics = null,
+    };
+
     fn init(
         allocator: std.mem.Allocator,
         bot_token: []const u8,
         api_base: []const u8,
+    ) !*TestDispatcher {
+        return initOpts(allocator, bot_token, api_base, .{});
+    }
+
+    fn initOpts(
+        allocator: std.mem.Allocator,
+        bot_token: []const u8,
+        api_base: []const u8,
+        opts: InitOpts,
     ) !*TestDispatcher {
         const self = try allocator.create(TestDispatcher);
         errdefer allocator.destroy(self);
@@ -748,6 +842,8 @@ const TestDispatcher = struct {
             .allocator = allocator,
             .io = testing.io,
             .stop = &self.stop,
+            .send_deadline_ms = opts.send_deadline_ms,
+            .metrics = opts.metrics,
         };
         self.thread = try std.Thread.spawn(.{}, dispatcherThread, .{args});
         return self;
@@ -887,6 +983,82 @@ test "dispatcher retries once after server closes connection; exactly 2 attempts
     try testing.expectEqual(@as(u32, 2), attempt_count.load(.acquire));
 }
 
+test "silent-drop: mute peer send fails at the deadline; retry recovers" {
+    // First connection reads the request and never replies. The poll-gate
+    // must fail the attempt fast; the fresh-connection retry against the healthy
+    // peer must deliver. (Mechanism under test = poll(fd, POLL.IN, deadline),
+    // NOT cancelation.)
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
+    var server = try addr.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+
+    var url_buf: [64]u8 = undefined;
+    const api_base = std.fmt.bufPrint(&url_buf, "http://127.0.0.2:{d}", .{
+        boundPort(&server),
+    }) catch unreachable;
+
+    var accept1_ms = std.atomic.Value(i64).init(0);
+    var accept2_ms = std.atomic.Value(i64).init(0);
+    const Ctx = struct {
+        server: *std.Io.net.Server,
+        accept1_ms: *std.atomic.Value(i64),
+        accept2_ms: *std.atomic.Value(i64),
+    };
+    const ctx = Ctx{ .server = &server, .accept1_ms = &accept1_ms, .accept2_ms = &accept2_ms };
+    const srv_thread = try std.Thread.spawn(.{}, struct {
+        fn run(c: Ctx) void {
+            const io = testing.io;
+            // Mute peer: accept, read the request head, never reply. The socket
+            // stays open until this thread exits — no RST, no EOF.
+            var c1 = c.server.accept(io) catch return;
+            c.accept1_ms.store(rt.nowMs(io), .release);
+            var rbuf1: [4096]u8 = undefined;
+            var rd1 = c1.reader(io, &rbuf1);
+            _ = rd1.interface.takeDelimiterInclusive('\n') catch {};
+
+            // Healthy on retry: reply normally.
+            var c2 = c.server.accept(io) catch {
+                c1.close(io);
+                return;
+            };
+            c.accept2_ms.store(rt.nowMs(io), .release);
+            var rbuf2: [4096]u8 = undefined;
+            var rd2 = c2.reader(io, &rbuf2);
+            _ = rd2.interface.takeDelimiterInclusive('\n') catch {};
+            var wbuf: [256]u8 = undefined;
+            var wr = c2.writer(io, &wbuf);
+            wr.interface.writeAll(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
+                    "Content-Length: 15\r\n\r\n{\"ok\":true}\r\n\r\n",
+            ) catch {};
+            wr.interface.flush() catch {};
+            c2.close(io);
+            c1.close(io);
+        }
+    }.run, .{ctx});
+
+    var m = metrics_mod.Metrics{};
+    const d = try TestDispatcher.initOpts(testing.allocator, "TOK", api_base, .{
+        .send_deadline_ms = 500,
+        .metrics = &m,
+    });
+    defer d.deinit();
+
+    try pushCall(&d.queue, "sendMessage", "{\"chat_id\":1,\"text\":\"td20\"}");
+
+    srv_thread.join();
+
+    // The retry happened, and it happened at deadline speed: the gap between the
+    // mute accept and the healthy accept covers the 500 ms deadline plus the
+    // ~200 ms retry sleep, with a generous ceiling far below any kernel
+    // retransmission timeout.
+    const gap = accept2_ms.load(.acquire) - accept1_ms.load(.acquire);
+    try testing.expect(gap >= 500);
+    try testing.expect(gap < 5000);
+    try testing.expectEqual(@as(u64, 1), m.dispatch_timeouts_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.api_call_retries_total.load(.monotonic));
+}
+
 test "inter-attempt retry delay is bounded below" {
     // The dispatcher sleeps between a failed send and its single retry. This
     // test records the wall-clock at each server accept and asserts the gap
@@ -1019,13 +1191,13 @@ test "parseRetryAfter reads, defaults, and clamps" {
 /// populate `parts` with slices of each part's raw content (headers + body).
 /// Returns the number of parts found (at most parts.len).
 fn splitMultipart(body: []const u8, boundary: []const u8, parts: [][]const u8) usize {
-    const delim = std.fmt.allocPrint(testing.allocator, "--{s}", .{boundary}) catch return 0;
+    const delim = testing.allocator.print("--{s}", .{boundary}) catch return 0;
     defer testing.allocator.free(delim);
 
     var found: usize = 0;
     var pos: usize = 0;
     while (pos < body.len and found < parts.len) {
-        const start = std.mem.indexOf(u8, body[pos..], delim) orelse break;
+        const start = std.mem.find(u8, body[pos..], delim) orelse break;
         const abs_start = pos + start;
         const after_delim = abs_start + delim.len;
         if (after_delim >= body.len) break;
@@ -1033,7 +1205,7 @@ fn splitMultipart(body: []const u8, boundary: []const u8, parts: [][]const u8) u
 
         // Skip the \r\n immediately after the delimiter line
         const content_start = after_delim + 2;
-        const next = std.mem.indexOf(u8, body[content_start..], delim) orelse {
+        const next = std.mem.find(u8, body[content_start..], delim) orelse {
             pos = after_delim;
             continue;
         };
@@ -1081,8 +1253,8 @@ test "multipart and json bodies are encoded correctly on the wire" {
         try testing.expect(n >= 1);
         var found_file = false;
         for (raw_parts[0..n]) |part| {
-            if (std.mem.indexOf(u8, part, "img.jpg") != null) {
-                try testing.expect(std.mem.indexOf(u8, part, "\xff\xd8\xff") != null);
+            if (std.mem.find(u8, part, "img.jpg") != null) {
+                try testing.expect(std.mem.find(u8, part, "\xff\xd8\xff") != null);
                 found_file = true;
             }
         }
@@ -1134,9 +1306,9 @@ test "multipart and json bodies are encoded correctly on the wire" {
         var found_caption = false;
         var found_file = false;
         for (raw_parts[0..n]) |part| {
-            if (std.mem.indexOf(u8, part, "caption") != null and
-                std.mem.indexOf(u8, part, "My caption") != null) found_caption = true;
-            if (std.mem.indexOf(u8, part, "pic.jpg") != null) found_file = true;
+            if (std.mem.find(u8, part, "caption") != null and
+                std.mem.find(u8, part, "My caption") != null) found_caption = true;
+            if (std.mem.find(u8, part, "pic.jpg") != null) found_file = true;
         }
         try testing.expect(found_caption);
         try testing.expect(found_file);
@@ -1214,8 +1386,7 @@ test "send real Telegram message via dispatcher" {
     const d = try TestDispatcher.init(testing.allocator, token, "https://api.telegram.org");
     defer d.deinit();
 
-    const body = try std.fmt.allocPrint(
-        testing.allocator,
+    const body = try testing.allocator.print(
         "{{\"chat_id\":{d},\"text\":\"zora dispatcher live test.\"}}",
         .{chat_id},
     );
@@ -1499,7 +1670,7 @@ test "api_calls counts ok after a retry, failed after both attempts fail, and ea
 
         try pushCall(&dq, "sendMessage", "{\"chat_id\":1,\"text\":\"x\"}");
         var waited: u64 = 0;
-        while (waited < 4_000 and m.api_calls[@intFromEnum(metrics_mod.CallOutcome.ok)].load(.monotonic) == 0) {
+        while (waited < 4_000 and m.api_calls[@backingInt(metrics_mod.CallOutcome.ok)].load(.monotonic) == 0) {
             rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
             waited += 20;
         }
@@ -1508,8 +1679,8 @@ test "api_calls counts ok after a retry, failed after both attempts fail, and ea
         disp.join();
         srv_thread.join();
 
-        try testing.expectEqual(@as(u64, 1), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.ok)].load(.monotonic));
-        try testing.expectEqual(@as(u64, 0), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.failed)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 1), m.api_calls[@backingInt(metrics_mod.CallOutcome.ok)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), m.api_calls[@backingInt(metrics_mod.CallOutcome.failed)].load(.monotonic));
         try testing.expectEqual(@as(u64, 1), m.api_call_retries_total.load(.monotonic));
     }
 
@@ -1543,7 +1714,7 @@ test "api_calls counts ok after a retry, failed after both attempts fail, and ea
 
         try pushCall(&dq, "sendMessage", "{\"chat_id\":1,\"text\":\"x\"}");
         var waited: u64 = 0;
-        while (waited < 4_000 and m.api_calls[@intFromEnum(metrics_mod.CallOutcome.failed)].load(.monotonic) == 0) {
+        while (waited < 4_000 and m.api_calls[@backingInt(metrics_mod.CallOutcome.failed)].load(.monotonic) == 0) {
             rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
             waited += 20;
         }
@@ -1552,8 +1723,8 @@ test "api_calls counts ok after a retry, failed after both attempts fail, and ea
         disp.join();
         srv_thread.join();
 
-        try testing.expectEqual(@as(u64, 1), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.failed)].load(.monotonic));
-        try testing.expectEqual(@as(u64, 0), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.ok)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 1), m.api_calls[@backingInt(metrics_mod.CallOutcome.failed)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), m.api_calls[@backingInt(metrics_mod.CallOutcome.ok)].load(.monotonic));
         try testing.expectEqual(@as(u64, 1), m.api_call_retries_total.load(.monotonic));
     }
 }

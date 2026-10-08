@@ -998,7 +998,7 @@ test "workflow counters: received and rejected by reason" {
     try testing.expectEqual(@as(u16, 400), try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, "{not json}"));
 
     try testing.expectEqual(@as(u64, 1), m.updates_received_total.load(.monotonic));
-    try testing.expectEqual(@as(u64, 2), m.updates_rejected[@intFromEnum(metrics_mod.RejectReason.forbidden)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@intFromEnum(metrics_mod.RejectReason.oversize)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@intFromEnum(metrics_mod.RejectReason.malformed)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), m.updates_rejected[@backingInt(metrics_mod.RejectReason.forbidden)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@backingInt(metrics_mod.RejectReason.oversize)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@backingInt(metrics_mod.RejectReason.malformed)].load(.monotonic));
 }

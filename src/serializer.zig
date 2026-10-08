@@ -262,7 +262,7 @@ fn appendFloat(
     try appendChecked(buf, allocator, s, max_size);
     // Ensure at least one decimal indicator so JSON parsers don't
     // re-parse it as an integer on the way back.
-    const has_point = std.mem.indexOfAny(u8, s, ".eEnN") != null;
+    const has_point = std.mem.findAny(u8, s, ".eEnN") != null;
     if (!has_point) try appendChecked(buf, allocator, ".0", max_size);
 }
 
@@ -414,7 +414,7 @@ test "scalar values round-trip through JSON" {
         const json = try luaTableToJson(lua, -1, testing.allocator);
         defer testing.allocator.free(json);
         lua.pop(1);
-        try testing.expect(std.mem.indexOfAny(u8, json, ".eE") != null);
+        try testing.expect(std.mem.findAny(u8, json, ".eE") != null);
         try jsonToLuaTable(lua, json, testing.allocator);
         try testing.expect(!lua.isInteger(-1));
         try testing.expectApproxEqRel(@as(f64, 3.14), try lua.toNumber(-1), 1e-9);

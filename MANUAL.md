@@ -32,7 +32,7 @@ the startup log mark the current contracts.
 
 | Requirement | Version |
 |---|---|
-| Zig | 0.16.0 |
+| Zig | 0.17.0 |
 | Linux | x86_64, kernel ≥ 5.x (inotify) |
 | FreeBSD | x86_64, 14+ (kqueue) |
 
@@ -785,15 +785,11 @@ between scrapes.
 | `zora_coroutines_inflight` | gauge | Lua coroutines parked on I/O across all workers |
 | `zora_coroutines_reaped_total` | counter | Coroutines dropped at `WORKFLOW_DEADLINE_MS` |
 | `zora_tracked_send_failures_total` | counter | Tracked sends that failed or lacked a `message_id` |
+| `zora_dispatch_timeouts_total` | counter | Sends abandoned at the dispatcher's per-attempt poll-gate deadline (30 s); a rising rate means a middlebox is dropping idle keep-alive connections |
 | `zora_response_oversize_total` | counter | API replies dropped for exceeding the response ceiling |
 | `zora_worker_queue_depth{worker}` | gauge | Updates waiting in each worker queue, one series per worker |
 | `zora_dispatcher_queue_depth` | gauge | API calls waiting in the dispatcher queue |
 | `zora_build_info{release,branch}` | gauge | Build identity; the value is always `1` |
-
-A ready-made Grafana dashboard covering every metric above ships at
-`docs/grafana/zora-dashboard.json` (Grafana 11.x). Import it and pick your
-Prometheus datasource when prompted. `docs/grafana/check-dashboard.sh` checks
-the dashboard still covers every metric this build exposes.
 
 The `route_overflow` and `route_drop` counters record where the
 `hash(user_id) % worker_count` affinity relaxes under load — see
