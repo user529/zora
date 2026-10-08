@@ -111,7 +111,7 @@ pub fn parseParams(s: []const u8) error{BadParams}!ArgonParams {
             saw_algo = true;
             continue;
         }
-        const eq = std.mem.indexOfScalar(u8, field, '=') orelse return error.BadParams;
+        const eq = std.mem.findScalar(u8, field, '=') orelse return error.BadParams;
         const name = field[0..eq];
         const val = field[eq + 1 ..];
         if (std.mem.eql(u8, name, "t")) {

@@ -183,9 +183,9 @@ test "GET /metrics serves the exposition; other requests get 404" {
 
     const ok = try rawRequest(bound, "GET /metrics HTTP/1.1\r\nHost: t\r\nAccept: */*\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200 OK"));
-    try testing.expect(std.mem.indexOf(u8, ok, "text/plain; version=0.0.4") != null);
-    try testing.expect(std.mem.indexOf(u8, ok, "zora_updates_received_total 5\n") != null);
-    try testing.expect(std.mem.indexOf(u8, ok, "zora_build_info{release=\"9\",branch=\"test\"} 1\n") != null);
+    try testing.expect(std.mem.find(u8, ok, "text/plain; version=0.0.4") != null);
+    try testing.expect(std.mem.find(u8, ok, "zora_updates_received_total 5\n") != null);
+    try testing.expect(std.mem.find(u8, ok, "zora_build_info{release=\"9\",branch=\"test\"} 1\n") != null);
 
     const wrong_path = try rawRequest(bound, "GET /other HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.startsWith(u8, wrong_path, "HTTP/1.1 404 Not Found"));

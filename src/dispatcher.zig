@@ -122,8 +122,7 @@ fn parkAt(dq: *delay.DelayQueue, ready: i64, call: types.ApiCall, args: Dispatch
 pub fn dispatcherThread(args: DispatcherArgs) void {
     var client = std.http.Client{ .allocator = args.allocator, .io = args.io };
     defer client.deinit();
-    const url_prefix = std.fmt.allocPrint(
-        args.allocator,
+    const url_prefix = args.allocator.print(
         "{s}/bot{s}/",
         .{ args.api_base, args.bot_token },
     ) catch unreachable;
@@ -234,7 +233,7 @@ fn sendWithRetry(ctx: *const SendCtx, call: types.ApiCall, retry_after_out: *u64
 /// Returns error.TelegramApiError so sendWithRetry triggers the single retry.
 fn checkStatus(status: std.http.Status, method: []const u8) !void {
     if (status.class() != .success) {
-        log.warn("Telegram API returned HTTP {d} for {s}", .{ @intFromEnum(status), method });
+        log.warn("Telegram API returned HTTP {d} for {s}", .{ @backingInt(status), method });
         return error.TelegramApiError;
     }
 }
@@ -270,7 +269,7 @@ fn send(ctx: *const SendCtx, call: types.ApiCall, retry_after_out: *u64) !void {
     const allocator = ctx.allocator;
     const metrics = ctx.metrics;
 
-    const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ ctx.url_prefix, call.method });
+    const url = try allocator.print("{s}{s}", .{ ctx.url_prefix, call.method });
     defer allocator.free(url);
     const uri = try std.Uri.parse(url);
 
@@ -311,7 +310,7 @@ fn send(ctx: *const SendCtx, call: types.ApiCall, retry_after_out: *u64) !void {
             const mb = try buildMultipartBody(io, parts, allocator);
             mp_bytes = mb.bytes;
             log.debug("→ {s} (multipart, {d} parts)", .{ call.method, parts.len });
-            const ct = try std.fmt.allocPrint(allocator, "multipart/form-data; boundary={s}", .{mb.boundary[0..mb.blen]});
+            const ct = try allocator.print("multipart/form-data; boundary={s}", .{mb.boundary[0..mb.blen]});
             mp_ct = ct;
             var r = client.request(.POST, uri, .{
                 .keep_alive = true,
@@ -368,7 +367,7 @@ fn send(ctx: *const SendCtx, call: types.ApiCall, retry_after_out: *u64) !void {
 
     try checkStatus(status, call.method); // other non-2xx ⇒ retryable error
 
-    log.debug("← {d} {s}", .{ @intFromEnum(status), call.method });
+    log.debug("← {d} {s}", .{ @backingInt(status), call.method });
 
     // Tracked sends: extract message_id from the captured body.
     if (call.tracking) |tracking| {
@@ -429,15 +428,14 @@ fn buildMultipartBody(
 
         if (p.filename) |fname| {
             try validateHeaderValue(fname);
-            const hdr = try std.fmt.allocPrint(
-                allocator,
+            const hdr = try allocator.print(
                 "Content-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: application/octet-stream\r\n",
                 .{ p.name, fname },
             );
             defer allocator.free(hdr);
             try buf.appendSlice(allocator, hdr);
         } else {
-            const hdr = try std.fmt.allocPrint(allocator, "Content-Disposition: form-data; name=\"{s}\"\r\n", .{p.name});
+            const hdr = try allocator.print("Content-Disposition: form-data; name=\"{s}\"\r\n", .{p.name});
             defer allocator.free(hdr);
             try buf.appendSlice(allocator, hdr);
         }
@@ -760,7 +758,7 @@ fn parseHttpRequest(r: *std.Io.Reader, allocator: std.mem.Allocator) !?MockServe
     }
 
     // Parse request line: "POST /path HTTP/1.1"
-    const rl_end = std.mem.indexOf(u8, header_section.items, "\r\n") orelse return null;
+    const rl_end = std.mem.find(u8, header_section.items, "\r\n") orelse return null;
     var parts = std.mem.splitScalar(u8, header_section.items[0..rl_end], ' ');
     _ = parts.next() orelse return null; // skip method
     const raw_path = parts.next() orelse return null;
@@ -772,7 +770,7 @@ fn parseHttpRequest(r: *std.Io.Reader, allocator: std.mem.Allocator) !?MockServe
     var content_type_raw: []const u8 = "";
     var lines = std.mem.splitSequence(u8, header_section.items[rl_end + 2 ..], "\r\n");
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const name = line[0..colon];
         const value = std.mem.trim(u8, line[colon + 1 ..], " ");
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
@@ -1193,13 +1191,13 @@ test "parseRetryAfter reads, defaults, and clamps" {
 /// populate `parts` with slices of each part's raw content (headers + body).
 /// Returns the number of parts found (at most parts.len).
 fn splitMultipart(body: []const u8, boundary: []const u8, parts: [][]const u8) usize {
-    const delim = std.fmt.allocPrint(testing.allocator, "--{s}", .{boundary}) catch return 0;
+    const delim = testing.allocator.print("--{s}", .{boundary}) catch return 0;
     defer testing.allocator.free(delim);
 
     var found: usize = 0;
     var pos: usize = 0;
     while (pos < body.len and found < parts.len) {
-        const start = std.mem.indexOf(u8, body[pos..], delim) orelse break;
+        const start = std.mem.find(u8, body[pos..], delim) orelse break;
         const abs_start = pos + start;
         const after_delim = abs_start + delim.len;
         if (after_delim >= body.len) break;
@@ -1207,7 +1205,7 @@ fn splitMultipart(body: []const u8, boundary: []const u8, parts: [][]const u8) u
 
         // Skip the \r\n immediately after the delimiter line
         const content_start = after_delim + 2;
-        const next = std.mem.indexOf(u8, body[content_start..], delim) orelse {
+        const next = std.mem.find(u8, body[content_start..], delim) orelse {
             pos = after_delim;
             continue;
         };
@@ -1255,8 +1253,8 @@ test "multipart and json bodies are encoded correctly on the wire" {
         try testing.expect(n >= 1);
         var found_file = false;
         for (raw_parts[0..n]) |part| {
-            if (std.mem.indexOf(u8, part, "img.jpg") != null) {
-                try testing.expect(std.mem.indexOf(u8, part, "\xff\xd8\xff") != null);
+            if (std.mem.find(u8, part, "img.jpg") != null) {
+                try testing.expect(std.mem.find(u8, part, "\xff\xd8\xff") != null);
                 found_file = true;
             }
         }
@@ -1308,9 +1306,9 @@ test "multipart and json bodies are encoded correctly on the wire" {
         var found_caption = false;
         var found_file = false;
         for (raw_parts[0..n]) |part| {
-            if (std.mem.indexOf(u8, part, "caption") != null and
-                std.mem.indexOf(u8, part, "My caption") != null) found_caption = true;
-            if (std.mem.indexOf(u8, part, "pic.jpg") != null) found_file = true;
+            if (std.mem.find(u8, part, "caption") != null and
+                std.mem.find(u8, part, "My caption") != null) found_caption = true;
+            if (std.mem.find(u8, part, "pic.jpg") != null) found_file = true;
         }
         try testing.expect(found_caption);
         try testing.expect(found_file);
@@ -1388,8 +1386,7 @@ test "send real Telegram message via dispatcher" {
     const d = try TestDispatcher.init(testing.allocator, token, "https://api.telegram.org");
     defer d.deinit();
 
-    const body = try std.fmt.allocPrint(
-        testing.allocator,
+    const body = try testing.allocator.print(
         "{{\"chat_id\":{d},\"text\":\"zora dispatcher live test.\"}}",
         .{chat_id},
     );
@@ -1673,7 +1670,7 @@ test "api_calls counts ok after a retry, failed after both attempts fail, and ea
 
         try pushCall(&dq, "sendMessage", "{\"chat_id\":1,\"text\":\"x\"}");
         var waited: u64 = 0;
-        while (waited < 4_000 and m.api_calls[@intFromEnum(metrics_mod.CallOutcome.ok)].load(.monotonic) == 0) {
+        while (waited < 4_000 and m.api_calls[@backingInt(metrics_mod.CallOutcome.ok)].load(.monotonic) == 0) {
             rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
             waited += 20;
         }
@@ -1682,8 +1679,8 @@ test "api_calls counts ok after a retry, failed after both attempts fail, and ea
         disp.join();
         srv_thread.join();
 
-        try testing.expectEqual(@as(u64, 1), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.ok)].load(.monotonic));
-        try testing.expectEqual(@as(u64, 0), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.failed)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 1), m.api_calls[@backingInt(metrics_mod.CallOutcome.ok)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), m.api_calls[@backingInt(metrics_mod.CallOutcome.failed)].load(.monotonic));
         try testing.expectEqual(@as(u64, 1), m.api_call_retries_total.load(.monotonic));
     }
 
@@ -1717,7 +1714,7 @@ test "api_calls counts ok after a retry, failed after both attempts fail, and ea
 
         try pushCall(&dq, "sendMessage", "{\"chat_id\":1,\"text\":\"x\"}");
         var waited: u64 = 0;
-        while (waited < 4_000 and m.api_calls[@intFromEnum(metrics_mod.CallOutcome.failed)].load(.monotonic) == 0) {
+        while (waited < 4_000 and m.api_calls[@backingInt(metrics_mod.CallOutcome.failed)].load(.monotonic) == 0) {
             rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
             waited += 20;
         }
@@ -1726,8 +1723,8 @@ test "api_calls counts ok after a retry, failed after both attempts fail, and ea
         disp.join();
         srv_thread.join();
 
-        try testing.expectEqual(@as(u64, 1), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.failed)].load(.monotonic));
-        try testing.expectEqual(@as(u64, 0), m.api_calls[@intFromEnum(metrics_mod.CallOutcome.ok)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 1), m.api_calls[@backingInt(metrics_mod.CallOutcome.failed)].load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), m.api_calls[@backingInt(metrics_mod.CallOutcome.ok)].load(.monotonic));
         try testing.expectEqual(@as(u64, 1), m.api_call_retries_total.load(.monotonic));
     }
 }

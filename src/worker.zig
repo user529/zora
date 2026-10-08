@@ -909,7 +909,7 @@ const TestCtx = struct {
 
 // luaTableToJson key order is unspecified — assert ApiCall bodies by substring.
 fn bodyHas(body: []const u8, needle: []const u8) bool {
-    return std.mem.indexOf(u8, body, needle) != null;
+    return std.mem.find(u8, body, needle) != null;
 }
 
 test "single update → dispatcher receives expected action" {
@@ -1162,7 +1162,7 @@ test "bot.http_request → coroutine yields, io_pool runs, result resumes, actio
     const stub = try spawnStub(HTTP_OK);
     defer stub.thread.join();
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  local resp = bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
         \\  return {{ {{ method="reply", params={{ status=resp.status }} }} }}
@@ -1183,7 +1183,7 @@ test "bot.http_request → coroutine yields, io_pool runs, result resumes, actio
     defer types.freeApiCall(action, testing.allocator);
 
     try testing.expectEqualStrings("reply", action.method);
-    try testing.expect(std.mem.indexOf(u8, action.payload.json, "\"status\":200") != null);
+    try testing.expect(std.mem.find(u8, action.payload.json, "\"status\":200") != null);
 }
 
 test "bot.http_request exposes response headers with case-insensitive lookup" {
@@ -1198,7 +1198,7 @@ test "bot.http_request exposes response headers with case-insensitive lookup" {
     const stub = try spawnStub(HTTP_OK);
     defer stub.thread.join();
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  local resp = bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
         \\  local lower = resp.headers["content-type"]
@@ -1226,10 +1226,10 @@ test "bot.http_request exposes response headers with case-insensitive lookup" {
     defer types.freeApiCall(action, testing.allocator);
 
     const j = action.payload.json;
-    try testing.expect(std.mem.indexOf(u8, j, "\"lower\":\"application/json\"") != null);
-    try testing.expect(std.mem.indexOf(u8, j, "\"exact\":\"application/json\"") != null);
-    try testing.expect(std.mem.indexOf(u8, j, "\"upper\":\"application/json\"") != null);
-    try testing.expect(std.mem.indexOf(u8, j, "\"verbatim\":\"yes\"") != null);
+    try testing.expect(std.mem.find(u8, j, "\"lower\":\"application/json\"") != null);
+    try testing.expect(std.mem.find(u8, j, "\"exact\":\"application/json\"") != null);
+    try testing.expect(std.mem.find(u8, j, "\"upper\":\"application/json\"") != null);
+    try testing.expect(std.mem.find(u8, j, "\"verbatim\":\"yes\"") != null);
 }
 
 test "slow coroutine parked; same worker processes fast update first" {
@@ -1260,7 +1260,7 @@ test "slow coroutine parked; same worker processes fast update first" {
     }.run, .{slow_srv});
     defer slow_thread.join();
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  if u.slow then
         \\    local r = bot.http_request{{ method="GET", url=u.url }}
@@ -1278,9 +1278,9 @@ test "slow coroutine parked; same worker processes fast update first" {
     defer ctx.deinit(t);
     rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
-    const slow_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{slow_port});
+    const slow_url = try testing.allocator.print("http://127.0.0.2:{d}/", .{slow_port});
     defer testing.allocator.free(slow_url);
-    const slow_body = try std.fmt.allocPrint(testing.allocator, "{{\"slow\":true,\"url\":\"{s}\"}}", .{slow_url});
+    const slow_body = try testing.allocator.print("{{\"slow\":true,\"url\":\"{s}\"}}", .{slow_url});
     defer testing.allocator.free(slow_body);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, slow_body));
@@ -1308,7 +1308,7 @@ test "state written in a resumed (post-I/O) segment commits and is read by a lat
     const stub = try spawnStub(HTTP_OK);
     defer stub.thread.join();
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  if u.write then
         \\    local resp = bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
@@ -1345,7 +1345,7 @@ test "state written in a resumed (post-I/O) segment commits and is read by a lat
         const a = ctx.output_q.pop();
         defer types.freeApiCall(a, testing.allocator);
         try testing.expectEqualStrings("read", a.method);
-        try testing.expect(std.mem.indexOf(u8, a.payload.json, "\"status\":200") != null);
+        try testing.expect(std.mem.find(u8, a.payload.json, "\"status\":200") != null);
     }
 }
 
@@ -1363,7 +1363,7 @@ test "write before a yield survives a later-segment failure (per-segment durabil
     const stub = try spawnStub(HTTP_OK);
     defer stub.thread.join();
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  bot.set_user_state(11, {{ pre = "kept" }})
         \\  bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
@@ -1389,7 +1389,7 @@ test "write before a yield survives a later-segment failure (per-segment durabil
     while (waited < 5_000) : (waited += 10) {
         const data = try ctx.db.getUserState(11);
         defer testing.allocator.free(data);
-        if (std.mem.indexOf(u8, data, "\"pre\":\"kept\"") != null) {
+        if (std.mem.find(u8, data, "\"pre\":\"kept\"") != null) {
             found = true;
             break;
         }
@@ -1446,7 +1446,7 @@ test "resume-path COMMIT failure drops the segment's actions and its state write
     }.run, .{srv});
     defer stub_thread.join();
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
         \\  bot.set_user_state(33, {{ post = "dropped" }})
@@ -1493,7 +1493,7 @@ test "resume-path COMMIT failure drops the segment's actions and its state write
     rt.sleepNs(testing.io, 50 * std.time.ns_per_ms);
     const data = try ctx.db.getUserState(33);
     defer testing.allocator.free(data);
-    try testing.expect(std.mem.indexOf(u8, data, "\"post\":\"dropped\"") == null);
+    try testing.expect(std.mem.find(u8, data, "\"post\":\"dropped\"") == null);
 }
 
 test "no transaction is held across a yield — a second writer is not blocked" {
@@ -1507,7 +1507,7 @@ test "no transaction is held across a yield — a second writer is not blocked" 
     var hang = try spawnHangStub();
     const port = boundPort(hang.server);
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  if u.park then
         \\    bot.http_request{{ method="GET", url=u.url }}
@@ -1519,9 +1519,9 @@ test "no transaction is held across a yield — a second writer is not blocked" 
     , .{});
     defer testing.allocator.free(lua_src);
 
-    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
+    const url = try testing.allocator.print("http://127.0.0.2:{d}/", .{port});
     defer testing.allocator.free(url);
-    const park_body = try std.fmt.allocPrint(testing.allocator, "{{\"park\":true,\"url\":\"{s}\"}}", .{url});
+    const park_body = try testing.allocator.print("{{\"park\":true,\"url\":\"{s}\"}}", .{url});
     defer testing.allocator.free(park_body);
 
     var ctx: AsyncTestCtx = undefined;
@@ -1547,7 +1547,7 @@ test "no transaction is held across a yield — a second writer is not blocked" 
     }
     const data = try ctx.db.getUserState(22);
     defer testing.allocator.free(data);
-    try testing.expect(std.mem.indexOf(u8, data, "\"w\":\"done\"") != null);
+    try testing.expect(std.mem.find(u8, data, "\"w\":\"done\"") != null);
 
     // Unblock the io_pool HTTP thread before deinit joins the pool.
     hang.deinit();
@@ -1563,7 +1563,7 @@ test "two sequential bot.http_request calls → two yields, correct order" {
     defer stub_a.thread.join();
     defer stub_b.thread.join();
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  local r1 = bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
         \\  local r2 = bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
@@ -1585,8 +1585,8 @@ test "two sequential bot.http_request calls → two yields, correct order" {
     defer types.freeApiCall(action, testing.allocator);
 
     try testing.expectEqualStrings("done", action.method);
-    try testing.expect(std.mem.indexOf(u8, action.payload.json, "\"s1\":200") != null);
-    try testing.expect(std.mem.indexOf(u8, action.payload.json, "\"s2\":201") != null);
+    try testing.expect(std.mem.find(u8, action.payload.json, "\"s1\":200") != null);
+    try testing.expect(std.mem.find(u8, action.payload.json, "\"s2\":201") != null);
 }
 
 test "re-yield against a populated inflight map — 8 coroutines, two yields each" {
@@ -1606,7 +1606,7 @@ test "re-yield against a populated inflight map — 8 coroutines, two yields eac
     defer stub_a.thread.join();
     defer stub_b.thread.join();
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  local a = bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
         \\  local b = bot.http_request{{ method="GET", url="http://127.0.0.2:{d}/" }}
@@ -1630,8 +1630,8 @@ test "re-yield against a populated inflight map — 8 coroutines, two yields eac
         const action = ctx.output_q.pop();
         defer types.freeApiCall(action, testing.allocator);
         try testing.expectEqualStrings("done", action.method);
-        try testing.expect(std.mem.indexOf(u8, action.payload.json, "\"s1\":200") != null);
-        try testing.expect(std.mem.indexOf(u8, action.payload.json, "\"s2\":201") != null);
+        try testing.expect(std.mem.find(u8, action.payload.json, "\"s1\":200") != null);
+        try testing.expect(std.mem.find(u8, action.payload.json, "\"s2\":201") != null);
     }
 }
 
@@ -1645,7 +1645,7 @@ test "coroutine past WORKFLOW_DEADLINE_MS is reaped; worker continues" {
     var hang = try spawnHangStub();
     const port = boundPort(hang.server);
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  if u.hang then
         \\    bot.http_request{{ method="GET", url=u.url }}
@@ -1656,9 +1656,9 @@ test "coroutine past WORKFLOW_DEADLINE_MS is reaped; worker continues" {
     , .{});
     defer testing.allocator.free(lua_src);
 
-    const hang_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
+    const hang_url = try testing.allocator.print("http://127.0.0.2:{d}/", .{port});
     defer testing.allocator.free(hang_url);
-    const hang_body = try std.fmt.allocPrint(testing.allocator, "{{\"hang\":true,\"url\":\"{s}\"}}", .{hang_url});
+    const hang_body = try testing.allocator.print("{{\"hang\":true,\"url\":\"{s}\"}}", .{hang_url});
     defer testing.allocator.free(hang_body);
 
     var ctx: AsyncTestCtx = undefined;
@@ -1747,7 +1747,7 @@ test "at inflight ceiling new updates are not dequeued until a slot frees" {
     }.run, .{ srv, HTTP_OK });
     defer slow_t.join();
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  if u.block then
         \\    bot.http_request{{ method="GET", url=u.url }}
@@ -1764,9 +1764,9 @@ test "at inflight ceiling new updates are not dequeued until a slot frees" {
     defer ctx.deinit(t);
     rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
-    const block_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
+    const block_url = try testing.allocator.print("http://127.0.0.2:{d}/", .{port});
     defer testing.allocator.free(block_url);
-    const block_body = try std.fmt.allocPrint(testing.allocator, "{{\"block\":true,\"url\":\"{s}\"}}", .{block_url});
+    const block_body = try testing.allocator.print("{{\"block\":true,\"url\":\"{s}\"}}", .{block_url});
     defer testing.allocator.free(block_body);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, block_body));
@@ -1802,16 +1802,16 @@ test "bot.exec and bot.shell deliver results to coroutine" {
     const exec_action = ctx.output_q.pop();
     defer types.freeApiCall(exec_action, testing.allocator);
     try testing.expectEqualStrings("exec_result", exec_action.method);
-    try testing.expect(std.mem.indexOf(u8, exec_action.payload.json, "\"code\":0") != null);
-    try testing.expect(std.mem.indexOf(u8, exec_action.payload.json, "execok") != null);
+    try testing.expect(std.mem.find(u8, exec_action.payload.json, "\"code\":0") != null);
+    try testing.expect(std.mem.find(u8, exec_action.payload.json, "execok") != null);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"kind\":\"shell\"}"));
     try testing.expect(waitQueue(&ctx.output_q, 1, 3_000));
     const shell_action = ctx.output_q.pop();
     defer types.freeApiCall(shell_action, testing.allocator);
     try testing.expectEqualStrings("shell_result", shell_action.method);
-    try testing.expect(std.mem.indexOf(u8, shell_action.payload.json, "\"code\":0") != null);
-    try testing.expect(std.mem.indexOf(u8, shell_action.payload.json, "shellok") != null);
+    try testing.expect(std.mem.find(u8, shell_action.payload.json, "\"code\":0") != null);
+    try testing.expect(std.mem.find(u8, shell_action.payload.json, "shellok") != null);
 }
 
 test "hot-reload while coroutine is parked; parked completes on old rules; next update uses new rules" {
@@ -1819,7 +1819,7 @@ test "hot-reload while coroutine is parked; parked completes on old rules; next 
     const stub = try spawnStub(HTTP_OK);
     defer stub.thread.join();
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  if u.fetch then
         \\    local r = bot.http_request{{ method="GET", url=u.url }}
@@ -1836,9 +1836,9 @@ test "hot-reload while coroutine is parked; parked completes on old rules; next 
     defer ctx.deinit(t);
     rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
-    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
+    const url = try testing.allocator.print("http://127.0.0.2:{d}/", .{stub.port});
     defer testing.allocator.free(url);
-    const fetch_body = try std.fmt.allocPrint(testing.allocator, "{{\"fetch\":true,\"url\":\"{s}\"}}", .{url});
+    const fetch_body = try testing.allocator.print("{{\"fetch\":true,\"url\":\"{s}\"}}", .{url});
     defer testing.allocator.free(fetch_body);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, fetch_body));
@@ -1870,7 +1870,7 @@ test "Lua error in resumed step → workflow aborted, slot freed, worker continu
     const stub = try spawnStub(HTTP_OK);
     defer stub.thread.join();
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  if u.crash then
         \\    local _ = bot.http_request{{ method="GET", url=u.url }}
@@ -1887,9 +1887,9 @@ test "Lua error in resumed step → workflow aborted, slot freed, worker continu
     defer ctx.deinit(t);
     rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
-    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{stub.port});
+    const url = try testing.allocator.print("http://127.0.0.2:{d}/", .{stub.port});
     defer testing.allocator.free(url);
-    const crash_body = try std.fmt.allocPrint(testing.allocator, "{{\"crash\":true,\"url\":\"{s}\"}}", .{url});
+    const crash_body = try testing.allocator.print("{{\"crash\":true,\"url\":\"{s}\"}}", .{url});
     defer testing.allocator.free(crash_body);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, crash_body));
@@ -1928,7 +1928,7 @@ test "bot.send_message → worker parks, dispatcher result → coroutine gets me
     try testing.expectEqualStrings("sendMessage", tracked_call.method);
     try testing.expect(tracked_call.tracking != null);
     const tracking = tracked_call.tracking.?;
-    try testing.expect(std.mem.indexOf(u8, tracked_call.payload.json, "\"chat_id\":1") != null);
+    try testing.expect(std.mem.find(u8, tracked_call.payload.json, "\"chat_id\":1") != null);
 
     // Simulate dispatcher success: push IoResult{ .send = .{ message_id = 42 } }.
     try ctx.result_q.push(.{
@@ -1942,7 +1942,7 @@ test "bot.send_message → worker parks, dispatcher result → coroutine gets me
     defer types.freeApiCall(confirm, testing.allocator);
 
     try testing.expectEqualStrings("confirm", confirm.method);
-    try testing.expect(std.mem.indexOf(u8, confirm.payload.json, "\"mid\":42") != null);
+    try testing.expect(std.mem.find(u8, confirm.payload.json, "\"mid\":42") != null);
 }
 
 test "bot.send_message mid used in editMessageText — end-to-end chain" {
@@ -1975,8 +1975,8 @@ test "bot.send_message mid used in editMessageText — end-to-end chain" {
     const edit_call = ctx.output_q.pop();
     defer types.freeApiCall(edit_call, testing.allocator);
     try testing.expectEqualStrings("editMessageText", edit_call.method);
-    try testing.expect(std.mem.indexOf(u8, edit_call.payload.json, "\"message_id\":99") != null);
-    try testing.expect(std.mem.indexOf(u8, edit_call.payload.json, "\"text\":\"done\"") != null);
+    try testing.expect(std.mem.find(u8, edit_call.payload.json, "\"message_id\":99") != null);
+    try testing.expect(std.mem.find(u8, edit_call.payload.json, "\"text\":\"done\"") != null);
 }
 
 test "tracked send failure → Lua error raised; pcall catches; worker continues" {
@@ -2012,7 +2012,7 @@ test "tracked send failure → Lua error raised; pcall catches; worker continues
     const handled = ctx.output_q.pop();
     defer types.freeApiCall(handled, testing.allocator);
     try testing.expectEqualStrings("error_handled", handled.method);
-    try testing.expect(std.mem.indexOf(u8, handled.payload.json, "HTTP 500") != null);
+    try testing.expect(std.mem.find(u8, handled.payload.json, "HTTP 500") != null);
 
     // Worker continues: process another update.
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":4}"));
@@ -2078,7 +2078,7 @@ test "coroutines_inflight / coroutines_reaped_total metrics" {
     var silent = try spawnHangStub();
     const port = boundPort(silent.server);
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  bot.http_request{{ method="GET", url=u.url }}
         \\  return {{}}
@@ -2086,9 +2086,9 @@ test "coroutines_inflight / coroutines_reaped_total metrics" {
     , .{});
     defer testing.allocator.free(lua_src);
 
-    const hang_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
+    const hang_url = try testing.allocator.print("http://127.0.0.2:{d}/", .{port});
     defer testing.allocator.free(hang_url);
-    const body = try std.fmt.allocPrint(testing.allocator, "{{\"url\":\"{s}\"}}", .{hang_url});
+    const body = try testing.allocator.print("{{\"url\":\"{s}\"}}", .{hang_url});
     defer testing.allocator.free(body);
 
     var ctx: AsyncTestCtx = undefined;
@@ -2153,7 +2153,7 @@ test "worker drains in-flight coroutines on stop; exits cleanly" {
     var silent = try spawnHangStub();
     const port = boundPort(silent.server);
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  bot.http_request{{ method="GET", url=u.url }}
         \\  return {{}}
@@ -2161,9 +2161,9 @@ test "worker drains in-flight coroutines on stop; exits cleanly" {
     , .{});
     defer testing.allocator.free(lua_src);
 
-    const hang_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
+    const hang_url = try testing.allocator.print("http://127.0.0.2:{d}/", .{port});
     defer testing.allocator.free(hang_url);
-    const body = try std.fmt.allocPrint(testing.allocator, "{{\"url\":\"{s}\"}}", .{hang_url});
+    const body = try testing.allocator.print("{{\"url\":\"{s}\"}}", .{hang_url});
     defer testing.allocator.free(body);
 
     var ctx: AsyncTestCtx = undefined;
@@ -2226,7 +2226,7 @@ test "state commits after .done and rolls back on Lua error" {
 
         const data = try ctx.db.getUserState(1);
         defer testing.allocator.free(data);
-        try testing.expect(std.mem.indexOf(u8, data, "\"x\":42") != null);
+        try testing.expect(std.mem.find(u8, data, "\"x\":42") != null);
     }
     // A handler that writes state then errors: the write is rolled back.
     {
@@ -2251,8 +2251,8 @@ test "state commits after .done and rolls back on Lua error" {
         const data = try ctx.db.getUserState(1);
         defer testing.allocator.free(data);
         // Rollback must have reverted the {x:99} write.
-        try testing.expect(std.mem.indexOf(u8, data, "\"x\":99") == null);
-        try testing.expect(std.mem.indexOf(u8, data, "\"x\":0") != null);
+        try testing.expect(std.mem.find(u8, data, "\"x\":99") == null);
+        try testing.expect(std.mem.find(u8, data, "\"x\":0") != null);
     }
 }
 
@@ -2260,7 +2260,7 @@ test "worker exits within WORKFLOW_DEADLINE_MS + 200ms with non-responding stub"
     var silent = try spawnHangStub();
     const port = boundPort(silent.server);
 
-    const lua_src = try std.fmt.allocPrint(testing.allocator,
+    const lua_src = try testing.allocator.print(
         \\function on_message(u)
         \\  bot.http_request{{ method="GET", url=u.url }}
         \\  return {{}}
@@ -2268,9 +2268,9 @@ test "worker exits within WORKFLOW_DEADLINE_MS + 200ms with non-responding stub"
     , .{});
     defer testing.allocator.free(lua_src);
 
-    const hang_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.2:{d}/", .{port});
+    const hang_url = try testing.allocator.print("http://127.0.0.2:{d}/", .{port});
     defer testing.allocator.free(hang_url);
-    const body = try std.fmt.allocPrint(testing.allocator, "{{\"url\":\"{s}\"}}", .{hang_url});
+    const body = try testing.allocator.print("{{\"url\":\"{s}\"}}", .{hang_url});
     defer testing.allocator.free(body);
 
     var ctx: AsyncTestCtx = undefined;
@@ -2474,16 +2474,16 @@ test "updates_processed counts ok and lua_error final outcomes" {
     // Wait for both outcomes (up to 4 s).
     var waited: u64 = 0;
     while (waited < 4_000 and
-        (m.updates_processed[@intFromEnum(metrics_mod.ProcessOutcome.ok)].load(.monotonic) < 1 or
-         m.updates_processed[@intFromEnum(metrics_mod.ProcessOutcome.lua_error)].load(.monotonic) < 1))
+        (m.updates_processed[@backingInt(metrics_mod.ProcessOutcome.ok)].load(.monotonic) < 1 or
+         m.updates_processed[@backingInt(metrics_mod.ProcessOutcome.lua_error)].load(.monotonic) < 1))
     {
         rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
         waited += 20;
     }
     ctx.deinit(t);
 
-    try testing.expectEqual(@as(u64, 1), m.updates_processed[@intFromEnum(metrics_mod.ProcessOutcome.ok)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.updates_processed[@intFromEnum(metrics_mod.ProcessOutcome.lua_error)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_processed[@backingInt(metrics_mod.ProcessOutcome.ok)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_processed[@backingInt(metrics_mod.ProcessOutcome.lua_error)].load(.monotonic));
 }
 
 test "rules_reloads counts hot-reload success and failure" {
@@ -2509,7 +2509,7 @@ test "rules_reloads counts hot-reload success and failure" {
     _ = ctx.reload_ver.fetchAdd(1, .release);
     try ctx.input_q.push(.{ .body = try testing.allocator.dupe(u8, UPDATE), .user_id = 1 });
     var waited: u64 = 0;
-    while (waited < 4_000 and m.rules_reloads[@intFromEnum(metrics_mod.ReloadOutcome.ok)].load(.monotonic) == 0) {
+    while (waited < 4_000 and m.rules_reloads[@backingInt(metrics_mod.ReloadOutcome.ok)].load(.monotonic) == 0) {
         rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
         waited += 20;
     }
@@ -2519,12 +2519,12 @@ test "rules_reloads counts hot-reload success and failure" {
     _ = ctx.reload_ver.fetchAdd(1, .release);
     try ctx.input_q.push(.{ .body = try testing.allocator.dupe(u8, UPDATE), .user_id = 1 });
     waited = 0;
-    while (waited < 4_000 and m.rules_reloads[@intFromEnum(metrics_mod.ReloadOutcome.failed)].load(.monotonic) == 0) {
+    while (waited < 4_000 and m.rules_reloads[@backingInt(metrics_mod.ReloadOutcome.failed)].load(.monotonic) == 0) {
         rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
         waited += 20;
     }
     ctx.deinit(t);
 
-    try testing.expectEqual(@as(u64, 1), m.rules_reloads[@intFromEnum(metrics_mod.ReloadOutcome.ok)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.rules_reloads[@intFromEnum(metrics_mod.ReloadOutcome.failed)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.rules_reloads[@backingInt(metrics_mod.ReloadOutcome.ok)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.rules_reloads[@backingInt(metrics_mod.ReloadOutcome.failed)].load(.monotonic));
 }

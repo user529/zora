@@ -295,7 +295,7 @@ pub fn schemaWatcherThread(args: SchemaWatcherArgs) void {
         .context = &ctx,
         .on_write = onSchemaChange,
     };
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux => watcher.watchInotify(target),
         .freebsd => watcher.watchKqueue(target),
         // Linux and FreeBSD are the only supported targets; fail the build

@@ -60,8 +60,8 @@ fn harden() void {
     std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch
         log.warn("setrlimit(RLIMIT_CORE, 0) failed — core dumps not suppressed", .{});
 
-    if (builtin.os.tag == .linux) {
-        const rc = std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
+    if (builtin.target.os.tag == .linux) {
+        const rc = std.os.linux.prctl(@backingInt(std.os.linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
         if (rc != 0) log.warn("prctl(PR_SET_DUMPABLE, 0) failed", .{});
     }
 }

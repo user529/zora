@@ -801,7 +801,7 @@ test "an immediate transaction commits and rolls back" {
     {
         const data = try store.getUserState(1);
         defer store.allocator.free(data);
-        try testing.expect(std.mem.indexOf(u8, data, "\"x\":42") != null);
+        try testing.expect(std.mem.find(u8, data, "\"x\":42") != null);
     }
 
     // rollback reverts the write to the last committed value.
@@ -812,8 +812,8 @@ test "an immediate transaction commits and rolls back" {
     {
         const data = try store.getUserState(2);
         defer store.allocator.free(data);
-        try testing.expect(std.mem.indexOf(u8, data, "\"x\":0") != null);
-        try testing.expect(std.mem.indexOf(u8, data, "\"x\":99") == null);
+        try testing.expect(std.mem.find(u8, data, "\"x\":0") != null);
+        try testing.expect(std.mem.find(u8, data, "\"x\":99") == null);
     }
 }
 
@@ -1284,7 +1284,7 @@ test "on-disk bytes are not the plaintext in encrypted mode" {
     const raw = c.sqlite3_column_blob(stmt, 0);
     const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
     const bytes = @as([*]const u8, @ptrCast(raw))[0..len];
-    try testing.expect(std.mem.indexOf(u8, bytes, "swordfish") == null);
+    try testing.expect(std.mem.find(u8, bytes, "swordfish") == null);
     try testing.expect(len >= state_crypto.overhead);
 }
 

@@ -724,15 +724,15 @@ test "return-list — six method shapes parse to ApiCalls" {
     // Bodies carry the expected fields (key order from luaTableToJson is
     // unspecified — assert by substring, or parse for the {chat_id,text} shape).
     try expectMsgBody(actions[0].payload.json, 1, "m"); // sendMessage chat_id+text
-    try testing.expect(std.mem.indexOf(u8, actions[1].payload.json, "\"parse_mode\":\"HTML\"") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[1].payload.json, "\"message_id\":2") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[2].payload.json, "\"callback_data\":\"d\"") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[2].payload.json, "\"inline_keyboard\"") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[3].payload.json, "\"callback_query_id\":\"cq\"") != null);
+    try testing.expect(std.mem.find(u8, actions[1].payload.json, "\"parse_mode\":\"HTML\"") != null);
+    try testing.expect(std.mem.find(u8, actions[1].payload.json, "\"message_id\":2") != null);
+    try testing.expect(std.mem.find(u8, actions[2].payload.json, "\"callback_data\":\"d\"") != null);
+    try testing.expect(std.mem.find(u8, actions[2].payload.json, "\"inline_keyboard\"") != null);
+    try testing.expect(std.mem.find(u8, actions[3].payload.json, "\"callback_query_id\":\"cq\"") != null);
     // deleteMessage carries chat_id and message_id (no text field).
-    try testing.expect(std.mem.indexOf(u8, actions[4].payload.json, "\"chat_id\":1") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[4].payload.json, "\"message_id\":2") != null);
-    try testing.expect(std.mem.indexOf(u8, actions[5].payload.json, "\"chat_id\":1") != null);
+    try testing.expect(std.mem.find(u8, actions[4].payload.json, "\"chat_id\":1") != null);
+    try testing.expect(std.mem.find(u8, actions[4].payload.json, "\"message_id\":2") != null);
+    try testing.expect(std.mem.find(u8, actions[5].payload.json, "\"chat_id\":1") != null);
 }
 
 test "bot.emit calls precede the return-list, in call order" {
@@ -1030,8 +1030,8 @@ test "startHandler dispatches on_schedule with payload and id" {
             }
             try testing.expectEqual(@as(usize, 1), actions.len);
             try testing.expectEqualStrings("noteId", actions[0].method);
-            try testing.expect(std.mem.indexOf(u8, actions[0].payload.json, "\"got\":77") != null);
-            try testing.expect(std.mem.indexOf(u8, actions[0].payload.json, "\"n\":5") != null);
+            try testing.expect(std.mem.find(u8, actions[0].payload.json, "\"got\":77") != null);
+            try testing.expect(std.mem.find(u8, actions[0].payload.json, "\"n\":5") != null);
         },
         else => return error.UnexpectedOutcome,
     }

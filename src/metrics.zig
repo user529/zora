@@ -9,7 +9,7 @@ const queue_mod = @import("queue.zig");
 const types = @import("types.zig");
 
 // Label enums for the workflow counters. Each labeled counter is a fixed
-// array of atomics indexed by @intFromEnum — one slot per label value, no
+// array of atomics indexed by @backingInt — one slot per label value, no
 // allocation, no locking.
 pub const RejectReason = enum { forbidden, oversize, malformed };
 pub const ProcessOutcome = enum { ok, lua_error };
@@ -55,19 +55,19 @@ pub const Metrics = struct {
     scheduler_jobs_fired_total: std.atomic.Value(u64) = .init(0),
 
     pub fn incReject(m: *Metrics, reason: RejectReason) void {
-        _ = m.updates_rejected[@intFromEnum(reason)].fetchAdd(1, .monotonic);
+        _ = m.updates_rejected[@backingInt(reason)].fetchAdd(1, .monotonic);
     }
 
     pub fn incProcessed(m: *Metrics, outcome: ProcessOutcome) void {
-        _ = m.updates_processed[@intFromEnum(outcome)].fetchAdd(1, .monotonic);
+        _ = m.updates_processed[@backingInt(outcome)].fetchAdd(1, .monotonic);
     }
 
     pub fn incApiCall(m: *Metrics, outcome: CallOutcome) void {
-        _ = m.api_calls[@intFromEnum(outcome)].fetchAdd(1, .monotonic);
+        _ = m.api_calls[@backingInt(outcome)].fetchAdd(1, .monotonic);
     }
 
     pub fn incReload(m: *Metrics, outcome: ReloadOutcome) void {
-        _ = m.rules_reloads[@intFromEnum(outcome)].fetchAdd(1, .monotonic);
+        _ = m.rules_reloads[@backingInt(outcome)].fetchAdd(1, .monotonic);
     }
 };
 
@@ -89,7 +89,7 @@ fn gaugeLine(w: *std.Io.Writer, comptime name: []const u8, comptime help: []cons
     try w.print("# HELP " ++ name ++ " " ++ help ++ "\n# TYPE " ++ name ++ " gauge\n" ++ name ++ " {d}\n", .{value});
 }
 
-/// One line per label value: `name{label="tag"} count`, indexed by @intFromEnum
+/// One line per label value: `name{label="tag"} count`, indexed by @backingInt
 /// like the counter arrays themselves.
 fn labeledCounterLines(
     w: *std.Io.Writer,
@@ -188,14 +188,14 @@ test "workflow counters default to zero and increment through the helpers" {
     m.incApiCall(.failed);
     m.incReload(.ok);
 
-    try testing.expectEqual(@as(u64, 2), m.updates_rejected[@intFromEnum(RejectReason.forbidden)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 0), m.updates_rejected[@intFromEnum(RejectReason.oversize)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@intFromEnum(RejectReason.malformed)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.updates_processed[@intFromEnum(ProcessOutcome.ok)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.updates_processed[@intFromEnum(ProcessOutcome.lua_error)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 0), m.api_calls[@intFromEnum(CallOutcome.ok)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.api_calls[@intFromEnum(CallOutcome.failed)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.rules_reloads[@intFromEnum(ReloadOutcome.ok)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), m.updates_rejected[@backingInt(RejectReason.forbidden)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.updates_rejected[@backingInt(RejectReason.oversize)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@backingInt(RejectReason.malformed)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_processed[@backingInt(ProcessOutcome.ok)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_processed[@backingInt(ProcessOutcome.lua_error)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.api_calls[@backingInt(CallOutcome.ok)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.api_calls[@backingInt(CallOutcome.failed)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.rules_reloads[@backingInt(ReloadOutcome.ok)].load(.monotonic));
 }
 
 test "renderPrometheus emits every metric with HELP/TYPE and current values" {
@@ -243,22 +243,22 @@ test "renderPrometheus emits every metric with HELP/TYPE and current values" {
         "zora_build_info",
     };
     for (names) |n| {
-        try testing.expect(std.mem.indexOf(u8, out, n) != null);
+        try testing.expect(std.mem.find(u8, out, n) != null);
         var type_buf: [96]u8 = undefined;
         const type_line = try std.fmt.bufPrint(&type_buf, "# TYPE {s} ", .{n});
-        try testing.expect(std.mem.indexOf(u8, out, type_line) != null);
+        try testing.expect(std.mem.find(u8, out, type_line) != null);
     }
 
     // Values and labels round-trip.
-    try testing.expect(std.mem.indexOf(u8, out, "zora_io_jobs_total 3\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "zora_updates_received_total 7\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "zora_updates_rejected_total{reason=\"malformed\"} 1\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "zora_updates_rejected_total{reason=\"forbidden\"} 0\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "zora_updates_processed_total{outcome=\"lua_error\"} 1\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "zora_api_calls_total{outcome=\"ok\"} 1\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "zora_throttle_delay_depth 2\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "zora_worker_queue_depth{worker=\"0\"} 1\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "zora_build_info{release=\"42\",branch=\"testbranch\"} 1\n") != null);
+    try testing.expect(std.mem.find(u8, out, "zora_io_jobs_total 3\n") != null);
+    try testing.expect(std.mem.find(u8, out, "zora_updates_received_total 7\n") != null);
+    try testing.expect(std.mem.find(u8, out, "zora_updates_rejected_total{reason=\"malformed\"} 1\n") != null);
+    try testing.expect(std.mem.find(u8, out, "zora_updates_rejected_total{reason=\"forbidden\"} 0\n") != null);
+    try testing.expect(std.mem.find(u8, out, "zora_updates_processed_total{outcome=\"lua_error\"} 1\n") != null);
+    try testing.expect(std.mem.find(u8, out, "zora_api_calls_total{outcome=\"ok\"} 1\n") != null);
+    try testing.expect(std.mem.find(u8, out, "zora_throttle_delay_depth 2\n") != null);
+    try testing.expect(std.mem.find(u8, out, "zora_worker_queue_depth{worker=\"0\"} 1\n") != null);
+    try testing.expect(std.mem.find(u8, out, "zora_build_info{release=\"42\",branch=\"testbranch\"} 1\n") != null);
     // dispatcher_queue == null → its gauge is omitted entirely.
-    try testing.expect(std.mem.indexOf(u8, out, "zora_dispatcher_queue_depth") == null);
+    try testing.expect(std.mem.find(u8, out, "zora_dispatcher_queue_depth") == null);
 }

@@ -142,7 +142,7 @@ test "schedulerThread claims a due job and enqueues it round-robin" {
     defer testing.allocator.free(item.?.body);
     try testing.expectEqual(types.WorkKind.schedule, item.?.kind);
     try testing.expect(item.?.schedule_id != null);
-    try testing.expect(std.mem.indexOf(u8, item.?.body, "\"hi\":1") != null);
+    try testing.expect(std.mem.find(u8, item.?.body, "\"hi\":1") != null);
 
     stop.store(true, .release);
     sched.wakeUp();
@@ -220,7 +220,7 @@ test "schedulerThread re-claims a job whose lease has expired (at-least-once)" {
     try testing.expect(item != null);
     defer testing.allocator.free(item.?.body);
     try testing.expectEqual(types.WorkKind.schedule, item.?.kind);
-    try testing.expect(std.mem.indexOf(u8, item.?.body, "\"job\":7") != null);
+    try testing.expect(std.mem.find(u8, item.?.body, "\"job\":7") != null);
 
     stop.store(true, .release);
     sched.wakeUp();
