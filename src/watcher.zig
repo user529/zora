@@ -1,23 +1,23 @@
-/// watcher.zig — kernel-native file watcher (inotify / kqueue / poll).
-///
-/// Generic watch primitives (`WatchTarget`, `watchInotify`, `watchKqueue`,
-/// `watchPoll`) fire a caller-supplied callback on file change; tg_schema.zig
-/// reuses them to watch the API schema.  The rules-reload helpers on top
-/// (`reload_version`, `WatcherArgs`, `watcherThread`) bump a global counter so
-/// workers reload rules.lua.
-///
-/// Public API:
-///   reload_version          — global atomic u64, starts at 0.
-///   WatcherArgs             — arguments for watcherThread.
-///   watcherThread(args)     — entry point for the dedicated watcher thread.
-///                             Dispatches to the kernel-native implementation at
-///                             compile time:
-///                               Linux   → inotify (CLOSE_WRITE | MOVED_TO)
-///                               FreeBSD → kqueue  (EVFILT_VNODE)
-///                               other   → poll    (stat() every 500ms, dev fallback)
-///
-/// Workers read reload_version with .acquire; the watcher writes with .release.
-/// The ordering guarantee is provided by std.atomic.Value(u64) — no torn reads.
+//! watcher.zig — kernel-native file watcher (inotify / kqueue / poll).
+//!
+//! Generic watch primitives (`WatchTarget`, `watchInotify`, `watchKqueue`,
+//! `watchPoll`) fire a caller-supplied callback on file change; tg_schema.zig
+//! reuses them to watch the API schema.  The rules-reload helpers on top
+//! (`reload_version`, `WatcherArgs`, `watcherThread`) bump a global counter so
+//! workers reload rules.lua.
+//!
+//! Public API:
+//!   reload_version          — global atomic u64, starts at 0.
+//!   WatcherArgs             — arguments for watcherThread.
+//!   watcherThread(args)     — entry point for the dedicated watcher thread.
+//!                             Dispatches to the kernel-native implementation at
+//!                             compile time:
+//!                               Linux   → inotify (CLOSE_WRITE | MOVED_TO)
+//!                               FreeBSD → kqueue  (EVFILT_VNODE)
+//!                               other   → poll    (stat() every 500ms, dev fallback)
+//!
+//! Workers read reload_version with .acquire; the watcher bumps it with
+//! .release.
 
 const std     = @import("std");
 const builtin = @import("builtin");
@@ -38,9 +38,12 @@ pub var reload_version = std.atomic.Value(u64).init(0);
 // ---------------------------------------------------------------------------
 
 pub const WatcherArgs = struct {
-    /// Path to the Lua rules file to watch.
+    /// Path to the Lua rules file to watch. Owned by the watcher thread, which
+    /// frees it with `allocator` if it returns. The caller allocates it before
+    /// the spawn: the thread runs detached and may outlive the caller's copy,
+    /// so it must never read memory the caller frees.
     rules_path: []const u8,
-    /// Allocator used by the watcher thread.
+    /// Allocator that owns `rules_path`.
     /// Must remain valid for the lifetime of the watcher thread.
     allocator: std.mem.Allocator,
     /// Runtime for the poll fallback's sleep and stat (unused on Linux/FreeBSD,
@@ -67,23 +70,16 @@ pub const WatchTarget = struct {
 // Public: watcher thread entry point
 // ---------------------------------------------------------------------------
 
-/// Run the file watcher for the path in `args.rules_path`.  Never returns
-/// under normal operation.  Intended to be run as a dedicated `std.Thread`.
+/// Run the file watcher for the path in `args.rules_path`, taking ownership
+/// of it.  Never returns under normal operation.  Intended to be run as a
+/// dedicated `std.Thread`.
 pub fn watcherThread(args: WatcherArgs) void {
-    // Duplicate so the caller can free its copy any time after spawning.
-    // The defer below never executes — the function loops forever.
-    const owned = args.allocator.dupe(u8, args.rules_path) catch {
-        // Degraded-but-running: the process keeps serving with workers on the
-        // rules already loaded; only hot-reload is lost. Same severity as the
-        // file-deleted notice below, which is likewise "feature off, bot fine".
-        log.warn("watcherThread: OOM duplicating rules path — hot-reload disabled, workers keep current rules", .{});
-        return;
-    };
-    defer args.allocator.free(owned);
+    // Reached only if the kernel watcher fails to start or stops on an error.
+    defer args.allocator.free(args.rules_path);
     switch (builtin.target.os.tag) {
-        .linux   => watcherInotify(owned, &reload_version),
-        .freebsd => watcherKqueue(owned, &reload_version),
-        else     => watcherPoll(owned, &reload_version, args.io, 500, null),
+        .linux   => watcherInotify(args.rules_path, &reload_version),
+        .freebsd => watcherKqueue(args.rules_path, &reload_version),
+        else     => watcherPoll(args.rules_path, &reload_version, args.io, 500, null),
     }
 }
 
@@ -354,25 +350,6 @@ const LUA_V0 = "-- rules v0";
 const LUA_V1 = "-- rules v1";
 const LUA_V2 = "-- rules v2";
 
-test "bumpReloadCounter increments the counter it is handed" {
-    // Exercise our callback, not the stdlib atomic. bumpReloadCounter is the
-    // on_write handler wired into every watcher path; it must advance the
-    // counter passed as its opaque context by exactly one per call.
-    var counter = std.atomic.Value(u64).init(0);
-    bumpReloadCounter(&counter);
-    try testing.expectEqual(@as(u64, 1), counter.load(.acquire));
-    bumpReloadCounter(&counter);
-    bumpReloadCounter(&counter);
-    try testing.expectEqual(@as(u64, 3), counter.load(.acquire));
-
-    // The process-global reload_version starts at 0 and is the context the
-    // production wrappers hand to bumpReloadCounter. Confirm the same call
-    // advances it from a captured baseline (other tests may have run first).
-    const before = reload_version.load(.acquire);
-    bumpReloadCounter(&reload_version);
-    try testing.expectEqual(before + 1, reload_version.load(.acquire));
-}
-
 test "watcherPoll detects file write within 1500ms" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -414,44 +391,7 @@ test "watcherPoll detects file write within 1500ms" {
     try testing.expect(waitForCount(&counter, 1, 1400));
 }
 
-test "(Linux) inotify detects CLOSE_WRITE within 1000ms" {
-    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    {
-        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V0 });
-    }
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPathFile(testing.io, "rules.lua", &path_buf);
-    const path = path_buf[0..path_len];
-
-    var counter = std.atomic.Value(u64).init(0);
-
-    const Ctx = struct {
-        path: []const u8,
-        ctr:  *std.atomic.Value(u64),
-    };
-    const ctx = Ctx{ .path = path, .ctr = &counter };
-    const t = try std.Thread.spawn(.{}, struct {
-        fn run(c: Ctx) void { watcherInotify(c.path, c.ctr); }
-    }.run, .{ctx});
-    t.detach();
-
-    // Give the watcher time to set up the watch descriptor.
-    rt.sleepNs(rt.io(), 20 * std.time.ns_per_ms);
-
-    // Write valid Lua (CLOSE_WRITE fires on close).
-    {
-        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V1 });
-    }
-
-    try testing.expect(waitForCount(&counter, 1, 1000));
-}
-
-test "(Linux) 3 writes 200ms apart → counter >= 3 within 2s of last write" {
+test "(Linux) inotify: 3 writes 200ms apart (CLOSE_WRITE) → counter >= 3 within 2s" {
     if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
@@ -543,7 +483,7 @@ test "(Linux) file deletion fires the on_delete callback exactly once" {
     const path_len = try tmp.dir.realPathFile(testing.io, "rules.lua", &path_buf);
     const path = path_buf[0..path_len];
 
-    // Drive watchInotify directly so we can register an on_delete handler —
+    // Drive watchInotify directly to register an on_delete handler —
     // the production WatchTarget already exposes one; this asserts it fires.
     // Both callbacks share one opaque context (a Counters struct), so a delete
     // and a write land in distinct fields and cannot be confused.
@@ -593,43 +533,4 @@ test "(Linux) file deletion fires the on_delete callback exactly once" {
     rt.sleepNs(rt.io(), 100 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u64, 1), counters.deletes.load(.acquire));
     try testing.expectEqual(@as(u64, 0), counters.writes.load(.acquire));
-}
-
-test "(Linux) watcherThread returns when the path dupe fails — no reload bump" {
-    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    {
-        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V0 });
-    }
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPathFile(testing.io, "rules.lua", &path_buf);
-    const path = path_buf[0..path_len];
-
-    // A failing allocator (zero allowed allocations) makes watcherThread's
-    // rules-path dupe fail; it must log and return rather than establish a
-    // watch. watcherThread targets the process-global reload_version, so we
-    // capture that baseline and assert no increment follows a file write.
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    const before = reload_version.load(.acquire);
-
-    const args = WatcherArgs{
-        .rules_path = path,
-        .allocator  = failing.allocator(),
-        .io         = testing.io,
-    };
-    // watcherThread returns immediately on the OOM path, so a plain join is
-    // safe — it never reaches the blocking inotify loop.
-    const t = try std.Thread.spawn(.{}, watcherThread, .{args});
-    t.join();
-
-    // No watch was ever set up; a write must not bump the counter.
-    {
-        try tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = LUA_V1 });
-    }
-    rt.sleepNs(rt.io(), 200 * std.time.ns_per_ms);
-    try testing.expectEqual(before, reload_version.load(.acquire));
 }

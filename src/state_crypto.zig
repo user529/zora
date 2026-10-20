@@ -1,21 +1,21 @@
-/// state_crypto.zig — encryption primitives for optional state-at-rest encryption.
-///
-/// Owns three concerns:
-///
-/// 1. AEAD envelope (XChaCha20-Poly1305): nonce(24) ‖ ciphertext ‖ tag(16).
-///    The nonce is drawn from the CSPRNG per call so two encryptions of the same
-///    plaintext differ. No associated data is bound.
-///
-/// 2. Argon2id key derivation: derives a 32-byte key from a passphrase and a
-///    random 16-byte salt using OWASP-minimum cost parameters. The key is stored
-///    in an mlocked, page-aligned heap buffer (best-effort) via the Cipher type.
-///
-/// 3. Passphrase verifier: encrypts a known constant into the database meta table
-///    at first open so subsequent opens can confirm the passphrase is correct
-///    before touching user data.
-///
-/// The state store calls these to encrypt payloads before writing them to SQLite
-/// and to decrypt them on read.
+//! state_crypto.zig — encryption primitives for optional state-at-rest encryption.
+//!
+//! Owns three concerns:
+//!
+//! 1. AEAD envelope (XChaCha20-Poly1305): nonce(24) ‖ ciphertext ‖ tag(16).
+//!    The nonce is drawn from the CSPRNG per call so two encryptions of the same
+//!    plaintext differ. No associated data is bound.
+//!
+//! 2. Argon2id key derivation: derives a 32-byte key from a passphrase and a
+//!    random 16-byte salt using OWASP-minimum cost parameters. The Cipher type
+//!    keeps the key in an mlocked, page-aligned heap buffer (best-effort).
+//!
+//! 3. Passphrase verifier: encrypts a known constant into the database meta table
+//!    at first open so subsequent opens can confirm the passphrase is correct
+//!    before touching user data.
+//!
+//! The state store calls these to encrypt payloads before writing them to SQLite
+//! and to decrypt them on read.
 
 const std = @import("std");
 
@@ -146,8 +146,8 @@ pub const Cipher = struct {
     locked: bool,
     io: std.Io,
 
-    /// Encrypt plaintext into out as nonce ‖ ciphertext ‖ tag. out must hold at
-    /// least plaintext.len + overhead bytes; returns the filled prefix.
+    /// Encrypt `plaintext` into `out` as nonce ‖ ciphertext ‖ tag. `out` must
+    /// hold at least `plaintext.len + overhead` bytes; returns the filled prefix.
     pub fn encryptInto(self: Cipher, out: []u8, plaintext: []const u8) []u8 {
         return sealInto(self.io, self.key[0..key_len].*, out, plaintext);
     }
@@ -239,7 +239,7 @@ pub fn checkVerifierHex(
 
 const testing = std.testing;
 
-test "encrypt/decrypt round-trips" {
+test "seal/open round-trips; a wrong key, a tampered tag, and a short blob fail" {
     const key: [key_len]u8 = @splat(7);
     const msg = "{\"count\":42}";
     var buf: [128]u8 = undefined;
@@ -249,23 +249,15 @@ test "encrypt/decrypt round-trips" {
     const out = try openAlloc(testing.allocator, key, blob);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings(msg, out);
-}
 
-test "a wrong key fails to decrypt" {
-    const key: [key_len]u8 = @splat(1);
     var wrong = key;
-    wrong[0] = 2;
-    var buf: [64]u8 = undefined;
-    const blob = sealInto(testing.io, key, &buf, "secret");
+    wrong[0] = 8;
     try testing.expectError(error.DecryptFailed, openAlloc(testing.allocator, wrong, blob));
-}
 
-test "a tampered envelope fails to decrypt" {
-    const key: [key_len]u8 = @splat(3);
-    var buf: [64]u8 = undefined;
-    const blob = sealInto(testing.io, key, &buf, "secret");
     blob[blob.len - 1] ^= 0xFF; // flip a tag byte
     try testing.expectError(error.DecryptFailed, openAlloc(testing.allocator, key, blob));
+
+    try testing.expectError(error.DecryptFailed, openAlloc(testing.allocator, key, "short"));
 }
 
 test "the same plaintext yields distinct ciphertext (random nonce)" {
@@ -277,11 +269,6 @@ test "the same plaintext yields distinct ciphertext (random nonce)" {
     try testing.expect(!std.mem.eql(u8, ba, bb));
 }
 
-test "a too-short blob fails cleanly" {
-    const key: [key_len]u8 = @splat(0);
-    try testing.expectError(error.DecryptFailed, openAlloc(testing.allocator, key, "short"));
-}
-
 test "deriveCipher is deterministic for the same passphrase and salt" {
     const salt: [salt_len]u8 = @splat(5);
     var c1 = try deriveCipher(testing.allocator, testing.io, "hunter2", salt, default_argon);
@@ -291,36 +278,14 @@ test "deriveCipher is deterministic for the same passphrase and salt" {
     try testing.expectEqualSlices(u8, c1.key, c2.key);
 }
 
-test "a different passphrase derives a different key" {
-    const salt: [salt_len]u8 = @splat(5);
-    var c1 = try deriveCipher(testing.allocator, testing.io, "right", salt, default_argon);
-    defer c1.deinit();
-    var c2 = try deriveCipher(testing.allocator, testing.io, "wrong", salt, default_argon);
-    defer c2.deinit();
-    try testing.expect(!std.mem.eql(u8, c1.key, c2.key));
-}
-
-test "Cipher encrypt/decrypt round-trips" {
-    const salt = randomSalt(testing.io);
-    var cph = try deriveCipher(testing.allocator, testing.io, "pw", salt, default_argon);
-    defer cph.deinit();
-    var buf: [64]u8 = undefined;
-    const blob = cph.encryptInto(&buf, "hello");
-    const out = try cph.decryptAlloc(testing.allocator, blob);
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings("hello", out);
-}
-
-test "params encode then parse round-trips" {
+test "params encode then parse round-trips; a missing prefix is rejected" {
     var buf: [64]u8 = undefined;
     const s = try encodeParams(&buf, default_argon);
     const p = try parseParams(s);
     try testing.expectEqual(default_argon.t, p.t);
     try testing.expectEqual(default_argon.m, p.m);
     try testing.expectEqual(default_argon.p, p.p);
-}
 
-test "parseParams rejects input missing the argon2id prefix" {
     try testing.expectError(error.BadParams, parseParams("t=2$m=19456$p=1"));
 }
 

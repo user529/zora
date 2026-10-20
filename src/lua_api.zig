@@ -1,19 +1,12 @@
-/// lua_api.zig — Lua-callable functions registered as bot.*
-///
-/// Registers the following Lua globals when `register()` is called:
-///
-///   bot.get_user_state(user_id: integer) -> table
-///   bot.set_user_state(user_id: integer, data: table)
-///   bot.get_chat_state(chat_id: integer) -> table
-///   bot.set_chat_state(chat_id: integer, data: table)
-///   bot.get_global(key: string) -> string|nil
-///   bot.set_global(key: string, value: string)
-///   bot.log(level: string, message: string)
-///   bot.rules_api_version (integer, read-only by convention)
-///
-/// The ApiCtx pointer is stored in the Lua registry under "_zora_ctx" and
-/// retrieved by each C function.  It must remain live for the entire lifetime
-/// of the Lua state.
+//! lua_api.zig — Lua-callable functions registered as bot.*
+//!
+//! register() installs the `bot` table (state, scheduling, emit, tracked
+//! send, I/O, and string helpers; the `fns` table in register() is the full
+//! list), the `json` table, `bot.rules_api_version`, and the `tg` facade.
+//!
+//! register() stores the ApiCtx pointer in the Lua registry under "_zora_ctx",
+//! and each C function reads it back. It must remain live for the entire
+//! lifetime of the Lua state.
 
 const std = @import("std");
 const ziglua = @import("ziglua");
@@ -31,13 +24,12 @@ const Lua = ziglua.Lua;
 // ---------------------------------------------------------------------------
 
 /// Per-engine context stored in the Lua registry.
-/// The db allocator is used for state_store operations;
-/// the api allocator is used for temporary serializer buffers.
 pub const ApiCtx = struct {
     db: *state_store.StateStore,
-    /// Allocator for temporary allocations inside bot.* functions
-    /// (e.g., JSON intermediate buffers).  Must be an arena or GPA —
-    /// every allocation is freed before the C function returns.
+    /// Allocator for bot.* functions: temporary buffers, freed before the C
+    /// function returns, and the strings of a yielded I/O job or tracked send,
+    /// which the worker or the dispatcher frees later. Must be thread-safe:
+    /// the dispatcher frees on its own threads.
     allocator:      std.mem.Allocator,
     /// Runtime for blocking I/O (reading file-upload descriptors).
     io:             std.Io,
@@ -64,45 +56,14 @@ const HEADER_MT_KEY: [:0]const u8 = "zora.header_mt";
 // Coroutine I/O types — shared between lua_api, lua_engine, and worker
 // ---------------------------------------------------------------------------
 
-/// Heap-allocated copies of an IoJob's payload strings.
-/// The IoJob references these slices — they must outlive the io_pool job.
-/// Free with freeOwnedStrings when the coroutine finishes, errors, or is reaped.
-pub const OwnedStrings = union(enum) {
-    http: struct { method: []u8, url: []u8, headers: []std.http.Header, body: []u8 },
-    exec: struct { argv: [][]u8 },  // each element is a duped arg; the slice itself is also allocated
-    shell: struct { command: []u8 },
-    none,
-};
-
 /// Returned from startHandler/resumeHandler when the coroutine yields.
 pub const PendingJob = union(enum) {
-    /// Submitted to io_pool. owned_strings freed when coroutine finishes, errors, or is reaped.
-    io: struct { io_job: io_pool.IoJob, owned_strings: OwnedStrings },
+    /// Submitted to io_pool. The coroutine owns the job's payload strings and
+    /// frees them (io_pool.freeIoJob) when it finishes, errors, or is reaped.
+    io: io_pool.IoJob,
     /// Pushed to dispatcher_queue. Dispatcher takes ownership of ApiCall strings after push.
     tracked_send: types.ApiCall,
 };
-
-/// Free all heap-allocated strings in an OwnedStrings value.
-pub fn freeOwnedStrings(strings: OwnedStrings, allocator: std.mem.Allocator) void {
-    switch (strings) {
-        .http => |h| {
-            allocator.free(h.method);
-            allocator.free(h.url);
-            for (h.headers) |hdr| {
-                allocator.free(hdr.name);
-                allocator.free(hdr.value);
-            }
-            allocator.free(h.headers);
-            allocator.free(h.body);
-        },
-        .exec => |e| {
-            for (e.argv) |arg| allocator.free(arg);
-            allocator.free(e.argv);
-        },
-        .shell => |s| allocator.free(s.command),
-        .none  => {},
-    }
-}
 
 /// The tg.* ergonomic facade.  `tg.<method>{params}` is
 /// exactly `bot.emit{ method = "<method>", params = {params} }` — pure sugar;
@@ -175,8 +136,9 @@ pub fn register(lua: *Lua, ctx: *ApiCtx, rules_api_version: u32) void {
     lua.setField(-2, "encode");
     lua.setGlobal("json");
 
-    // Install an initial (empty) emit accumulator so the registry slot is
-    // always a table; callOnMessage replaces it per invocation.
+    // Install an initial (empty) emit accumulator for the main state, so a
+    // bot.emit in the rules' top-level code finds a table; each handler
+    // coroutine gets its own from startHandler.
     beginEmitBatch(lua);
 
     // Install the tg.* facade.  The snippet is a fixed constant — a failure
@@ -199,15 +161,6 @@ pub fn getCtx(lua: *Lua) *ApiCtx {
 // Public: buildApiCall — build an ApiCall from a Lua params table
 // ---------------------------------------------------------------------------
 
-/// Build an ApiCall from a Lua params table at stack index `params_idx`.
-/// Single scan: if any value is a file-descriptor table → multipart payload;
-/// otherwise → JSON payload. `method` is duped into the returned ApiCall.
-///
-/// File-descriptor tables:
-///   { __file = "/abs/path" }                      — read from disk
-///   { __file_bytes = "...", filename = "name" }   — inline bytes
-///
-/// Errors: error.FileTooLarge, error.MissingFilename, file-read errors, OOM.
 /// Read an integer `chat_id` from a Lua params table, if present. Leaves the
 /// stack balanced. Returns null when absent or non-integer.
 fn extractChatId(lua: *Lua, params_idx: i32) ?i64 {
@@ -218,6 +171,15 @@ fn extractChatId(lua: *Lua, params_idx: i32) ?i64 {
     return lua.toInteger(-1) catch null;
 }
 
+/// Build an ApiCall from a Lua params table at stack index `params_idx`.
+/// Single scan: if any value is a file-descriptor table → multipart payload;
+/// otherwise → JSON payload. `method` is duped into the returned ApiCall.
+///
+/// File-descriptor tables:
+///   { __file = "/abs/path" }                      — read from disk
+///   { __file_bytes = "...", filename = "name" }   — inline bytes
+///
+/// Errors: error.FileTooLarge, error.MissingFilename, file-read errors, OOM.
 pub fn buildApiCall(
     lua:        *Lua,
     params_idx: i32,
@@ -407,13 +369,16 @@ fn getStateImpl(
     comptime dbFn: fn (*state_store.StateStore, i64) anyerror![]u8,
     comptime errPrefix: []const u8,
 ) c_int {
+    // json is freed explicitly on both paths, never via defer: raiseErrorStr
+    // longjmps out of this frame and skips any defer.
     const json = dbFn(ctx.db, id) catch |err| {
         lua.raiseErrorStr(errPrefix ++ " db error: %s", .{@errorName(err).ptr});
     };
-    defer ctx.db.allocator.free(json);
     serializer.jsonToLuaTable(lua, json, ctx.allocator) catch |err| {
+        ctx.db.allocator.free(json);
         lua.raiseErrorStr(errPrefix ++ " deserialize error: %s", .{@errorName(err).ptr});
     };
+    ctx.db.allocator.free(json);
     return 1;
 }
 
@@ -426,14 +391,15 @@ fn setStateImpl(
 ) c_int {
     lua.checkType(2, .table);
 
+    // json is freed explicitly, never via defer: see getStateImpl.
     const json = serializer.luaTableToJson(lua, 2, ctx.allocator) catch |err| {
         lua.raiseErrorStr(errPrefix ++ " serialize error: %s", .{@errorName(err).ptr});
     };
-    defer ctx.allocator.free(json);
-
     dbFn(ctx.db, id, json) catch |err| {
+        ctx.allocator.free(json);
         lua.raiseErrorStr(errPrefix ++ " db error: %s", .{@errorName(err).ptr});
     };
+    ctx.allocator.free(json);
     return 0;
 }
 
@@ -640,13 +606,14 @@ fn botLog(state: ?*ziglua.LuaState) callconv(.c) c_int {
 // bot.emit — fire-and-forget API-call accumulator
 //
 // `bot.emit{ method = ..., params = {...} }` appends an API-call table to a
-// per-invocation accumulator held in the Lua registry.  lua_engine drains the
-// accumulator after on_message returns, dispatching the emitted calls in call
-// order, before the on_message return-list.
+// per-coroutine accumulator held in the Lua registry. lua_engine drains it
+// when the handler coroutine finishes, ahead of the handler's return-list;
+// the calls keep their emit order.
 // ---------------------------------------------------------------------------
 
 /// Install a fresh, empty emit accumulator keyed by the calling thread.
-/// Call once before each on_message resumeThread.
+/// startHandler calls it once per handler coroutine; register() calls it
+/// once for the main state.
 pub fn beginEmitBatch(lua: *Lua) void {
     _ = lua.pushThread();                       // key = this thread
     lua.newTable();                             // value = {}
@@ -795,138 +762,105 @@ fn validateHeaderValue(value: []const u8) HeaderError!void {
     }
 }
 
-/// Free an owned []http.Header slice (each name+value, then the slice).
-fn freeHeaderSlice(allocator: std.mem.Allocator, headers: []std.http.Header) void {
-    for (headers) |hdr| {
-        allocator.free(hdr.name);
-        allocator.free(hdr.value);
-    }
-    allocator.free(headers);
+const HttpArgError = error{
+    HeadersNotTable,
+    HeaderNotString,
+    InvalidHeaderName,
+    InvalidHeaderValue,
+    TooManyHeaders,
+    HeadersTooLarge,
+    OutOfMemory,
+};
+
+fn httpArgMessage(err: HttpArgError) [:0]const u8 {
+    return switch (err) {
+        error.HeadersNotTable => "headers must be a table",
+        error.HeaderNotString => "header name and value must be strings",
+        error.InvalidHeaderName => "invalid header name",
+        error.InvalidHeaderValue => "invalid header value",
+        error.TooManyHeaders => "too many headers (max 64)",
+        error.HeadersTooLarge => "headers too large (max 16 KB)",
+        error.OutOfMemory => "OOM",
+    };
 }
 
-/// Free a partially-built header list (used on the error unwinding paths).
-fn freeHeaderList(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(std.http.Header)) void {
-    for (list.items) |hdr| {
-        allocator.free(hdr.name);
-        allocator.free(hdr.value);
+/// Copy method, url, body, and the optional headers map at `headers_idx` into
+/// an owned IoJob. Each header is validated, at most 64 of them, 16 KB in
+/// all. This function only returns errors, never raises a Lua error, so its
+/// errdefers release every partial copy; the caller raises once.
+fn buildHttpJob(
+    lua: *Lua,
+    alloc: std.mem.Allocator,
+    method_raw: []const u8,
+    url_raw: []const u8,
+    body_raw: []const u8,
+    headers_idx: i32,
+) HttpArgError!io_pool.IoJob {
+    var hdr_list: std.ArrayListUnmanaged(std.http.Header) = .empty;
+    errdefer io_pool.freeHeaderList(alloc, &hdr_list);
+    switch (lua.typeOf(headers_idx)) {
+        // A string is the old, dropped form: reject it so the table contract
+        // is unambiguous.
+        .string => return error.HeadersNotTable,
+        .table => {
+            var total_bytes: usize = 0;
+            lua.pushNil();
+            while (lua.next(headers_idx)) {
+                defer lua.pop(1); // pop value, keep key for next()
+                if (lua.typeOf(-2) != .string or lua.typeOf(-1) != .string) return error.HeaderNotString;
+                const nm = lua.toString(-2) catch unreachable;
+                const vl = lua.toString(-1) catch unreachable;
+                validateHeaderName(nm) catch return error.InvalidHeaderName;
+                validateHeaderValue(vl) catch return error.InvalidHeaderValue;
+                if (hdr_list.items.len >= 64) return error.TooManyHeaders;
+                total_bytes += nm.len + vl.len;
+                if (total_bytes > 16 * 1024) return error.HeadersTooLarge;
+                const name = try alloc.dupe(u8, nm);
+                errdefer alloc.free(name);
+                const value = try alloc.dupe(u8, vl);
+                errdefer alloc.free(value);
+                try hdr_list.append(alloc, .{ .name = name, .value = value });
+            }
+        },
+        else => {},
     }
-    list.deinit(allocator);
+
+    const method = try alloc.dupe(u8, method_raw);
+    errdefer alloc.free(method);
+    const url = try alloc.dupe(u8, url_raw);
+    errdefer alloc.free(url);
+    const body = try alloc.dupe(u8, body_raw);
+    errdefer alloc.free(body);
+    return .{
+        .worker_id = 0, // filled in by lua_engine.processResume
+        .coro_id   = 0, // filled in by lua_engine.processResume
+        .payload = .{ .http_request = .{
+            .method  = method,
+            .url     = url,
+            .headers = try hdr_list.toOwnedSlice(alloc),
+            .body    = body,
+        }},
+    };
 }
 
 fn botHttpRequest(state: ?*ziglua.LuaState) callconv(.c) c_int {
     const lua: *Lua = @ptrCast(state.?);
     lua.checkType(1, .table);
     const ctx = getCtx(lua);
-    const alloc = ctx.allocator;
 
-    // Read method and url from the argument table.
+    // Read the fields first: checkString raises on a bad argument, before
+    // anything is allocated.
     _ = lua.getField(1, "method");
     const method_raw = lua.checkString(-1);
     _ = lua.getField(1, "url");
     const url_raw = lua.checkString(-1);
-
     _ = lua.getField(1, "body");
     const body_raw: []const u8 = if (lua.isString(-1)) lua.checkString(-1) else "";
-
-    // Read the optional headers map. A string (the old, dropped form) is now
-    // an error so the new table contract is unambiguous.
     _ = lua.getField(1, "headers");
-    const headers_idx = lua.getTop();
-    const htype = lua.typeOf(headers_idx);
-    if (htype == .string)
-        lua.raiseErrorStr("http_request: headers must be a table", .{});
 
-    // Validate, cap, and dupe each header into an owned []http.Header.
-    var hdr_list: std.ArrayListUnmanaged(std.http.Header) = .empty;
-    if (htype == .table) {
-        var total_bytes: usize = 0;
-        lua.pushNil();
-        while (lua.next(headers_idx)) {
-            // key at -2, value at -1
-            if (lua.typeOf(-2) != .string or lua.typeOf(-1) != .string) {
-                freeHeaderList(alloc, &hdr_list);
-                lua.raiseErrorStr("http_request: header name and value must be strings", .{});
-            }
-            const nm = lua.toString(-2) catch unreachable;
-            const vl = lua.toString(-1) catch unreachable;
-            validateHeaderName(nm) catch {
-                freeHeaderList(alloc, &hdr_list);
-                lua.raiseErrorStr("http_request: invalid header name", .{});
-            };
-            validateHeaderValue(vl) catch {
-                freeHeaderList(alloc, &hdr_list);
-                lua.raiseErrorStr("http_request: invalid header value", .{});
-            };
-            if (hdr_list.items.len >= 64) {
-                freeHeaderList(alloc, &hdr_list);
-                lua.raiseErrorStr("http_request: too many headers (max 64)", .{});
-            }
-            total_bytes += nm.len + vl.len;
-            if (total_bytes > 16 * 1024) {
-                freeHeaderList(alloc, &hdr_list);
-                lua.raiseErrorStr("http_request: headers too large (max 16 KB)", .{});
-            }
-            const nm_d = alloc.dupe(u8, nm) catch {
-                freeHeaderList(alloc, &hdr_list);
-                lua.raiseErrorStr("http_request: OOM", .{});
-            };
-            const vl_d = alloc.dupe(u8, vl) catch {
-                alloc.free(nm_d);
-                freeHeaderList(alloc, &hdr_list);
-                lua.raiseErrorStr("http_request: OOM", .{});
-            };
-            hdr_list.append(alloc, .{ .name = nm_d, .value = vl_d }) catch {
-                alloc.free(nm_d);
-                alloc.free(vl_d);
-                freeHeaderList(alloc, &hdr_list);
-                lua.raiseErrorStr("http_request: OOM", .{});
-            };
-            lua.pop(1); // pop value, keep key for next()
-        }
-    }
-    // toOwnedSlice failure leaves the list buffer intact, so freeHeaderList here is not a double-free.
-    const headers = hdr_list.toOwnedSlice(alloc) catch {
-        freeHeaderList(alloc, &hdr_list);
-        lua.raiseErrorStr("http_request: OOM", .{});
-    };
-
-    // Dupe the scalar payload strings. On OOM, also free the header slice.
-    const method = alloc.dupe(u8, method_raw) catch {
-        freeHeaderSlice(alloc, headers);
-        lua.raiseErrorStr("http_request: OOM", .{});
-    };
-    const url = alloc.dupe(u8, url_raw) catch {
-        alloc.free(method);
-        freeHeaderSlice(alloc, headers);
-        lua.raiseErrorStr("http_request: OOM", .{});
-    };
-    const body = alloc.dupe(u8, body_raw) catch {
-        alloc.free(method);
-        alloc.free(url);
-        freeHeaderSlice(alloc, headers);
-        lua.raiseErrorStr("http_request: OOM", .{});
-    };
-
-    const owned = OwnedStrings{ .http = .{
-        .method  = method,
-        .url     = url,
-        .headers = headers,
-        .body    = body,
-    }};
-
-    ctx.pending_job = .{ .io = .{
-        .io_job = io_pool.IoJob{
-            .worker_id   = 0,   // filled in by lua_engine.startHandler/resumeHandler
-            .coro_id     = 0,   // filled in by lua_engine.startHandler/resumeHandler
-            .payload = .{ .http_request = .{
-                .method  = method,
-                .url     = url,
-                .headers = headers,
-                .body    = body,
-            }},
-        },
-        .owned_strings = owned,
-    }};
+    const job = buildHttpJob(lua, ctx.allocator, method_raw, url_raw, body_raw, lua.getTop()) catch |err|
+        lua.raiseErrorStr("http_request: %s", .{httpArgMessage(err).ptr});
+    ctx.pending_job = .{ .io = job };
 
     lua.yield(0); // noreturn — parks here; worker pushes 1 result before next resumeThread
 }
@@ -961,15 +895,9 @@ fn botExec(state: ?*ziglua.LuaState) callconv(.c) c_int {
         lua.pop(1);
     }
 
-    // Build a const-pointer slice for IoJob (the mutable slice IS the owned copy).
-    const argv_const: []const []const u8 = @ptrCast(argv);
-
     ctx.pending_job = .{ .io = .{
-        .io_job = io_pool.IoJob{
-            .worker_id = 0, .coro_id = 0,
-            .payload = .{ .exec = .{ .argv = argv_const } },
-        },
-        .owned_strings = OwnedStrings{ .exec = .{ .argv = argv } },
+        .worker_id = 0, .coro_id = 0,
+        .payload = .{ .exec = .{ .argv = @ptrCast(argv) } },
     }};
 
     lua.yield(0);
@@ -990,11 +918,8 @@ fn botShell(state: ?*ziglua.LuaState) callconv(.c) c_int {
     const command = alloc.dupe(u8, cmd_raw) catch lua.raiseErrorStr("shell: OOM", .{});
 
     ctx.pending_job = .{ .io = .{
-        .io_job = io_pool.IoJob{
-            .worker_id = 0, .coro_id = 0,
-            .payload = .{ .shell = .{ .command = command } },
-        },
-        .owned_strings = OwnedStrings{ .shell = .{ .command = command } },
+        .worker_id = 0, .coro_id = 0,
+        .payload = .{ .shell = .{ .command = command } },
     }};
 
     lua.yield(0);
@@ -1087,23 +1012,9 @@ fn botSendMessageTracked(state: ?*ziglua.LuaState) callconv(.c) c_int {
 // pairs() still yields the verbatim keys.
 // ---------------------------------------------------------------------------
 
-/// True when `a` equals `b_lower` under ASCII case folding. `b_lower` is
-/// assumed already lower-cased; only `a` is folded. This differs from
-/// `std.ascii.eqlIgnoreCase`, which folds both sides on every call. The
-/// caller lower-cases the query key once, so folding only `a` here avoids
-/// re-folding that key on each `next()` iteration of the header scan.
-fn asciiEqlLowerRhs(a: []const u8, b_lower: []const u8) bool {
-    if (a.len != b_lower.len) return false;
-    for (a, b_lower) |ca, cb| {
-        if (std.ascii.toLower(ca) != cb) return false;
-    }
-    return true;
-}
-
 /// __index(table, key): case-insensitive lookup over the verbatim-keyed
 /// response-header table. Returns the matching value or nil. Always returns
-/// exactly one value. Keys longer than 256 bytes are treated as absent and
-/// never match.
+/// exactly one value.
 fn headerIndex(state: ?*ziglua.LuaState) callconv(.c) c_int {
     const lua: *Lua = @ptrCast(state.?);
     // table at 1, key at 2.
@@ -1111,30 +1022,15 @@ fn headerIndex(state: ?*ziglua.LuaState) callconv(.c) c_int {
         lua.pushNil();
         return 1;
     }
-    const key = lua.toString(2) catch {
-        lua.pushNil();
-        return 1;
-    };
-    var kbuf: [256]u8 = undefined;
-    if (key.len > kbuf.len) {
-        lua.pushNil();
-        return 1;
-    }
-    for (key, 0..) |c, i| kbuf[i] = std.ascii.toLower(c);
-    const kq = kbuf[0..key.len];
+    const key = lua.toString(2) catch unreachable;
 
     lua.pushNil(); // first key for next()
     while (lua.next(1)) {
         // stored key at -2, value at -1
         if (lua.typeOf(-2) == .string) {
-            const sk = lua.toString(-2) catch {
-                lua.pop(1); // pop value, keep key for next()
-                continue;
-            };
-            if (asciiEqlLowerRhs(sk, kq)) {
-                // Leave the value (-1) on top; Lua takes it as the result.
-                return 1;
-            }
+            const sk = lua.toString(-2) catch unreachable;
+            // Leave the value (-1) on top; Lua takes it as the result.
+            if (std.ascii.eqlIgnoreCase(sk, key)) return 1;
         }
         lua.pop(1); // pop value, keep key for next()
     }
@@ -1168,7 +1064,7 @@ pub fn attachHeaderMetatable(lua: *Lua) void {
 
 const testing = std.testing;
 
-test "validateHeaderName accepts tokens, rejects empty/colon/control" {
+test "header name and value validation" {
     try validateHeaderName("Content-Type");
     try validateHeaderName("X-Custom_Header.v2");
     try testing.expectError(error.EmptyName, validateHeaderName(""));
@@ -1176,9 +1072,7 @@ test "validateHeaderName accepts tokens, rejects empty/colon/control" {
     try testing.expectError(error.BadNameByte, validateHeaderName("Bad Name"));
     try testing.expectError(error.BadNameByte, validateHeaderName("Bad\r\n"));
     try testing.expectError(error.BadNameByte, validateHeaderName("Bad\x7f"));
-}
 
-test "validateHeaderValue accepts text, rejects CR/LF/NUL" {
     try validateHeaderValue("application/json");
     try validateHeaderValue("Bearer abc.def-ghi with spaces");
     try testing.expectError(error.BadValueByte, validateHeaderValue("a\rb"));
@@ -1206,30 +1100,14 @@ test "bot.schedule_after / schedule_at / unschedule / now_ms" {
         \\assert(bot.unschedule(id) == false, "second unschedule should be false")
     );
 
-    // Negative seconds must be rejected with a Lua error.
-    {
-        const result = lua.doString(
-            \\bot.schedule_after{ seconds = -1, payload = {} }
-        );
-        if (result) |_| return error.TestExpectedLuaError else |_| {}
-    }
-
-    // Non-finite seconds: NaN (0/0) must be rejected — not a crash.
-    {
-        const r = lua.doString("bot.schedule_after{ seconds = 0/0, payload = {} }");
-        if (r) |_| return error.TestExpectedLuaError else |_| {}
-    }
-
-    // Non-finite seconds: +inf (1/0) must be rejected — not a crash.
-    {
-        const r = lua.doString("bot.schedule_after{ seconds = 1/0, payload = {} }");
-        if (r) |_| return error.TestExpectedLuaError else |_| {}
-    }
-
     // schedule_at accepts a past instant; now_ms returns a usable integer.
+    // A missing payload stores "{}" and still returns a positive integer id
+    // (openBase does not load `math`, so `% 1` checks integer-ness).
     try lua.doString(
         \\local a = bot.schedule_at{ at_ms = bot.now_ms() - 5000, payload = {} }
         \\assert(type(a) == "number")
+        \\local b = bot.schedule_after{ seconds = 0 }
+        \\assert(type(b) == "number" and b % 1 == 0 and b > 0, "bad id " .. tostring(b))
     );
 }
 
@@ -1259,31 +1137,18 @@ test "state round-trips through bot.*" {
         \\assert(bot.get_global("counter") == "42", "global round-trip failed")
         \\assert(bot.get_global("__no_such_key__") == nil, "expected nil for missing key")
     );
-}
 
-test "bot.log valid levels succeed; invalid level errors" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-
-    var ctx = testCtx(&db);
-
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    // Valid levels info and warn should not error.
+    // An SQL injection payload is stored as data: every statement binds its
+    // values, so the payload round-trips verbatim as a state value, a global
+    // key, and a global value, and the tables survive.
     try lua.doString(
-        \\bot.log("info",  "info message")
-        \\bot.log("warn",  "warn message")
+        \\local p = "'; DROP TABLE user_state; --"
+        \\bot.set_user_state(7, {note = p})
+        \\bot.set_global(p, p)
+        \\assert(bot.get_user_state(7).note == p, "payload changed in user state")
+        \\assert(bot.get_global(p) == p, "payload changed as a global key/value")
+        \\assert(bot.get_user_state(1).count == 3, "user_state lost after the payload")
     );
-
-    // Invalid level should raise a Lua error (any error variant is fine).
-    const result = lua.doString(
-        \\bot.log("bad_level", "oops")
-    );
-    if (result) |_| return error.TestExpectedLuaError else |_| {}
 }
 
 test "bot.rules_api_version matches Zig constant" {
@@ -1312,24 +1177,6 @@ test "bot.rules_api_version matches Zig constant" {
     lua.pop(2);
 
     try testing.expectEqual(@as(ziglua.Integer, lua_engine.RULES_API_VERSION), ver);
-}
-
-test "bot.get_user_state with non-integer arg → Lua error" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-
-    var ctx = testCtx(&db);
-
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    const result = lua.doString(
-        \\bot.get_user_state("not_an_int")
-    );
-    if (result) |_| return error.TestExpectedLuaError else |_| {}
 }
 
 test "tg.<method>{...} == bot.emit{method=...,params=...}" {
@@ -1397,7 +1244,7 @@ test "two engines have independent ApiCtx (no registry aliasing)" {
 // a file larger than max_file_bytes → error.FileTooLarge
 // ---------------------------------------------------------------------------
 
-test "buildApiCall builds multipart and enforces the file limit" {
+test "buildApiCall builds multipart from __file and __file_bytes and enforces limits" {
     const alloc = testing.allocator;
     var db = try state_store.StateStore.open(alloc, ":memory:");
     defer db.close();
@@ -1462,6 +1309,43 @@ test "buildApiCall builds multipart and enforces the file limit" {
         try testing.expectError(error.FileTooLarge, buildApiCall(lua, params_idx, "sendPhoto", &ctx));
         lua.setTop(0);
     }
+    // { photo = { __file_bytes = "...", filename = "x.bin" } } → one multipart part.
+    {
+        var ctx = testCtx(&db);
+        register(lua, &ctx, 1);
+
+        lua.newTable();                       // params
+        lua.newTable();                       // descriptor
+        _ = lua.pushString("\x01\x02\x03");
+        lua.setField(-2, "__file_bytes");     // descriptor.__file_bytes
+        _ = lua.pushString("x.bin");
+        lua.setField(-2, "filename");         // descriptor.filename
+        lua.setField(-2, "photo");            // params.photo = descriptor
+        const params_idx: i32 = lua.getTop();
+
+        const call = try buildApiCall(lua, params_idx, "sendDocument", &ctx);
+        defer types.freeApiCall(call, alloc);
+        lua.setTop(0);
+
+        switch (call.payload) {
+            .multipart => |parts| {
+                try testing.expectEqual(@as(usize, 1), parts.len);
+                try testing.expectEqualStrings("photo", parts[0].name);
+                try testing.expectEqualStrings("\x01\x02\x03", parts[0].content);
+                try testing.expectEqualStrings("x.bin", parts[0].filename.?);
+            },
+            .json => return error.ExpectedMultipart,
+        }
+
+        // __file_bytes without filename → MissingFilename.
+        lua.newTable();
+        lua.newTable();
+        _ = lua.pushString("\x01\x02\x03");
+        lua.setField(-2, "__file_bytes");
+        lua.setField(-2, "photo");
+        try testing.expectError(error.MissingFilename, buildApiCall(lua, lua.getTop(), "sendDocument", &ctx));
+        lua.setTop(0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1491,101 +1375,50 @@ fn expectLuaError(lua: *Lua, src: [:0]const u8) !void {
     if (lua.doString(src)) |_| return error.TestExpectedLuaError else |_| {}
 }
 
-test "json.decode handles valid, oversized, and malformed input" {
+test "json.encode/decode: round-trip, size and depth caps, malformed input" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
     lua.openBase();
 
-    // Valid JSON decodes to a Lua table (default 1 MB cap).
+    // A nested table encodes to a string that decodes back (default 1 MB cap).
     {
         var ctx = testCtx(&db);
         register(lua, &ctx, 1);
         try lua.doString(
-            \\local t = json.decode('{"ok":true,"n":42}')
-            \\assert(t.ok == true,  "expected ok=true got " .. tostring(t.ok))
-            \\assert(t.n  == 42,    "expected n=42 got "   .. tostring(t.n))
-        );
-    }
-    // Oversized input raises a Lua error; the state survives for later code.
-    {
-        var ctx = testCtxCap(&db, 4); // tiny cap
-        register(lua, &ctx, 1);
-        const result = lua.doString("json.decode('{\"ok\":true}')");
-        if (result) |_| return error.TestExpectedLuaError else |_| {}
-        try lua.doString("local x = 1 + 1");
-    }
-    // Malformed JSON raises a Lua error (doString restores the stack).
-    {
-        var ctx = testCtx(&db);
-        register(lua, &ctx, 1);
-        const result = lua.doString("json.decode('{bad json}')");
-        if (result) |_| return error.TestExpectedLuaError else |_| {}
-    }
-}
-
-test "json.encode enforces size and depth limits" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-
-    // A small table encodes to a string that decodes back (default cap).
-    {
-        var ctx = testCtx(&db);
-        register(lua, &ctx, 1);
-        try lua.doString(
-            \\local s = json.encode({a = 1, b = "x"})
+            \\local s = json.encode({name = "alice", count = 7, nested = {x = true}})
             \\assert(type(s) == "string", "expected string got " .. type(s))
             \\local t = json.decode(s)
-            \\assert(t.a == 1,   "expected a=1 got " .. tostring(t.a))
-            \\assert(t.b == "x", "expected b=x got " .. tostring(t.b))
+            \\assert(t.name == "alice",  "name mismatch: " .. tostring(t.name))
+            \\assert(t.count == 7,       "count mismatch: " .. tostring(t.count))
+            \\assert(t.nested.x == true, "nested.x mismatch")
         );
     }
-    // A table over json_max_bytes raises a Lua error.
+    // Input or output over json_max_bytes raises a Lua error; the state
+    // survives for later code.
     {
         var ctx = testCtxCap(&db, 10); // tiny cap
         register(lua, &ctx, 1);
-        const result = lua.doString(
-            \\json.encode({key = "this is a long value that exceeds the cap"})
-        );
-        if (result) |_| return error.TestExpectedLuaError else |_| {}
+        try expectLuaError(lua, "json.decode('{\"ok\":true,\"x\":1}')");
+        try expectLuaError(lua, "json.encode({key = \"this is a long value that exceeds the cap\"})");
+        try lua.doString("local x = 1 + 1");
     }
-    // A table nested past the depth limit raises a Lua error.
+    // Malformed JSON and nesting past the depth limit raise a Lua error.
     {
         var ctx = testCtx(&db);
         register(lua, &ctx, 1);
-        const result = lua.doString(
+        try expectLuaError(lua, "json.decode('{bad json}')");
+        try expectLuaError(lua,
             \\local t = {}
             \\local cur = t
             \\for i = 1, 9 do cur.inner = {}; cur = cur.inner end
             \\json.encode(t)
         );
-        if (result) |_| return error.TestExpectedLuaError else |_| {}
     }
 }
 
-test "json.decode(json.encode(t)) round-trips" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    try lua.doString(
-        \\local orig = {name = "alice", count = 7, nested = {x = true}}
-        \\local t = json.decode(json.encode(orig))
-        \\assert(t.name == "alice",     "name mismatch: " .. tostring(t.name))
-        \\assert(t.count == 7,          "count mismatch: " .. tostring(t.count))
-        \\assert(t.nested.x == true,    "nested.x mismatch")
-    );
-}
-
-test "bot.url_encode encodes reserved and passes unreserved chars" {
+test "bot.url_encode and bot.shell_quote" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
     var ctx = testCtx(&db);
@@ -1599,122 +1432,77 @@ test "bot.url_encode encodes reserved and passes unreserved chars" {
         \\       "reserved: " .. bot.url_encode("hello world&q=1"))
         \\assert(bot.url_encode("Az09-_.~") == "Az09-_.~",
         \\       "unreserved chars changed: " .. bot.url_encode("Az09-_.~"))
-    );
-}
-
-test "bot.shell_quote wraps in single quotes" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    try lua.doString(
         \\assert(bot.shell_quote("hello world") == "'hello world'")
         \\assert(bot.shell_quote("it's")        == "'it'\\''s'")
         \\assert(bot.shell_quote("")             == "''")
     );
 }
 
-test "json.* and bot.url_encode/shell_quote available without require" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    try lua.doString(
-        \\assert(type(json) == "table",          "json not a table")
-        \\assert(type(json.decode) == "function","json.decode missing")
-        \\assert(type(json.encode) == "function","json.encode missing")
-        \\assert(type(bot.url_encode) == "function", "bot.url_encode missing")
-        \\assert(type(bot.shell_quote) == "function", "bot.shell_quote missing")
-    );
-}
-
-test "bot.send_message produces a tracked send with merged opts" {
+test "bot.send_message yields a tracked send with merged opts" {
     const lua_engine_mod = @import("lua_engine.zig");
 
-    // A bare send yields a .tracked_send stamped with the worker/coro ids.
-    {
-        var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-        defer db.close();
-        var ctx = testCtx(&db);
-        var engine = try lua_engine_mod.LuaEngine.init(testing.allocator, &ctx);
-        defer engine.deinit();
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+    var ctx = testCtx(&db);
+    var engine = try lua_engine_mod.LuaEngine.init(testing.allocator, &ctx);
+    defer engine.deinit();
 
-        try engine.loadString(
-            \\function on_message(u)
-            \\  local mid = bot.send_message{ chat_id = 1, text = "hi" }
-            \\  return {}
-            \\end
-        );
+    try engine.loadString(
+        \\function on_message(u)
+        \\  local mid = bot.send_message{
+        \\    chat_id = 5,
+        \\    text    = "hello",
+        \\    opts    = { parse_mode = "HTML" }
+        \\  }
+        \\  return {}
+        \\end
+    );
 
-        const outcome = try engine.startHandler("{}", 7, 3, testing.allocator, "on_message", null);
-        switch (outcome) {
-            .yielded => |y| {
-                defer lua_engine_mod.teardownCoro(engine.lua, y.handle);
-                switch (y.pending_job) {
-                    .tracked_send => |call| {
-                        defer types.freeApiCall(call, testing.allocator);
-                        try testing.expectEqualStrings("sendMessage", call.method);
-                        try testing.expect(call.tracking != null);
-                        try testing.expectEqual(@as(u8, 3),  call.tracking.?.worker_id);
-                        try testing.expectEqual(@as(u32, 7), call.tracking.?.coro_id);
-                        try testing.expect(std.mem.find(u8, call.payload.json, "\"chat_id\":1") != null);
-                        try testing.expect(std.mem.find(u8, call.payload.json, "\"text\":\"hi\"") != null);
-                        try testing.expect(call.route != null);
-                        try testing.expectEqual(@as(i64, 1), call.route.?.chat_id);
-                    },
-                    .io => return error.ExpectedTrackedSend,
-                }
-            },
-            .done => return error.ExpectedYield,
-            .err  => return error.ExpectedYield,
-        }
-    }
-    // opts are merged into the JSON body.
-    {
-        var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-        defer db.close();
-        var ctx = testCtx(&db);
-        var engine = try lua_engine_mod.LuaEngine.init(testing.allocator, &ctx);
-        defer engine.deinit();
-
-        try engine.loadString(
-            \\function on_message(u)
-            \\  local mid = bot.send_message{
-            \\    chat_id = 5,
-            \\    text    = "hello",
-            \\    opts    = { parse_mode = "HTML" }
-            \\  }
-            \\  return {}
-            \\end
-        );
-
-        const outcome = try engine.startHandler("{}", 1, 0, testing.allocator, "on_message", null);
-        switch (outcome) {
-            .yielded => |y| {
-                defer lua_engine_mod.teardownCoro(engine.lua, y.handle);
-                switch (y.pending_job) {
-                    .tracked_send => |call| {
-                        defer types.freeApiCall(call, testing.allocator);
-                        try testing.expect(std.mem.find(u8, call.payload.json, "\"parse_mode\":\"HTML\"") != null);
-                        try testing.expect(std.mem.find(u8, call.payload.json, "\"chat_id\":5") != null);
-                    },
-                    .io => return error.ExpectedTrackedSend,
-                }
-            },
-            else => return error.ExpectedYield,
-        }
+    // The send yields a .tracked_send stamped with the worker/coro ids, routed
+    // to its chat, with opts merged into the JSON body.
+    const outcome = try engine.startHandler("{}", 7, 3, testing.allocator, "on_message", null);
+    switch (outcome) {
+        .yielded => |y| {
+            defer lua_engine_mod.teardownCoro(engine.lua, y.handle);
+            switch (y.pending_job) {
+                .tracked_send => |call| {
+                    defer types.freeApiCall(call, testing.allocator);
+                    try testing.expectEqualStrings("sendMessage", call.method);
+                    try testing.expectEqual(@as(u8, 3),  call.tracking.?.worker_id);
+                    try testing.expectEqual(@as(u32, 7), call.tracking.?.coro_id);
+                    try testing.expectEqual(@as(i64, 5), call.route.?.chat_id);
+                    try testing.expect(std.mem.find(u8, call.payload.json, "\"chat_id\":5") != null);
+                    try testing.expect(std.mem.find(u8, call.payload.json, "\"text\":\"hello\"") != null);
+                    try testing.expect(std.mem.find(u8, call.payload.json, "\"parse_mode\":\"HTML\"") != null);
+                },
+                .io => return error.ExpectedTrackedSend,
+            }
+        },
+        .done, .err => return error.ExpectedYield,
     }
 }
 
-test "state setters/getters reject bad arguments with a Lua error" {
+test "a failed state read or write raises a Lua error without leaking" {
+    // raiseErrorStr longjmps out of the C function, past any Zig defer; the
+    // JSON buffer must still be freed. testing.allocator reports a leak.
+    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
+    defer db.close();
+    var ctx = testCtx(&db);
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openBase();
+    register(lua, &ctx, 1);
+
+    // A stored blob that is not JSON fails to deserialize.
+    try db.setUserState(1, "{not json");
+    try expectLuaError(lua, "bot.get_user_state(1)");
+
+    // A write to a missing table fails in the database.
+    try testing.expectEqual(@as(c_int, 0), @import("c").sqlite3_exec(db.db, "DROP TABLE user_state", null, null, null));
+    try expectLuaError(lua, "bot.set_user_state(2, {x = 1})");
+}
+
+test "bot.* functions reject bad arguments with a Lua error" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
 
@@ -1726,71 +1514,45 @@ test "state setters/getters reject bad arguments with a Lua error" {
     lua.openBase();
     register(lua, &ctx, 1);
 
-    // Non-integer ids: checkInteger rejects a string.
-    try expectLuaError(lua, "bot.set_user_state(\"x\", {})");
-    try expectLuaError(lua, "bot.get_chat_state(\"x\")");
-    try expectLuaError(lua, "bot.set_chat_state(\"x\", {})");
+    const bad = [_][:0]const u8{
+        // State: ids must be integers, setters take a table, global key and
+        // value must be strings.
+        "bot.get_user_state(\"x\")",
+        "bot.set_user_state(\"x\", {})",
+        "bot.get_chat_state(\"x\")",
+        "bot.set_chat_state(\"x\", {})",
+        "bot.set_user_state(1, \"not a table\")",
+        "bot.set_chat_state(1, \"not a table\")",
+        "bot.get_global()",
+        "bot.set_global(\"k\")",
+        "bot.set_global()",
+        // Scheduling: negative, NaN (0/0) and +inf (1/0) delays.
+        "bot.schedule_after{ seconds = -1, payload = {} }",
+        "bot.schedule_after{ seconds = 0/0, payload = {} }",
+        "bot.schedule_after{ seconds = 1/0, payload = {} }",
+        // bot.log: an unknown level.
+        "bot.log(\"bad_level\", \"oops\")",
+        // bot.send_message: chat_id and text are required. The send yields on
+        // success, so an error raised here is the rejection, not the yield.
+        "bot.send_message{ text = \"x\" }",
+        "bot.send_message{ chat_id = 1 }",
+        // bot.exec: an empty argv is rejected before any subprocess is built.
+        "bot.exec{ argv = {} }",
+        // bot.http_request: a string headers map is the dropped form.
+        "bot.http_request{ method = \"GET\", url = \"http://x\", headers = \"oops\" }",
+        // bot.shell: a table never coerces to a string (a number would).
+        "bot.shell{ command = {} }",
+    };
+    for (bad) |src| expectLuaError(lua, src) catch |e| {
+        std.debug.print("no Lua error for: {s}\n", .{src});
+        return e;
+    };
 
-    // Setters require a table as the second argument: checkType rejects a string.
-    try expectLuaError(lua, "bot.set_user_state(1, \"not a table\")");
-    try expectLuaError(lua, "bot.set_chat_state(1, \"not a table\")");
-
-    // Global key/value must be strings: checkString rejects nil/absent args.
-    try expectLuaError(lua, "bot.get_global()");
-    try expectLuaError(lua, "bot.set_global(\"k\")");
-    try expectLuaError(lua, "bot.set_global()");
-}
-
-test "buildApiCall handles __file_bytes and requires filename" {
-    const alloc = testing.allocator;
-    var db = try state_store.StateStore.open(alloc, ":memory:");
-    defer db.close();
-
-    var lua = try Lua.init(alloc);
-    defer lua.deinit();
-    lua.openBase();
-
-    var ctx = testCtx(&db);
-    register(lua, &ctx, 1);
-
-    // { photo = { __file_bytes = "...", filename = "x.bin" } } → one multipart part.
-    {
-        lua.newTable();                       // params
-        lua.newTable();                       // descriptor
-        _ = lua.pushString("\x01\x02\x03");
-        lua.setField(-2, "__file_bytes");     // descriptor.__file_bytes
-        _ = lua.pushString("x.bin");
-        lua.setField(-2, "filename");         // descriptor.filename
-        lua.setField(-2, "photo");            // params.photo = descriptor
-        const params_idx: i32 = lua.getTop();
-
-        const call = try buildApiCall(lua, params_idx, "sendDocument", &ctx);
-        defer types.freeApiCall(call, alloc);
-        lua.setTop(0);
-
-        try testing.expectEqualStrings("sendDocument", call.method);
-        switch (call.payload) {
-            .multipart => |parts| {
-                try testing.expectEqual(@as(usize, 1), parts.len);
-                try testing.expectEqualStrings("photo", parts[0].name);
-                try testing.expectEqualStrings("\x01\x02\x03", parts[0].content);
-                try testing.expectEqualStrings("x.bin", parts[0].filename.?);
-            },
-            .json => return error.ExpectedMultipart,
-        }
-    }
-    // __file_bytes without filename → error.MissingFilename.
-    {
-        lua.newTable();                       // params
-        lua.newTable();                       // descriptor (no filename)
-        _ = lua.pushString("\x01\x02\x03");
-        lua.setField(-2, "__file_bytes");
-        lua.setField(-2, "photo");
-        const params_idx: i32 = lua.getTop();
-
-        try testing.expectError(error.MissingFilename, buildApiCall(lua, params_idx, "sendDocument", &ctx));
-        lua.setTop(0);
-    }
+    // The valid bot.log levels succeed.
+    try lua.doString(
+        \\bot.log("info", "info message")
+        \\bot.log("warn", "warn message")
+    );
 }
 
 test "headerIndex resolves response headers case-insensitively" {
@@ -1820,73 +1582,5 @@ test "headerIndex resolves response headers case-insensitively" {
         \\assert(h["CONTENT-TYPE"] == "application/json", "upper-case lookup failed")
         \\assert(h["Content-Type"] == "application/json", "verbatim lookup failed")
         \\assert(h["X-Missing"] == nil, "missing header should read nil")
-    );
-}
-
-test "bot.send_message rejects missing required fields" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-
-    var ctx = testCtx(&db);
-
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    // Missing chat_id and missing text each raise a Lua error. The send yields
-    // on success, so reaching the yield would mean the field passed validation;
-    // a raised error before the yield is the rejection we want.
-    try expectLuaError(lua, "bot.send_message{ text = \"x\" }");
-    try expectLuaError(lua, "bot.send_message{ chat_id = 1 }");
-}
-
-test "http_request/exec/shell reject bad arguments" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-
-    var ctx = testCtx(&db);
-
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    // bot.exec: an empty argv is rejected before any subprocess is built.
-    try expectLuaError(lua, "bot.exec{ argv = {} }");
-
-    // bot.http_request: a string headers map is the dropped form and is rejected.
-    try expectLuaError(lua,
-        "bot.http_request{ method = \"GET\", url = \"http://x\", headers = \"oops\" }",
-    );
-
-    // bot.shell: a non-string command fails checkString. A table never coerces
-    // to a string (unlike a number, which checkString accepts), so it rejects
-    // before any command is duped or yield is reached.
-    try expectLuaError(lua, "bot.shell{ command = {} }");
-}
-
-test "bot.schedule_after without payload returns a valid id" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-
-    var ctx = testCtx(&db);
-
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-
-    lua.openBase();
-    register(lua, &ctx, 1);
-
-    // No payload key at all → the nil-payload branch dupes "{}" and inserts a
-    // row. openBase does not load `math`, so integer-ness is checked with `% 1`
-    // rather than math.type.
-    try lua.doString(
-        \\local id = bot.schedule_after{ seconds = 0 }
-        \\assert(type(id) == "number", "id must be a number, got " .. type(id))
-        \\assert(id % 1 == 0, "id must be an integer, got " .. tostring(id))
-        \\assert(id > 0, "id must be positive, got " .. tostring(id))
     );
 }

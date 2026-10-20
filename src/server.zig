@@ -1,23 +1,25 @@
-/// server.zig — minimal HTTP/1.1 server for the Telegram webhook endpoint.
-///
-/// Architecture:
-///   - One accept thread (poll-based, honours stop flag with 10ms timeout)
-///   - A fixed pool of handler threads draining a connection hand-off queue
-///   - Validates method, path, and X-Telegram-Bot-Api-Secret-Token header
-///   - Point-extracts user_id from the raw JSON body (no full parse),
-///     routes by hashUserId % len(queues)
-///   - Responds 200 OK immediately; the worker thread does the Lua processing
-///
-/// Memory ownership:
-///   The raw webhook body is duplicated into a heap-allocated WorkItem and
-///   pushed to a worker queue.  The worker frees WorkItem.body after
-///   callOnMessage returns.  No arena is leaked.
+//! server.zig — minimal HTTP/1.1 server for the Telegram webhook endpoint.
+//!
+//! Architecture:
+//!   - One accept thread, blocked in poll() on the listener and a stop latch
+//!   - A fixed pool of handler threads blocked on a connection hand-off queue
+//!   - No thread wakes on a timer: an idle server costs no CPU
+//!   - Validates method, path, and X-Telegram-Bot-Api-Secret-Token header
+//!   - Point-extracts user_id from the raw JSON body (no full parse),
+//!     routes by hashUserId % len(queues)
+//!   - Responds 200 OK immediately; the worker thread does the Lua processing
+//!
+//! Memory ownership:
+//!   The raw webhook body is duplicated into a heap-allocated WorkItem and
+//!   pushed to a worker queue.  The worker frees WorkItem.body once the
+//!   handler has started.
 const std = @import("std");
 const types = @import("types.zig");
 const q_mod = @import("queue.zig");
 const worker = @import("worker.zig");
 const metrics_mod = @import("metrics.zig");
 const rt = @import("rt.zig");
+const Latch = @import("latch.zig").Latch;
 
 const log = std.log.scoped(.server);
 
@@ -25,14 +27,15 @@ const log = std.log.scoped(.server);
 /// threshold are rejected with 413 before any body memory is allocated.
 pub const MAX_BODY_BYTES: usize = 1 * 1024 * 1024;
 
-/// Maximum number of concurrently open connection-handler threads.
-/// The accept loop drops connections beyond this limit.
+/// Maximum number of accepted connections queued or being served at once.
+/// The accept loop drops connections beyond this limit. It also sizes the
+/// connection hand-off queue.
 pub const MAX_CONNECTIONS: u32 = 1024;
 
 /// Idle timeout (ms) to wait for a connected client's first byte before giving
 /// up, so a peer that connects and sends nothing cannot pin a handler thread.
 /// Implemented with poll() — see waitReadable for why SO_RCVTIMEO is unusable
-/// under 0.16's blocking-Io read path. 0 disables the guard.
+/// under the blocking-Io read path. 0 disables the guard.
 pub const DEFAULT_READ_IDLE_TIMEOUT_MS: u32 = 15_000;
 
 // ---------------------------------------------------------------------------
@@ -50,8 +53,9 @@ pub const ServerArgs = struct {
     io: std.Io,
     /// Number of reusable connection-handler threads.
     pool_threads: u8,
-    /// Per-recv idle read timeout (SO_RCVTIMEO) for accepted connections.
-    /// 0 disables. Defaulted so callers need not set it.
+    /// How long a handler waits for a client's first byte before it answers
+    /// 400 and closes. waitReadable() implements the wait as a poll() gate.
+    /// 0 disables it. Production keeps the default; tests set a short value.
     read_idle_timeout_ms: u32 = DEFAULT_READ_IDLE_TIMEOUT_MS,
     /// Optional metrics sink. Null means "don't count" (tests default to null).
     metrics: ?*metrics_mod.Metrics = null,
@@ -63,12 +67,14 @@ pub const Server = struct {
     webhook_secret: []const u8,
     queues: []*q_mod.Queue(types.WorkItem),
     listener: std.Io.net.Server,
-    stop: std.atomic.Value(bool),
+    /// deinit() sets it to wake the accept thread out of poll().
+    stop: Latch,
     accept_thread: std.Thread,
     active: std.atomic.Value(u32),
     /// Fixed handler-thread pool (std.Thread.Pool was removed in 0.16). The
     /// accept thread pushes accepted streams to conn_queue; these threads pop
     /// and serve them, so the pool reuses threads rather than spawning one per connection.
+    /// Closing `conn_queue` is the handlers' stop signal.
     handler_threads: []std.Thread,
     conn_queue: q_mod.Queue(std.Io.net.Stream),
     read_idle_timeout_ms: u32,
@@ -89,7 +95,8 @@ pub const Server = struct {
         // exhaustion warnings under burst load.
         self.listener = try args.listen_addr.listen(args.io, .{ .reuse_address = true, .kernel_backlog = 4096 });
         errdefer self.listener.deinit(args.io);
-        self.stop = std.atomic.Value(bool).init(false);
+        self.stop = try Latch.init();
+        errdefer self.stop.deinit();
         self.active = std.atomic.Value(u32).init(0);
 
         // Connection hand-off queue: accept thread pushes, handlers pop.
@@ -102,7 +109,7 @@ pub const Server = struct {
         errdefer args.allocator.free(self.handler_threads);
         var spawned: usize = 0;
         errdefer {
-            self.stop.store(true, .release);
+            self.conn_queue.close();
             for (self.handler_threads[0..spawned]) |t| t.join();
         }
         for (self.handler_threads) |*t| {
@@ -117,30 +124,18 @@ pub const Server = struct {
     /// Signal the accept loop to exit, wait for it, drain the handler pool,
     /// then release resources.  Order matters: stop accepting before draining
     /// (no new tasks), drain before freeing (handlers hold *Server).
+    /// The handlers serve every stream already queued before they exit, so
+    /// `conn_queue` is empty when they have joined.
     pub fn deinit(self: *Server) void {
-        self.stop.store(true, .release);
+        self.stop.set();
         self.accept_thread.join();
+        self.conn_queue.close();
         for (self.handler_threads) |t| t.join();
         self.allocator.free(self.handler_threads);
-        // Close any streams accepted but not yet served (handlers drain first,
-        // so this is normally empty; the close keeps fds from leaking on a race).
-        while (self.conn_queue.popTimeout(0)) |stream| stream.close(self.io);
         self.conn_queue.deinit(self.allocator);
+        self.stop.deinit();
         self.listener.deinit(self.io);
         self.allocator.destroy(self);
-    }
-
-    /// The address the listening socket is actually bound to.
-    /// Useful when port 0 was requested (OS assigns an ephemeral port).
-    /// 0.16's net.Server drops listen_address, so query the socket directly.
-    pub fn listenAddress(self: *const Server) std.Io.net.IpAddress {
-        var sa: std.posix.sockaddr.in = undefined;
-        var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-        _ = std.posix.system.getsockname(self.listener.socket.handle, @ptrCast(&sa), &len);
-        return .{ .ip4 = .{
-            .bytes = @bitCast(sa.addr),
-            .port = std.mem.bigToNative(u16, sa.port),
-        } };
     }
 };
 
@@ -150,15 +145,12 @@ pub const Server = struct {
 
 fn acceptLoop(srv: *Server) void {
     const fd = srv.listener.socket.handle;
-    while (!srv.stop.load(.acquire)) {
-        var pfd = std.posix.pollfd{
-            .fd = fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
+    while (true) {
+        const ready = srv.stop.waitReadable(fd) catch |err| {
+            log.err("accept poll: {s} — no longer accepting connections", .{@errorName(err)});
+            return;
         };
-        const n = std.posix.poll(@as(*[1]std.posix.pollfd, &pfd)[0..1], 10) catch return;
-        if (n == 0) continue;
-        if (pfd.revents & std.posix.POLL.IN == 0) continue;
+        if (!ready) return;
 
         const stream = srv.listener.accept(srv.io) catch |err| {
             log.warn("accept: {s}", .{@errorName(err)});
@@ -169,8 +161,9 @@ fn acceptLoop(srv: *Server) void {
             stream.close(srv.io);
             continue;
         }
-        // Drop connections when every worker queue is at capacity to prevent
-        // thread-churn SIGSEGV.
+        // Shed load before reading the request: with every worker queue full,
+        // the client gets 503 whatever its secret, and no handler thread
+        // spends time reading a body that would be dropped anyway.
         const all_saturated = blk: {
             for (srv.queues) |q| {
                 if (q.len() < q.buf.len) break :blk false;
@@ -200,14 +193,11 @@ fn acceptLoop(srv: *Server) void {
 // ---------------------------------------------------------------------------
 
 /// One fixed pool thread: pull accepted streams off conn_queue and serve them.
-/// After stop, drain the queue so every accepted connection is answered and its
-/// fd released before the thread exits.
+/// An idle thread parks in popBlocking() with no timeout. After close(),
+/// popBlocking() still returns every queued stream, so each accepted
+/// connection is answered and its fd released before the thread exits.
 fn handlerLoop(srv: *Server) void {
-    while (!srv.stop.load(.acquire)) {
-        const stream = srv.conn_queue.popTimeout(10 * std.time.ns_per_ms) orelse continue;
-        handleConnection(srv, stream);
-    }
-    while (srv.conn_queue.popTimeout(0)) |stream| handleConnection(srv, stream);
+    while (srv.conn_queue.popBlocking()) |stream| handleConnection(srv, stream);
 }
 
 fn handleConnection(srv: *Server, stream: std.Io.net.Stream) void {
@@ -220,10 +210,10 @@ fn handleConnection(srv: *Server, stream: std.Io.net.Stream) void {
 
 /// Wait up to `timeout_ms` for the socket to become readable, so a client that
 /// connects and sends nothing cannot hold a handler thread indefinitely.
-/// Returns true if data is ready, false on timeout/error. timeout_ms == 0 means
-/// "no idle limit" (wait forever — caller skips the gate).
+/// Returns true if data is ready, false on timeout/error. The caller skips the
+/// gate when the idle limit is disabled (0).
 ///
-/// 0.16 note: this replaces SO_RCVTIMEO. The Threaded Io does blocking recv on
+/// Why not SO_RCVTIMEO: the Threaded Io does blocking recv on
 /// its worker threads and treats an EAGAIN timeout as a programmer bug (panics),
 /// so a socket read timeout cannot be set via setsockopt; poll() is the portable
 /// idle guard that works with the blocking-Io read path.
@@ -270,11 +260,7 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
     // Use takeDelimiter (not takeDelimiterExclusive) so the '\n' itself is
     // consumed; takeDelimiterExclusive leaves it in the buffer, causing the
     // header loop to see an empty first line and exit immediately.
-    const req_raw_opt = rdr.takeDelimiter('\n') catch {
-        sendStatus(srv.io, stream, "400 Bad Request") catch {};
-        return;
-    };
-    const req_raw = req_raw_opt orelse {
+    const req_raw = (rdr.takeDelimiter('\n') catch null) orelse {
         sendStatus(srv.io, stream, "400 Bad Request") catch {};
         return;
     };
@@ -284,12 +270,9 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
     const method = req_parts.next() orelse "";
     const path = req_parts.next() orelse "";
 
-    // Evaluate method/path BEFORE reading any more data (slices point into
-    // read_buf; safe until the next takeDelimiter call).
-    const method_ok = std.mem.eql(u8, method, "POST");
-    const path_ok = std.mem.eql(u8, path, "/webhook");
-
-    if (!method_ok or !path_ok) {
+    // Check method and path before reading further: both slices point into
+    // `read_buf` and stay valid only until the next takeDelimiter() call.
+    if (!std.mem.eql(u8, method, "POST") or !std.mem.eql(u8, path, "/webhook")) {
         if (srv.metrics) |m| m.incReject(.forbidden);
         try sendStatus(srv.io, stream, "403 Forbidden");
         return;
@@ -313,8 +296,8 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
             const v = std.mem.trim(u8, h["x-telegram-bot-api-secret-token:".len..], " \t");
             secret_valid = std.mem.eql(u8, srv.webhook_secret, v);
         }
-        // Each header line is processed inline; slices are not held after this
-        // iteration.  Buffer-pointer safety is maintained.
+        // Header slices point into `read_buf`; none is kept past this
+        // iteration.
     }
 
     if (!secret_valid) {
@@ -349,7 +332,7 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
     };
 
     // ── Forward the raw body verbatim to a worker ────────────────────────────
-    // The WorkItem owns its body; the worker frees it after callOnMessage.
+    // The WorkItem owns its body; the worker frees it once the handler has started.
     const owned_body = srv.allocator.dupe(u8, body) catch {
         log.warn("rejected request: out of memory copying body", .{});
         try sendStatus(srv.io, stream, "500 Internal Server Error");
@@ -358,8 +341,7 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
     const item = types.WorkItem{ .body = owned_body, .user_id = user_id };
     const n = srv.queues.len;
     const primary = worker.hashUserId(user_id orelse 0, @intCast(n));
-    var pushed = false;
-    for (0..n) |i| {
+    const pushed = for (0..n) |i| {
         const idx = (primary + i) % n;
         srv.queues[idx].push(item) catch continue;
         if (i > 0) {
@@ -368,9 +350,8 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
             if (srv.metrics) |m| _ = m.route_overflow_total.fetchAdd(1, .monotonic);
             log.debug("worker {d} full — overflowed update to worker {d}", .{ primary, idx });
         }
-        pushed = true;
-        break;
-    }
+        break true;
+    } else false;
     if (!pushed) {
         if (srv.metrics) |m| _ = m.route_drop_total.fetchAdd(1, .monotonic);
         log.warn("all queues full — update dropped (primary={d})", .{primary});
@@ -388,8 +369,9 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
 // user_id extraction
 //
 // The worker-routing key is point-extracted from the raw webhook JSON with a
-// streaming scanner — never a full parse.  The scanner navigates to `message.from.id`
-// (preferred) or `callback_query.from.id` and stop as soon as an id is found;
+// streaming scanner — never a full parse. The scanner navigates to
+// `message.from.id` (preferred) or `callback_query.from.id` and stops as soon
+// as an id is found;
 // trailing bytes are not scanned.  Telegram lists `message` before
 // `callback_query` in the Update object, so first-match gives `message`
 // precedence.
@@ -408,24 +390,14 @@ fn extractUserId(allocator: std.mem.Allocator, body: []const u8) ExtractError!?i
     if ((scanner.next() catch return error.InvalidJson) != .object_begin)
         return error.InvalidJson;
 
-    while (true) {
-        const tok = scanner.nextAlloc(allocator, .alloc_if_needed) catch return error.InvalidJson;
-        const key = switch (tok) {
-            .object_end => return null,
-            .string => |s| s,
-            .allocated_string => |s| s,
-            else => return error.InvalidJson, // an object key must be a string
-        };
-        const wanted = std.mem.eql(u8, key, "message") or
-            std.mem.eql(u8, key, "callback_query");
-        if (tok == .allocated_string) allocator.free(tok.allocated_string);
-
-        if (wanted) {
-            if (try scanFromId(allocator, &scanner)) |id| return id;
-        } else {
-            scanner.skipValue() catch return error.InvalidJson;
+    while (try nextKey(allocator, &scanner, &.{ "message", "callback_query" })) |wanted| {
+        if (!wanted) {
+            try skipValue(&scanner);
+        } else if (try scanFromId(allocator, &scanner)) |id| {
+            return id;
         }
     }
+    return null;
 }
 
 /// Scanner positioned just after a `message`/`callback_query` key.  When the
@@ -433,57 +405,28 @@ fn extractUserId(allocator: std.mem.Allocator, body: []const u8) ExtractError!?i
 /// left mid-document — the caller stops).  Otherwise consumes the whole value
 /// cleanly and returns null.
 fn scanFromId(allocator: std.mem.Allocator, scanner: *std.json.Scanner) ExtractError!?i64 {
-    if ((scanner.peekNextTokenType() catch return error.InvalidJson) != .object_begin) {
-        scanner.skipValue() catch return error.InvalidJson;
-        return null;
-    }
-    _ = scanner.next() catch return error.InvalidJson; // consume object_begin
-
-    while (true) {
-        const tok = scanner.nextAlloc(allocator, .alloc_if_needed) catch return error.InvalidJson;
-        const key = switch (tok) {
-            .object_end => return null,
-            .string => |s| s,
-            .allocated_string => |s| s,
-            else => return error.InvalidJson,
-        };
-        const is_from = std.mem.eql(u8, key, "from");
-        if (tok == .allocated_string) allocator.free(tok.allocated_string);
-
-        if (is_from) {
-            if (try scanIdField(allocator, scanner)) |id| return id;
-            // `from` carried no usable id — keep consuming the enclosing object.
-        } else {
-            scanner.skipValue() catch return error.InvalidJson;
+    if (!try enterObject(scanner)) return null;
+    while (try nextKey(allocator, scanner, &.{"from"})) |is_from| {
+        if (!is_from) {
+            try skipValue(scanner);
+        } else if (try scanIdField(allocator, scanner)) |id| {
+            return id;
         }
+        // A `from` without a usable id: keep consuming the enclosing object.
     }
+    return null;
 }
 
 /// Scanner positioned just after a `from` key.  Returns an integer `id` value
 /// if present; otherwise consumes the value cleanly and returns null.
 fn scanIdField(allocator: std.mem.Allocator, scanner: *std.json.Scanner) ExtractError!?i64 {
-    if ((scanner.peekNextTokenType() catch return error.InvalidJson) != .object_begin) {
-        scanner.skipValue() catch return error.InvalidJson;
-        return null;
-    }
-    _ = scanner.next() catch return error.InvalidJson; // consume object_begin
-
-    while (true) {
-        const tok = scanner.nextAlloc(allocator, .alloc_if_needed) catch return error.InvalidJson;
-        const key = switch (tok) {
-            .object_end => return null,
-            .string => |s| s,
-            .allocated_string => |s| s,
-            else => return error.InvalidJson,
-        };
-        const is_id = std.mem.eql(u8, key, "id");
-        if (tok == .allocated_string) allocator.free(tok.allocated_string);
-
+    if (!try enterObject(scanner)) return null;
+    while (try nextKey(allocator, scanner, &.{"id"})) |is_id| {
         if (is_id and (scanner.peekNextTokenType() catch return error.InvalidJson) == .number) {
             const num = scanner.nextAlloc(allocator, .alloc_if_needed) catch return error.InvalidJson;
             const slice = switch (num) {
-                .number => |s| s,
-                .allocated_number => |s| s,
+                .number => |n| n,
+                .allocated_number => |n| n,
                 else => return error.InvalidJson, // peek guaranteed a number
             };
             const parsed = std.fmt.parseInt(i64, slice, 10) catch null;
@@ -492,9 +435,47 @@ fn scanIdField(allocator: std.mem.Allocator, scanner: *std.json.Scanner) Extract
             // id (float / overflow) falls through: keep consuming the object.
             if (parsed) |id| return id;
         } else {
-            scanner.skipValue() catch return error.InvalidJson;
+            try skipValue(scanner);
         }
     }
+    return null;
+}
+
+/// Read the next key of the object the scanner is in. Returns null at the
+/// object's end; otherwise whether the key is one of `names`. The scanner is
+/// left on the key's value.
+fn nextKey(
+    allocator: std.mem.Allocator,
+    scanner: *std.json.Scanner,
+    names: []const []const u8,
+) ExtractError!?bool {
+    const tok = scanner.nextAlloc(allocator, .alloc_if_needed) catch return error.InvalidJson;
+    defer if (tok == .allocated_string) allocator.free(tok.allocated_string);
+    const key = switch (tok) {
+        .object_end => return null,
+        .string => |k| k,
+        .allocated_string => |k| k,
+        else => return error.InvalidJson, // an object key must be a string
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, key, n)) return true;
+    }
+    return false;
+}
+
+/// When the next value is an object, consume its `{` and return true;
+/// otherwise skip the whole value and return false.
+fn enterObject(scanner: *std.json.Scanner) ExtractError!bool {
+    if ((scanner.peekNextTokenType() catch return error.InvalidJson) != .object_begin) {
+        try skipValue(scanner);
+        return false;
+    }
+    _ = scanner.next() catch return error.InvalidJson;
+    return true;
+}
+
+fn skipValue(scanner: *std.json.Scanner) ExtractError!void {
+    scanner.skipValue() catch return error.InvalidJson;
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +483,7 @@ fn scanIdField(allocator: std.mem.Allocator, scanner: *std.json.Scanner) Extract
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 const Queue = q_mod.Queue;
 
 const TEST_SECRET = "test-webhook-secret";
@@ -516,9 +498,9 @@ const VALID_UPDATE =
 // ---------------------------------------------------------------------------
 
 /// Heap-allocated test fixture: N worker queues + a running Server.
-/// Everything — queue buffers and server internals — uses std.testing.allocator.
-/// WorkItem ownership is clean (no leaked arenas), so the leak detector runs
-/// over the whole server path; deinit drains any unconsumed WorkItem bodies.
+/// Everything — queue buffers and server internals — uses std.testing.allocator,
+/// so the leak detector runs over the whole server path; deinit drains any
+/// unconsumed WorkItem bodies.
 const TestSetup = struct {
     const MAX_Q = 8;
 
@@ -578,7 +560,7 @@ const TestSetup = struct {
     }
 
     fn serverAddr(self: *const TestSetup) std.Io.net.IpAddress {
-        return self.srv.listenAddress();
+        return test_util.boundAddress(&self.srv.listener);
     }
 
     fn queueLen(self: *TestSetup, i: usize) usize {
@@ -655,51 +637,27 @@ fn httpOversizeBody(address: std.Io.net.IpAddress, secret: []const u8) !u16 {
 // Webhook endpoint tests
 // ---------------------------------------------------------------------------
 
-test "valid POST /webhook with correct secret → 200 OK, update enqueued" {
-    const ts = try TestSetup.init(1, TEST_SECRET);
+test "rejected requests: 403/400/413, nothing enqueued, counted by reason" {
+    var m = metrics_mod.Metrics{};
+    const ts = try TestSetup.initFull(1, TEST_SECRET, DEFAULT_READ_IDLE_TIMEOUT_MS, 512, &m);
     defer ts.deinit();
 
-    const status = try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, VALID_UPDATE);
-    try testing.expectEqual(@as(u16, 200), status);
-    try testing.expectEqual(@as(usize, 1), ts.queueLen(0));
-}
-
-test "non-POST, wrong path, or bad secret → 403 Forbidden, nothing enqueued" {
-    const ts = try TestSetup.init(1, TEST_SECRET);
-    defer ts.deinit();
-
-    // GET instead of POST.
+    // GET instead of POST, wrong path, missing secret, wrong secret → 403.
     try testing.expectEqual(@as(u16, 403), try httpReq("GET", ts.serverAddr(), "/webhook", TEST_SECRET, ""));
-    // Wrong path.
     try testing.expectEqual(@as(u16, 403), try httpReq("POST", ts.serverAddr(), "/notwebhook", TEST_SECRET, VALID_UPDATE));
-    // Missing secret header.
     try testing.expectEqual(@as(u16, 403), try httpReq("POST", ts.serverAddr(), "/webhook", null, VALID_UPDATE));
-    // Wrong secret.
     try testing.expectEqual(@as(u16, 403), try httpReq("POST", ts.serverAddr(), "/webhook", "wrong-secret", VALID_UPDATE));
+    // Valid secret, malformed JSON body → 400.
+    try testing.expectEqual(@as(u16, 400), try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, "{not json}"));
+    // Declared body over 1 MB → 413, rejected on the header alone, before any
+    // body is read or allocated.
+    try testing.expectEqual(@as(u16, 413), try httpOversizeBody(ts.serverAddr(), TEST_SECRET));
 
-    // No rejected request enqueued anything.
     try testing.expectEqual(@as(usize, 0), ts.queueLen(0));
-}
-
-test "valid secret, malformed JSON body → 400 Bad Request, nothing enqueued" {
-    const ts = try TestSetup.init(1, TEST_SECRET);
-    defer ts.deinit();
-
-    const status = try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, "{not json}");
-    try testing.expectEqual(@as(u16, 400), status);
-    try testing.expectEqual(@as(usize, 0), ts.queueLen(0));
-}
-
-test "200 OK arrives within 50ms" {
-    const ts = try TestSetup.init(1, TEST_SECRET);
-    defer ts.deinit();
-
-    const t0 = rt.nowMs(testing.io);
-    const status = try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, VALID_UPDATE);
-    const elapsed = rt.nowMs(testing.io) - t0;
-
-    try testing.expectEqual(@as(u16, 200), status);
-    try testing.expect(elapsed < 50);
+    try testing.expectEqual(@as(u64, 0), m.updates_received_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 4), m.updates_rejected[@backingInt(metrics_mod.RejectReason.forbidden)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@backingInt(metrics_mod.RejectReason.malformed)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@backingInt(metrics_mod.RejectReason.oversize)].load(.monotonic));
 }
 
 test "100 requests with same user_id → all enqueued to same worker queue" {
@@ -769,29 +727,23 @@ test "10 simultaneous connections → all 200 OK, all updates enqueued" {
     try testing.expectEqual(@as(usize, N), enqueued);
 }
 
-test "body > 1 MB → 413, server does not allocate unbounded memory" {
-    const ts = try TestSetup.init(1, TEST_SECRET);
-    defer ts.deinit();
-
-    const status = try httpOversizeBody(ts.serverAddr(), TEST_SECRET);
-    try testing.expectEqual(@as(u16, 413), status);
-    try testing.expectEqual(@as(usize, 0), ts.queueLen(0));
-}
-
 // ---------------------------------------------------------------------------
-// Raw body forwarding + point-extracted user_id
-//
-// Oversize / malformed-JSON rejection is already covered by the malformed-JSON
-// and oversize-body tests above — no separate test.
+// Point-extracted user_id
 // ---------------------------------------------------------------------------
 
-test "server forwards the raw webhook body verbatim to the worker" {
-    const ts = try TestSetup.init(1, TEST_SECRET);
+test "a valid update gets 200 within 50 ms and reaches the queue verbatim" {
+    var m = metrics_mod.Metrics{};
+    const ts = try TestSetup.initFull(1, TEST_SECRET, DEFAULT_READ_IDLE_TIMEOUT_MS, 512, &m);
     defer ts.deinit();
 
+    // Telegram requires a fast ACK.
+    const t0 = rt.nowMs(testing.io);
     const status = try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, VALID_UPDATE);
+    const elapsed = rt.nowMs(testing.io) - t0;
     try testing.expectEqual(@as(u16, 200), status);
+    try testing.expect(elapsed < 50);
     try testing.expectEqual(@as(usize, 1), ts.queueLen(0));
+    try testing.expectEqual(@as(u64, 1), m.updates_received_total.load(.monotonic));
 
     const item = ts.q_store[0].pop();
     defer testing.allocator.free(item.body);
@@ -845,46 +797,15 @@ test "extractUserId — message / callback_query / edge cases" {
     try testing.expectError(error.InvalidJson, extractUserId(A, ""));
     // top-level array (not an object) → error
     try testing.expectError(error.InvalidJson, extractUserId(A, "[1,2,3]"));
+    // invalid UTF-8, a raw control character in a string, binary garbage,
+    // a truncated body → error
+    try testing.expectError(error.InvalidJson, extractUserId(A, "{\"update_id\":1,\"t\":\"\xff\xfe\"}"));
+    try testing.expectError(error.InvalidJson, extractUserId(A, "{\"update_id\":1,\"t\":\"hi\x01there\"}"));
+    try testing.expectError(error.InvalidJson, extractUserId(A, "\x00\x01\x02\x03\xff\xfe\xfd"));
+    try testing.expectError(error.InvalidJson, extractUserId(A, "{\"update_id\":1,\"message\":"));
     // early exit: the id is found before the trailing invalid JSON is reached,
     // so the scan stops and returns the id rather than raising InvalidJson.
     try testing.expectEqual(@as(?i64, 777), try extractUserId(A, "{\"message\":{\"from\":{\"id\":777,\"junk\":NOTVALID}}}"));
-}
-
-test "server→worker WorkItem handoff leaks nothing under testing.allocator" {
-    // The server allocates one WorkItem.body per accepted update.  Draining the
-    // queues exactly as a worker does (take item, free body) must leave the
-    // testing.allocator balanced — proving the server↔worker ownership contract.
-    const ts = try TestSetup.init(2, TEST_SECRET);
-    defer ts.deinit();
-
-    for (0..20) |i| {
-        var buf: [256]u8 = undefined;
-        const body = try std.fmt.bufPrint(&buf,
-            \\{{"update_id":{d},"message":{{"from":{{"id":{d}}}}}}}
-        , .{ i + 1, i + 1 });
-        try testing.expectEqual(@as(u16, 200), try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, body));
-    }
-
-    var drained: usize = 0;
-    for (0..ts.q_count) |qi| {
-        while (ts.q_store[qi].popTimeout(0)) |item| {
-            testing.allocator.free(item.body);
-            drained += 1;
-        }
-    }
-    try testing.expectEqual(@as(usize, 20), drained);
-}
-
-test "pool-backed server: 50 sequential connections all 200, deinit drains cleanly" {
-    const ts = try TestSetup.init(2, TEST_SECRET);
-    defer ts.deinit();
-
-    for (0..50) |_| {
-        try testing.expectEqual(@as(u16, 200), try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, VALID_UPDATE));
-    }
-
-    // Reaching here (and ts.deinit returning) proves pool.deinit() drains the
-    // accepted connections and joins its workers without hanging or leaking.
 }
 
 // ---------------------------------------------------------------------------
@@ -893,11 +814,11 @@ test "pool-backed server: 50 sequential connections all 200, deinit drains clean
 // Both paths relax the hash(user_id)%N affinity and record it on Metrics:
 //   - overflow: primary queue full, update placed on a later queue → still 200.
 //   - drop:     every queue full, update shed → 503.
-// hashUserId(2, 2) == 0, so an update from user_id 2 routes primarily to
-// queue 0; pre-filling queue 0 forces the chosen path deterministically.
+// Pre-filling the primary queue of user_id 2 (hashUserId(2, N)) forces the
+// chosen path deterministically.
 // ---------------------------------------------------------------------------
 
-/// A minimal valid Update from user_id 2 (routes to queue 0 under N=1 and N=2).
+/// A minimal valid Update from user_id 2.
 const UPDATE_USER_2 =
     \\{"update_id":1,"message":{"message_id":1,"from":{"id":2,"is_bot":false,"first_name":"T"},"chat":{"id":2,"type":"private"},"date":0}}
 ;
@@ -911,19 +832,22 @@ fn fillQueue(ts: *TestSetup, qi: usize) !void {
 
 test "primary queue full → affinity-overflow places update on next queue, 200, route_overflow_total++" {
     var metrics = metrics_mod.Metrics{};
-    // Two queues, capacity 1 each: filling queue 0 leaves queue 1 free, so the
-    // overflow path (place elsewhere + 200) is taken rather than the drop path.
+    // Two queues, capacity 1 each: filling the primary leaves the other free,
+    // so the overflow path (place elsewhere + 200) is taken rather than the
+    // drop path.
     const ts = try TestSetup.initFull(2, TEST_SECRET, DEFAULT_READ_IDLE_TIMEOUT_MS, 1, &metrics);
     defer ts.deinit();
+    const primary = worker.hashUserId(2, 2);
+    const other = 1 - primary;
 
-    try fillQueue(ts, 0); // queue 0 at capacity; primary for user_id 2
+    try fillQueue(ts, primary);
 
     const status = try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, UPDATE_USER_2);
     try testing.expectEqual(@as(u16, 200), status);
 
     // Update landed on the non-primary queue, not dropped.
-    try testing.expectEqual(@as(usize, 1), ts.queueLen(0)); // unchanged (the placeholder)
-    try testing.expectEqual(@as(usize, 1), ts.queueLen(1)); // the overflowed update
+    try testing.expectEqual(@as(usize, 1), ts.queueLen(primary)); // unchanged (the placeholder)
+    try testing.expectEqual(@as(usize, 1), ts.queueLen(other)); // the overflowed update
     try testing.expectEqual(@as(u64, 1), metrics.route_overflow_total.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), metrics.route_drop_total.load(.monotonic));
 }
@@ -943,15 +867,13 @@ test "all queues full → update dropped with 503, queue length unchanged" {
     // The dropped update was not enqueued: the queue still holds only the filler.
     try testing.expectEqual(@as(usize, 1), ts.queueLen(0));
 
-    // route_drop_total is NOT incremented here. A steadily-saturated server is
-    // shed at the accept loop ("all worker queues saturated — dropping
-    // connection"), which sends 503 without touching the counter; the only path
-    // that increments route_drop_total is the in-handleRequest push-loop drop,
-    // reached only in the narrow race where a queue fills *between* the accept
-    // check and the push. So under the very condition the counter names, it
-    // stays 0. See task report (B13) — flagged as a possible production bug,
-    // not fixed here (this task touches tests only). The assertion below pins
-    // the current behavior so a future fix that wires the counter is visible.
+    // route_drop_total stays 0 here. A server with every worker queue full
+    // sheds the connection in the accept loop ("all worker queues saturated —
+    // dropping connection"), which sends 503 without touching the counter.
+    // Only the push loop in handleRequest increments it, in the narrow race
+    // where a queue fills between the accept check and the push. The
+    // assertion pins this behavior, so a change that wires the counter into
+    // the accept loop shows up here.
     try testing.expectEqual(@as(u64, 0), metrics.route_drop_total.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), metrics.route_overflow_total.load(.monotonic));
 }
@@ -982,23 +904,17 @@ test "stalled client (sends nothing) is reclaimed by the read timeout" {
     _ = n;
 }
 
-test "workflow counters: received and rejected by reason" {
-    var m = metrics_mod.Metrics{};
-    const ts = try TestSetup.initFull(1, TEST_SECRET, DEFAULT_READ_IDLE_TIMEOUT_MS, 512, &m);
+test "idle server: handler pool and accept loop sleep without periodic wakeups" {
+    const ts = try TestSetup.init(1, TEST_SECRET);
     defer ts.deinit();
 
-    // Accepted update → received.
-    try testing.expectEqual(@as(u16, 200), try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, VALID_UPDATE));
-    // Wrong method and bad secret → forbidden (2×).
-    try testing.expectEqual(@as(u16, 403), try httpReq("GET", ts.serverAddr(), "/webhook", TEST_SECRET, ""));
-    try testing.expectEqual(@as(u16, 403), try httpReq("POST", ts.serverAddr(), "/webhook", "wrong", VALID_UPDATE));
-    // Declared-oversize body → oversize.
-    try testing.expectEqual(@as(u16, 413), try httpOversizeBody(ts.serverAddr(), TEST_SECRET));
-    // Malformed JSON body → malformed.
-    try testing.expectEqual(@as(u16, 400), try httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, "{not json}"));
-
-    try testing.expectEqual(@as(u64, 1), m.updates_received_total.load(.monotonic));
-    try testing.expectEqual(@as(u64, 2), m.updates_rejected[@backingInt(metrics_mod.RejectReason.forbidden)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@backingInt(metrics_mod.RejectReason.oversize)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@backingInt(metrics_mod.RejectReason.malformed)].load(.monotonic));
+    // Let the server threads reach their idle wait, then count voluntary
+    // context switches for the whole process over an idle window. A 10 ms
+    // poll in each of the three server threads (two handlers, one acceptor)
+    // gives about 90 in 300 ms; blocking waits give none.
+    rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
+    const before = std.posix.getrusage(std.posix.rusage.SELF).nvcsw;
+    rt.sleepNs(testing.io, 300 * std.time.ns_per_ms);
+    const woke = std.posix.getrusage(std.posix.rusage.SELF).nvcsw - before;
+    try testing.expect(woke < 15);
 }

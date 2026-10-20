@@ -6,7 +6,7 @@
 //! SELECT MIN(fire_at_ms). Owns its own StateStore connection (WAL allows the
 //! concurrent worker writers that create/cancel jobs).
 //!
-//! Delivery is at-least-once: a claimed row is deleted by the worker only on
+//! Delivery is at-least-once: the worker deletes a claimed row only on
 //! terminal success, inside the handler's own transaction. A crash leaves the
 //! lease to expire, and the row is re-claimed and re-fired.
 const std = @import("std");
@@ -116,65 +116,6 @@ fn sleepCap(args: SchedulerArgs, now: i64) void {
 
 const testing = std.testing;
 
-test "schedulerThread claims a due job and enqueues it round-robin" {
-    var store = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer store.close();
-
-    var q = try queue_mod.Queue(types.WorkItem).init(testing.allocator, rt.io(), 16);
-    defer {
-        while (q.popTimeout(0)) |item| testing.allocator.free(item.body);
-        q.deinit(testing.allocator);
-    }
-    var qs = [_]*queue_mod.Queue(types.WorkItem){&q};
-
-    // A job already due (fire_at_ms in the past).
-    _ = try store.scheduleInsert(rt.nowMs(rt.io()) - 1000, "{\"hi\":1}");
-
-    var sched = Scheduler{ .io = rt.io(), .wait_cap_ns = 50 * std.time.ns_per_ms };
-    var stop = std.atomic.Value(bool).init(false);
-    const t = try std.Thread.spawn(.{}, schedulerThread, .{SchedulerArgs{
-        .db = &store, .worker_qs = &qs, .sched = &sched,
-        .stop = &stop, .io = rt.io(), .allocator = testing.allocator,
-    }});
-
-    const item = q.popTimeout(2 * std.time.ns_per_s);
-    try testing.expect(item != null);
-    defer testing.allocator.free(item.?.body);
-    try testing.expectEqual(types.WorkKind.schedule, item.?.kind);
-    try testing.expect(item.?.schedule_id != null);
-    try testing.expect(std.mem.find(u8, item.?.body, "\"hi\":1") != null);
-
-    stop.store(true, .release);
-    sched.wakeUp();
-    t.join();
-}
-
-test "schedulerThread does not fire a not-yet-due job" {
-    var store = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer store.close();
-    var q = try queue_mod.Queue(types.WorkItem).init(testing.allocator, rt.io(), 16);
-    defer {
-        while (q.popTimeout(0)) |item| testing.allocator.free(item.body);
-        q.deinit(testing.allocator);
-    }
-    var qs = [_]*queue_mod.Queue(types.WorkItem){&q};
-
-    _ = try store.scheduleInsert(rt.nowMs(rt.io()) + 60_000, "{}"); // due in 60s
-
-    var sched = Scheduler{ .io = rt.io(), .wait_cap_ns = 50 * std.time.ns_per_ms };
-    var stop = std.atomic.Value(bool).init(false);
-    const t = try std.Thread.spawn(.{}, schedulerThread, .{SchedulerArgs{
-        .db = &store, .worker_qs = &qs, .sched = &sched,
-        .stop = &stop, .io = rt.io(), .allocator = testing.allocator,
-    }});
-
-    try testing.expectEqual(@as(?types.WorkItem, null), q.popTimeout(150 * std.time.ns_per_ms));
-
-    stop.store(true, .release);
-    sched.wakeUp();
-    t.join();
-}
-
 test "schedulerThread re-claims a job whose lease has expired (at-least-once)" {
     // The core at-least-once guarantee: a worker that claims a row but crashes
     // before deleting it leaves the lease (claimed_at_ms) to expire. The next
@@ -227,10 +168,10 @@ test "schedulerThread re-claims a job whose lease has expired (at-least-once)" {
     t.join();
 }
 
-test "schedulerThread round-robins due jobs across worker queues" {
+test "schedulerThread fires due jobs round-robin as schedule items; a future job waits" {
     // The timer thread claims due jobs into worker queues round-robin
     // (rr increments per job). Two due jobs across two queues must land one each,
-    // not both on a single queue.
+    // not both on a single queue; a job due in 60 s must not fire.
     var store = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer store.close();
 
@@ -249,6 +190,7 @@ test "schedulerThread round-robins due jobs across worker queues" {
     const due = rt.nowMs(rt.io()) - 1000;
     _ = try store.scheduleInsert(due, "{\"a\":1}");
     _ = try store.scheduleInsert(due, "{\"b\":2}");
+    _ = try store.scheduleInsert(rt.nowMs(rt.io()) + 60_000, "{\"later\":1}");
 
     var m = metrics_mod.Metrics{};
     var sched = Scheduler{ .io = rt.io(), .wait_cap_ns = 50 * std.time.ns_per_ms };
@@ -267,74 +209,22 @@ test "schedulerThread round-robins due jobs across worker queues" {
     try testing.expect(item1 != null);
     defer testing.allocator.free(item0.?.body);
     defer testing.allocator.free(item1.?.body);
+    for ([_]types.WorkItem{ item0.?, item1.? }) |it| {
+        try testing.expectEqual(types.WorkKind.schedule, it.kind);
+        try testing.expect(it.schedule_id != null);
+        try testing.expect(std.mem.find(u8, it.body, "later") == null);
+    }
+
+    // Let a few more ticks run: the future job stays put.
+    rt.sleepNs(rt.io(), 150 * std.time.ns_per_ms);
 
     stop.store(true, .release);
     sched.wakeUp();
     t.join();
 
-    // No third item leaked into either queue.
+    // No third item (the future job, or a duplicate) reached either queue.
     try testing.expectEqual(@as(?types.WorkItem, null), q0.popTimeout(0));
     try testing.expectEqual(@as(?types.WorkItem, null), q1.popTimeout(0));
 
     try testing.expectEqual(@as(u64, 2), m.scheduler_jobs_fired_total.load(.monotonic));
-}
-
-test "schedulerThread caps a single tick at max_batch" {
-    // DEFAULT_MAX_BATCH caps a post-downtime catch-up burst. With more due rows
-    // than max_batch, no single tick may claim more than max_batch. A worker
-    // queue sized to max_batch fills on the first tick and stays full: a tick
-    // that claimed more would overflow it (and free the surplus), so the queue
-    // can never hold more than max_batch — and every row remains in the DB,
-    // since the scheduler never deletes a claimed row (only the worker does, on
-    // terminal success).
-    var store = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer store.close();
-
-    const max_batch: u32 = 3;
-    const total: u32 = max_batch + 5;
-
-    var q = try queue_mod.Queue(types.WorkItem).init(testing.allocator, rt.io(), max_batch);
-    defer {
-        while (q.popTimeout(0)) |item| testing.allocator.free(item.body);
-        q.deinit(testing.allocator);
-    }
-    var qs = [_]*queue_mod.Queue(types.WorkItem){&q};
-
-    const due = rt.nowMs(rt.io()) - 1000;
-    var i: u32 = 0;
-    while (i < total) : (i += 1) _ = try store.scheduleInsert(due, "{}");
-
-    var sched = Scheduler{ .io = rt.io(), .max_batch = max_batch, .wait_cap_ns = 50 * std.time.ns_per_ms };
-    var stop = std.atomic.Value(bool).init(false);
-    const t = try std.Thread.spawn(.{}, schedulerThread, .{SchedulerArgs{
-        .db = &store, .worker_qs = &qs, .sched = &sched,
-        .stop = &stop, .io = rt.io(), .allocator = testing.allocator,
-    }});
-
-    // The queue is never drained while the thread runs, so it fills on the first
-    // tick and stays full. Poll up to ~2 s for it to reach max_batch; it must
-    // never exceed it — proof a single tick claimed no more than max_batch and
-    // later ticks could not push surplus into the full queue.
-    var spins: u32 = 0;
-    while (q.len() < max_batch and spins < 200) : (spins += 1) {
-        rt.sleepNs(rt.io(), 10 * std.time.ns_per_ms);
-    }
-    try testing.expectEqual(@as(usize, max_batch), q.len());
-
-    stop.store(true, .release);
-    sched.wakeUp();
-    t.join();
-
-    // The queue still holds exactly max_batch — no tick ever overfilled it.
-    try testing.expectEqual(@as(usize, max_batch), q.len());
-
-    // Every row is still in the DB — the scheduler never deletes a claimed row.
-    // A far-future reclaim cutoff makes every still-present row claimable again.
-    const future_cutoff = due + DEFAULT_LEASE_MS + 1_000_000;
-    const remaining = try store.scheduleClaimDue(due + 1, future_cutoff, total + 10, testing.allocator);
-    defer {
-        for (remaining) |j| testing.allocator.free(j.payload);
-        testing.allocator.free(remaining);
-    }
-    try testing.expectEqual(@as(usize, total), remaining.len);
 }

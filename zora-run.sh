@@ -19,8 +19,9 @@ get_arch() {
 # find_jemalloc -> prints an absolute, readable libjemalloc path, or nothing.
 # It asks ldconfig for the native library first, then falls back to a fixed set
 # of directories. The multiarch entries are globs (aarch64-linux-gnu,
-# x86_64-linux-gnu, ...), so the one list serves x86-64, ARM64,
-# The sysroot prefix is part of each glob, so a fake tree (ZORA_SYSROOT) is searched too.
+# x86_64-linux-gnu, ...), so the one list serves both x86-64 and ARM64. The
+# sysroot prefix is part of each glob, so a fake tree (ZORA_SYSROOT) is
+# searched too.
 find_jemalloc() {
     if command -v ldconfig >/dev/null 2>&1; then
         tag=$(get_arch)
@@ -57,7 +58,7 @@ for c in "$dir/zora" "$dir/zig-out/bin/zora"; do
 done
 [ -n "$bin" ] || { log "zora binary not found near $dir"; exit 1; }
 
-# 1. Operator overrided LD_PRELOAD. Do not search.
+# 1. The operator set LD_PRELOAD: use it as is, do not search.
 if [ -n "${LD_PRELOAD:-}" ]; then
     log "LD_PRELOAD preset (${LD_PRELOAD}); not searching"
     exec "$bin" "$@"

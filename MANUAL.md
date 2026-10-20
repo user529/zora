@@ -33,11 +33,16 @@ the startup log mark the current contracts.
 | Requirement | Version |
 |---|---|
 | Zig | 0.17.0 |
-| Linux | x86_64, kernel ≥ 5.x (inotify) |
+| Linux | x86_64, kernel ≥ 5.10 (inotify) |
 | FreeBSD | x86_64, 14+ (kqueue) |
 
 No other runtime dependencies. The build compiles SQLite and Lua 5.4 into
 the binary.
+
+The first build needs network access. It fetches the `ziglua` package from
+`github.com`, the Lua 5.4 source from `www.lua.org`, and the `translate-c`
+package, with its `aro` dependency, from `codeberg.org`. Zig stores them in
+its package cache, and later builds run offline.
 
 > **Note — jemalloc (optional, recommended).** Zora runs on the system
 > allocator with no extra package. On Linux with glibc, the allocator can hold
@@ -53,14 +58,14 @@ the binary.
 ## Build
 
 ```bash
-# Debug build (with safety checks and GPA leak detection)
+# Debug build (with safety checks)
 zig build
 
 # Production build
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 
 # Cross-compile for FreeBSD from Linux
-zig build -Dtarget=x86_64-freebsd -Doptimize=ReleaseFast
+zig build -Dtarget=x86_64-freebsd -Doptimize=fast
 
 # Run unit tests
 zig build test
@@ -78,10 +83,10 @@ the CPU with `-Dcpu`:
 
 ```bash
 # Build for a specific microarchitecture (here, AMD Zen 4)
-zig build -Doptimize=ReleaseFast -Dcpu=znver4
+zig build -Doptimize=fast -Dcpu=znver4
 
 # Or build for a portable baseline that runs on any modern x86_64 host
-zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3
+zig build -Doptimize=fast -Dcpu=x86_64_v3
 ```
 
 ---
@@ -118,17 +123,17 @@ clear error message if either is absent.
 | Variable | Default | Description |
 |---|---|---|
 | `LISTEN_ADDR` | `0.0.0.0:8443` | `host:port` the HTTP server binds to |
-| `WEBHOOK_POOL_THREADS` | `cpu_count` | Number of inbound webhook connection-handler threads (minimum 2). One accept thread hands accepted connections to this pool |
+| `WEBHOOK_POOL_THREADS` | `cpu_count` | Number of inbound webhook connection-handler threads. The default is at least 2; the server runs at least one. One accept thread hands accepted connections to this pool |
 
 ### `[worker]` — Lua workers
 
 | Variable | Default | Description |
 |---|---|---|
 | `WORKER_THREADS` | `cpu_count` | Number of Lua worker threads (minimum 2) |
-| `WORKER_QUEUE_CAPACITY` | `1024` | Bounded queue depth per worker; the worker drops excess updates with a warning |
+| `WORKER_QUEUE_CAPACITY` | `1024` | Bounded queue depth per worker. When a worker's queue is full, the server places the update on another worker's queue; when every queue is full, it answers `503` and Telegram redelivers the update later |
 | `WORKER_MAX_INFLIGHT` | `64` | Maximum coroutines parked simultaneously per worker thread |
 | `WORKFLOW_DEADLINE_MS` | `60000` | Maximum wall-clock lifetime of a single coroutine workflow in milliseconds |
-| `JSON_MAX_BYTES` | `1048576` | Maximum input size in bytes accepted by `json.decode`; larger inputs raise a Lua error |
+| `JSON_MAX_BYTES` | `1048576` | Maximum size in bytes of `json.decode` input and `json.encode` output; a larger value raises a Lua error |
 
 ### `[io]` — blocking I/O pool
 
@@ -136,14 +141,14 @@ clear error message if either is absent.
 |---|---|---|
 | `IO_POOL_THREADS` | `8` | Number of blocking I/O pool threads (HTTP, exec, shell) |
 | `IO_QUEUE_CAPACITY` | `256` | I/O job queue depth shared across all pool threads |
-| `IO_JOB_TIMEOUT_MS` | `30000` | Per-job wall-clock timeout in milliseconds; the pool kills jobs that exceed it |
+| `IO_JOB_TIMEOUT_MS` | `30000` | Per-job wall-clock timeout in milliseconds. The pool kills a child process that exceeds it and cuts off an HTTP response that has not arrived by then. The connect and TLS handshake are bounded by the kernel connect timeout instead |
 | `PROC_MAX_OUTPUT_BYTES` | `65536` | Maximum bytes of stdout captured from child processes; zora truncates the excess |
 
 ### `[dispatcher]` — outbound Telegram calls
 
 | Variable | Default | Description |
 |---|---|---|
-| `DISPATCHER_THREADS` | `2 * cpu_count` | Outbound HTTP threads sending to the Telegram API (minimum 2). Each sends sequentially, so this multiplies outbound throughput; raise it for high send rates (e.g. premium) |
+| `DISPATCHER_THREADS` | `2 * cpu_count` | Outbound HTTP threads sending to the Telegram API. The default is at least 2; an explicit value must be at least 1. Each sends sequentially, so this multiplies outbound throughput; raise it for high send rates (e.g. premium) |
 | `DELAY_QUEUE_CAPACITY` | `4096` | Capacity of the retry-after delay queue. Calls held back by a Telegram rate limit (HTTP 429) wait here; an overflow drops the call with a warning |
 | `RETRY_AFTER_MAX_MS` | `60000` | Upper bound, in milliseconds, on how long a 429-throttled call waits before retry. Zora caps longer `retry_after` values from Telegram to this |
 | `RETRY_AFTER_DEFAULT_MS` | `1000` | Retry-after wait, in milliseconds, used when a Telegram 429 response omits the duration |
@@ -227,8 +232,6 @@ kill -TERM $PID
 ```
 
 On `SIGTERM` or `SIGINT`, zora drains in-flight work and exits cleanly.
-The GPA leak detector (Debug builds only) reports any unreleased allocations
-after shutdown.
 
 ### Startup log
 
@@ -252,8 +255,9 @@ The banner prints six identifiers:
 After the banner, zora prints every effective setting, one line per variable,
 under the `config` scope. It groups the lines by subsystem — `[bot]`,
 `[server]`, `[worker]`, `[io]`, `[dispatcher]`, `[metrics]` — in the order an
-update flows through the process. Each value is the one in force after zora applies its
-defaults, so the dump is the quickest way to confirm what the process loaded.
+update flows through the process. Each value is the one in force after zora
+applies its defaults, so the dump is the quickest way to confirm what the
+process loaded.
 
 ```
 info(config): [bot] BOT_TOKEN=123****wxYZ
@@ -266,9 +270,9 @@ info(config): [dispatcher] DISPATCHER_THREADS=16
 info(config): [metrics] METRICS_ADDR=disabled
 ```
 
-Zora masks `BOT_TOKEN`, `WEBHOOK_SECRET`, and `STATE_ENCRYPTION_KEY`: it prints a
-short prefix and suffix and replaces the rest with `****`. The mask hides a value of three
-characters or fewer in full. It reveals at most the first three and last four
+Zora masks `BOT_TOKEN`, `WEBHOOK_SECRET`, and `STATE_ENCRYPTION_KEY`: it prints
+a short prefix and suffix and replaces the rest with `****`. The mask hides a
+value of three characters or fewer in full. It reveals at most the first three and last four
 characters, never more than half the value, and never its length — so the dump
 is safe to leave in a log. Zora prints every other value in full.
 
@@ -283,10 +287,11 @@ function `on_message`.
 
 ```lua
 ---@param update table  Decoded Telegram Update object
----@return table        Array of Action tables (empty array is valid)
+---@return table        Usually {}; outgoing calls are emitted with tg.*
 function on_message(update)
     -- ...
-    return { ... }
+    tg.sendMessage{ chat_id = 123456789, text = "Hello" }
+    return {}
 end
 ```
 
@@ -302,10 +307,10 @@ task's delay expires:
 ```lua
 ---@param payload table  The payload object passed to bot.schedule_at or bot.schedule_after
 ---@param id      integer The schedule row id (for dedup/cancellation via bot.unschedule)
----@return table         Array of Action tables (empty array is valid)
+---@return table         Usually {}; outgoing calls are emitted with tg.*
 function on_schedule(payload, id)
     -- ...
-    return { ... }
+    return {}
 end
 ```
 
@@ -317,41 +322,57 @@ the handler contacts must also handle duplicate requests gracefully.
 
 ### Outgoing calls
 
-Return an array of API-call tables. Each call must have a `method` field naming
-a Telegram Bot API method, and an optional `params` table:
+A handler sends Telegram API calls by emitting them. `tg.<method>{params}`
+emits one call and is shorthand for
+`bot.emit{ method = "<method>", params = {params} }`. Any Bot API method works;
+zora checks each call against the vendored schema as `API_VALIDATION` sets.
 
 ```lua
 -- Send a plain text message
-{ method = "sendMessage", params = { chat_id = 123456789, text = "Hello!" } }
+tg.sendMessage{ chat_id = 123456789, text = "Hello!" }
 
 -- Send a message with parse mode
-{ method = "sendMessage", params = { chat_id = 123456789, text = "<b>Bold</b>",
-                                     parse_mode = "HTML" } }
+tg.sendMessage{ chat_id = 123456789, text = "<b>Bold</b>", parse_mode = "HTML" }
 
 -- Answer an inline keyboard callback query
-{ method = "answerCallbackQuery",
-  params = { callback_query_id = update.callback_query.id, text = "Done" } }
+tg.answerCallbackQuery{ callback_query_id = update.callback_query.id, text = "Done" }
 
 -- Delete a message
-{ method = "deleteMessage", params = { chat_id = 123456789, message_id = 42 } }
+tg.deleteMessage{ chat_id = 123456789, message_id = 42 }
+
+-- The first call again, through bot.emit
+bot.emit{ method = "sendMessage", params = { chat_id = 123456789, text = "Hello!" } }
 ```
 
-You can also fire calls mid-handler using `bot.emit{...}` (collected before the
-return list) or the `tg.*` shorthand:
+A handler may also return an array of call tables, each shaped
+`{ method = "...", params = {...} }`. Zora sends the emitted calls first, in
+emit order, then the returned ones.
+
+Zora sends the calls after the handler finishes. A yield (see
+[Async Rules](#async-rules-rules_api-v1)) does not send them early. If the
+handler raises an error or is reaped at its deadline, zora sends none of its
+calls.
+
+### File uploads
+
+A parameter whose value is a file table turns the call into a multipart upload:
 
 ```lua
--- These are equivalent:
-bot.emit{ method = "sendMessage", params = { chat_id = 1, text = "hi" } }
-tg.sendMessage{ chat_id = 1, text = "hi" }
+-- Read the file from disk
+tg.sendPhoto{ chat_id = chat_id, photo = { __file = "/srv/zora/cat.jpg" } }
+
+-- Send bytes held in Lua; `filename` is required
+tg.sendDocument{ chat_id = chat_id,
+                 document = { __file_bytes = csv, filename = "report.csv" } }
 ```
 
-Zora dispatches the calls asynchronously after `on_message` returns. It
-preserves the order within one invocation: emit calls first, then the
-return list.
+A file may be up to 50 MB, the Telegram limit for bot uploads. Zora logs and
+drops a call with a larger file, an unreadable `__file` path, or a
+`__file_bytes` table without `filename`.
 
 ### `bot.*` API
 
-These functions are available inside `on_message`:
+These functions are available inside `on_message` and `on_schedule`:
 
 ```lua
 -- Per-user state (persisted in SQLite, keyed by Telegram user_id)
@@ -406,20 +427,22 @@ The following are **disabled** for security: `io`, `os`, `package`, `debug`,
 
 ### Execution limits
 
-Each `on_message` call has a hard instruction-count limit to prevent runaway
-loops or infinite recursion. When a call exceeds it, the worker logs a warning,
-returns an empty action slice, and continues with the next update.
+A handler may run at most 10 million Lua instructions between two yields; deep
+recursion overflows the Lua stack. Either stops runaway loops and recursion. The
+handler then fails like any Lua error: the worker logs a warning, sends none of
+the handler's calls, rolls back the state writes of the running part, and
+continues with the next update.
 
-Zora limits state blobs to **64 KB** serialised and **8 levels** of table
-nesting. It rejects writes that exceed these limits with a logged error and
-preserves the previous state value.
+Zora limits state values to **64 KB** serialised and **8 levels** of table
+nesting. A write that exceeds a limit raises a Lua error, and the stored value
+stays as it was.
 
 ### Example rules file
 
 ```lua
 function on_message(update)
     local msg = update.message
-    if not msg then return {} end
+    if not msg or not msg.from then return {} end
 
     local user_id = msg.from.id
     local chat_id = msg.chat.id
@@ -495,8 +518,10 @@ local r = bot.exec{ argv = { "dig", "+short", domain } }
 -- Run a shell command (use bot.shell_quote for untrusted parts)
 local r = bot.shell{ command = "echo hello" }
 
--- Send a message and get back the message_id (tracked send)
-local mid = bot.send_message{ chat_id = chat_id, text = "🔍 searching…" }
+-- Send a message and get back the message_id (tracked send). `opts` adds
+-- further sendMessage parameters. A failed send raises a Lua error.
+local mid = bot.send_message{ chat_id = chat_id, text = "🔍 searching…",
+                              opts = { parse_mode = "HTML" } }
 ```
 
 ### Fire-and-forget (does not park the coroutine)
@@ -509,7 +534,7 @@ bot.emit{ method = "sendMessage", params = { chat_id = id, text = "hi" } }
 
 ```lua
 json.decode(str)      -- returns table; raises Lua error if input > JSON_MAX_BYTES or invalid JSON
-json.encode(table)    -- returns string
+json.encode(table)    -- returns string; raises Lua error if output > JSON_MAX_BYTES
 
 bot.url_encode(str)   -- RFC 3986 percent-encoding; returns string
 bot.shell_quote(str)  -- safe quoting for sh -c command strings; returns string
@@ -522,8 +547,19 @@ Two limits bound coroutines:
 - `WORKER_MAX_INFLIGHT` — if this many coroutines are already parked, the
   worker stops accepting new updates until a slot frees.
 - `WORKFLOW_DEADLINE_MS` — the worker reaps coroutines running longer than
-  this, discarding the Lua state and freeing the slot. Set it to the maximum
-  acceptable round-trip time for the slowest I/O operation a rule might perform.
+  this, discarding the coroutine and its unsent calls and freeing the slot. Set
+  it to the maximum acceptable round-trip time for the slowest I/O operation a
+  rule might perform.
+
+### State writes across a yield
+
+Each part of a handler between yields commits as one transaction: the part
+before the first yielding call, and each part after a resume. State written
+before a yield is saved once the coroutine parks, and a later error does not
+roll it back. A read-modify-write that spans a yield (read state, call out,
+write state) is therefore not atomic. Change state within one part, or keep the
+change idempotent. Zora never holds a transaction across a yield, because that
+would block every other writer for the length of the network call.
 
 ---
 
@@ -553,8 +589,8 @@ vim rules/rules.lua
    `worker N: reload failed` at `WARN` level and keeps the `on_message` it
    already had. The counter copy still advances, so a broken file is not
    retried until the file changes again.
-4. If the rules file is deleted, the watcher logs a warning and the workers
-   keep their current rules.
+4. If the rules file is deleted, the workers keep their current rules. On Linux
+   the watcher also logs a warning.
 
 Each worker reloads on its own, so during a reload some workers may run the
 new rules for a short window while others still run the old ones.
@@ -581,8 +617,9 @@ Three namespaces exist:
 | chat state | `chat_id` (integer) | per-group or per-channel state |
 | global state | arbitrary string | shared counters, feature flags |
 
-State values are Lua tables that zora serialises to JSON. A read returns an
-empty table `{}` for an unknown key — never `nil`.
+User and chat state values are Lua tables that zora stores as JSON; a read for
+an unknown id returns an empty table `{}`, never `nil`. Global state maps a
+string key to a string value; a read for an unknown key returns `nil`.
 
 ### Concurrency
 
@@ -620,7 +657,7 @@ sqlite3 state.db "PRAGMA integrity_check;"
 ```
 
 The current schema version is 2. A database created by an earlier zora (schema 1)
-needs a one-time upgrade before this release will open it; see [Migrating an
+needs a one-time upgrade; this release does not open it as is. See [Migrating an
 Existing Database to v2](#migrating-an-existing-database-to-v2). When encryption
 is on, the payload columns hold ciphertext, so `.dump` and `SELECT` return BLOBs
 rather than readable JSON; see [Encrypting State at Rest](#encrypting-state-at-rest).
@@ -668,8 +705,8 @@ timing stay visible. Each encrypted value carries a fixed 40-byte envelope (a
 Zora holds the derived key in a locked memory page (`mlock`, best-effort) so it
 does not reach swap, and wipes the key on shutdown. It strips
 `STATE_ENCRYPTION_KEY` — along with `BOT_TOKEN` and `WEBHOOK_SECRET` — from the
-environment of any child process a rule spawns through `bot.shell`, `bot.exec`,
-or `bot.http_request`. The configuration dump masks the passphrase like the other
+environment of any child process a rule spawns through `bot.shell` or
+`bot.exec`. The configuration dump masks the passphrase like the other
 secrets, and the startup banner shows only `enc=on` or `enc=off`, never the value.
 
 ### Enabling it
@@ -717,9 +754,10 @@ is encrypted (see [Encrypting State at Rest](#encrypting-state-at-rest)); unset,
 it is plaintext v2. The tool copies every user, chat, global, and scheduler row —
 preserving scheduler ids and pending leases — then reopens the result to confirm
 it is valid before finishing. It refuses to overwrite an existing `--out` file and
-refuses a source that is not schema v1. Like the server, it hardens its own
-process — it locks memory and suppresses core dumps — so the passphrase and the
-decrypted data do not reach swap or a core file.
+refuses a source that is not schema v1. It hardens its own process — it locks
+all its memory and suppresses core dumps — so the passphrase and the decrypted
+data do not reach swap or a core file. (The server locks only the page that
+holds the derived key.)
 
 The tool builds with the rest of zora; the binary is `zig-out/bin/zora-migrate`.
 
@@ -729,9 +767,10 @@ The tool builds with the rest of zora; the binary is `zig-out/bin/zora-migrate`.
 
 Zora exposes runtime counters over a Prometheus scrape endpoint. Set
 `METRICS_ADDR` to a `host:port` and zora serves the metrics there; leave it
-unset and the endpoint does not start. The endpoint runs on its own thread and
-touches nothing on the update path, so a scrape never slows the bot. A scrape
-that fails is logged at `warn` and dropped.
+unset and the endpoint does not start. The endpoint runs on its own thread. A
+scrape reads the counters and takes each queue's lock once to sample its depth;
+it does nothing else on the update path. Zora logs a failed scrape at `warn`
+and drops it.
 
 ### The endpoint
 
@@ -773,7 +812,7 @@ between scrapes.
 | `zora_rules_reloads_total{outcome}` | counter | Hot reloads of the rules file. `outcome`: `ok`, `failed` |
 | `zora_scheduler_jobs_fired_total` | counter | Scheduled jobs claimed and dispatched to workers |
 | `zora_route_overflow_total` | counter | Updates placed on a non-primary worker because the primary queue was full |
-| `zora_route_drop_total` | counter | Updates dropped because every worker queue was full |
+| `zora_route_drop_total` | counter | Updates dropped after the request was read, because every worker queue filled in the meantime. A connection shed at accept time, when every queue is already full, gets `503` and is not counted here |
 | `zora_throttle_429_total` | counter | HTTP 429 responses observed from the Telegram API |
 | `zora_throttle_delayed_total` | counter | Calls parked in the delay queue by rate limiting |
 | `zora_throttle_shed_total` | counter | Calls dropped on delay-queue overflow |
@@ -790,6 +829,11 @@ between scrapes.
 | `zora_worker_queue_depth{worker}` | gauge | Updates waiting in each worker queue, one series per worker |
 | `zora_dispatcher_queue_depth` | gauge | API calls waiting in the dispatcher queue |
 | `zora_build_info{release,branch}` | gauge | Build identity; the value is always `1` |
+
+A ready-made Grafana dashboard covering every metric above ships at
+`docs/grafana/zora-dashboard.json` (Grafana 11.x). Import it and pick your
+Prometheus datasource when prompted. `docs/grafana/check-dashboard.sh` checks
+the dashboard still covers every metric this build exposes.
 
 The `route_overflow` and `route_drop` counters record where the
 `hash(user_id) % worker_count` affinity relaxes under load — see

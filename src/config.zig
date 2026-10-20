@@ -1,15 +1,15 @@
-/// config.zig — load configuration from environment variables.
-///
-/// Entry point:
-///   loadFromMap(allocator, env)  — reads from a caller-supplied environment map.
-///
-/// The caller owns the environment map. The process entry point obtains it from
-/// the runtime (`std.process.Init.environ_map`); tests build one by hand. Zig
-/// 0.16 removed the self-fetching `std.process.getEnvMap`, so the environment is
-/// always passed in.
-///
-/// String fields in the returned Config are allocated from `allocator`.
-/// Call deinit(config, allocator) when the config is no longer needed.
+//! config.zig — load configuration from environment variables.
+//!
+//! Entry point:
+//!   loadFromMap(allocator, env)  — reads from a caller-supplied environment map.
+//!
+//! The caller owns the environment map. The process entry point obtains it from
+//! the runtime (`std.process.Init.environ_map`); tests build one by hand. Zig
+//! 0.16 removed the self-fetching `std.process.getEnvMap`, so the environment is
+//! always passed in.
+//!
+//! String fields in the returned Config are allocated from `allocator`.
+//! Call deinit(config, allocator) when the config is no longer needed.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -84,13 +84,14 @@ pub fn loadFromMap(allocator: std.mem.Allocator, env: std.process.Environ.Map) C
     // dropped and Telegram retries, so size for bursts — RAM is abundant here)
     const worker_queue_capacity = try parseUintMin(u16, env, "WORKER_QUEUE_CAPACITY", 1024, 1);
 
-    // Optional: DISPATCHER_THREADS (default: 2 * cpu_count, minimum 2 —
-    // network-I/O-bound outbound senders; thread count multiplies throughput).
+    // Optional: DISPATCHER_THREADS (default 2 × cpu_count, at least 2; an
+    // explicit value must be ≥ 1). The senders are network-I/O-bound, so the
+    // thread count multiplies throughput.
     const dispatcher_threads = try parseUintMin(u8, env, "DISPATCHER_THREADS", cpuScaledThreads(2), 1);
 
-    // Optional: WEBHOOK_POOL_THREADS (default: cpu_count, minimum 2 — webhook
-    // connection-handler pool size). The pool reuses threads, so this bounds
-    // concurrency, not per-message allocation.
+    // Optional: WEBHOOK_POOL_THREADS (default cpu_count, at least 2 — webhook
+    // connection-handler pool size; the server runs at least one). The pool
+    // reuses threads, so this bounds concurrency, not per-message allocation.
     const webhook_pool_threads = try parseUint(u8, env, "WEBHOOK_POOL_THREADS", cpuScaledThreads(1));
 
     // Optional: JSON_MAX_BYTES (1 MB default — max size for json.decode/encode in Lua)
@@ -266,21 +267,9 @@ pub fn sanitizeChildEnv(
     allocator: std.mem.Allocator,
     env: std.process.Environ.Map,
 ) !std.process.Environ.Map {
-    const deny = [_][]const u8{ "BOT_TOKEN", "WEBHOOK_SECRET", "STATE_ENCRYPTION_KEY" };
-    var out = std.process.Environ.Map.init(allocator);
-    errdefer out.deinit();
-    var it = env.iterator();
-    while (it.next()) |entry| {
-        const key = entry.key_ptr.*;
-        var secret = false;
-        for (deny) |d| {
-            if (std.mem.eql(u8, key, d)) {
-                secret = true;
-                break;
-            }
-        }
-        if (!secret) try out.put(key, entry.value_ptr.*);
-    }
+    var out = try env.clone(allocator);
+    for ([_][]const u8{ "BOT_TOKEN", "WEBHOOK_SECRET", "STATE_ENCRYPTION_KEY" }) |key|
+        _ = out.swapRemove(key);
     return out;
 }
 
@@ -308,7 +297,7 @@ fn parseUint(comptime T: type, env: std.process.Environ.Map, key: []const u8, de
 /// Like parseUint, but rejects a value below `min`. Counts and ring-buffer
 /// capacities must be positive: a zero worker count divides by zero in the
 /// hash routing, a zero queue capacity divides by zero in the ring buffer (the
-/// Queue.init assert is compiled out in ReleaseFast), and a zero dispatcher,
+/// Queue.init assert is compiled out in fast builds), and a zero dispatcher,
 /// io-pool, or inflight bound silently processes nothing. Defaults are already
 /// positive; this guards an explicit `KEY=0`.
 fn parseUintMin(comptime T: type, env: std.process.Environ.Map, key: []const u8, default: T, min: T) ConfigError!T {
@@ -332,11 +321,8 @@ fn parseBool(env: std.process.Environ.Map, key: []const u8, default: bool) Confi
 /// An unrecognised value → error.InvalidConfig.
 fn parseValidationMode(env: std.process.Environ.Map) ConfigError!types.ValidationMode {
     const raw = env.get("API_VALIDATION") orelse return .warn;
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (std.mem.eql(u8, trimmed, "off")) return .off;
-    if (std.mem.eql(u8, trimmed, "warn")) return .warn;
-    if (std.mem.eql(u8, trimmed, "strict")) return .strict;
-    return error.InvalidConfig;
+    return std.meta.stringToEnum(types.ValidationMode, std.mem.trim(u8, raw, " \t\r\n")) orelse
+        error.InvalidConfig;
 }
 
 /// Returns cpu_count * multiplier, clamped to [2, maxInt(u8)].
@@ -360,7 +346,7 @@ fn cpuScaledThreads(multiplier: usize) u8 {
 
 const testing = std.testing;
 
-// --- Output capture for logEffective tests (P3-1, P4-3, P4-43) ---
+// --- Output capture for logEffective tests ---
 //
 // logEffective routes its output through std.log, whose backend in the test
 // runner is owned by the test_runner.zig root and cannot be redirected from a
@@ -412,6 +398,7 @@ test "loads every field from a fully populated environment" {
         .{ "RETRY_AFTER_MAX_MS",     "30000" },
         .{ "RETRY_AFTER_DEFAULT_MS", "500" },
         .{ "METRICS_ADDR",           "127.0.0.1:9100" },
+        .{ "STATE_ENCRYPTION_KEY",   "passphrase" },
     });
     defer env.deinit();
 
@@ -427,6 +414,7 @@ test "loads every field from a fully populated environment" {
     try testing.expectEqual(types.ValidationMode.strict, cfg.api_validation);
     try testing.expectEqualStrings("http://127.0.0.1:9000", cfg.bot_api_base);
     try testing.expectEqual(true, cfg.metrics_log);
+    try testing.expectEqualStrings("passphrase", cfg.state_encryption_key.?);
 
     // [server]
     try testing.expectEqual(@as(u16, 9443), cfg.listen_addr.ip4.port);
@@ -472,14 +460,23 @@ test "applies defaults when optional fields are absent" {
     try testing.expectEqualStrings("https://api.telegram.org", cfg.bot_api_base);
     try testing.expectEqual(types.ValidationMode.warn, cfg.api_validation);
     try testing.expectEqual(false, cfg.metrics_log);
+    try testing.expectEqual(@as(?[]const u8, null), cfg.state_encryption_key);
 
-    // [server]: LISTEN_ADDR default is 0.0.0.0:8443. In 0.16 IpAddress the
-    // port is stored in native byte order.
+    // [server]: LISTEN_ADDR default is 0.0.0.0:8443; IpAddress keeps the port
+    // in native byte order. WEBHOOK_POOL_THREADS scales with
+    // the CPU count, minimum 2.
     try testing.expectEqual(@as(u16, 8443), cfg.listen_addr.ip4.port);
+    try testing.expect(cfg.webhook_pool_threads >= 2);
 
-    // [worker]: minimum 2 workers; queue capacity 1024.
-    try testing.expect(cfg.worker_threads >= 2);
+    // [worker]: WORKER_THREADS = CPU count, minimum 2; queue capacity 1024;
+    // 64 coroutines in flight; 60 s workflow deadline; 1 MB JSON cap.
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const exp_worker: u32 = @max(2, @as(u32, @intCast(@min(cpu_count, @as(usize, std.math.maxInt(u32))))));
+    try testing.expectEqual(exp_worker, cfg.worker_threads);
     try testing.expectEqual(@as(u16, 1024), cfg.worker_queue_capacity);
+    try testing.expectEqual(@as(u16, 64), cfg.worker_max_inflight);
+    try testing.expectEqual(@as(u64, 60_000), cfg.workflow_deadline_ms);
+    try testing.expectEqual(@as(usize, 1_048_576), cfg.json_max_bytes);
 
     // [io]: IO_POOL_THREADS = 8, IO_QUEUE_CAPACITY = 256, IO_JOB_TIMEOUT_MS =
     // 30 000, PROC_MAX_OUTPUT_BYTES = 65 536.
@@ -488,52 +485,19 @@ test "applies defaults when optional fields are absent" {
     try testing.expectEqual(@as(u64,   30_000), cfg.io_job_timeout_ms);
     try testing.expectEqual(@as(usize, 65_536), cfg.proc_max_output_bytes);
 
-    // [dispatcher]: at least 2 threads; throttle defaults.
-    try testing.expect(cfg.dispatcher_threads >= 2);
+    // [dispatcher]: DISPATCHER_THREADS = 2 × CPU count, minimum 2; throttle
+    // defaults.
+    const exp_disp: u8 = @max(2, @as(u8, @intCast(@min(cpu_count * 2, @as(usize, std.math.maxInt(u8))))));
+    try testing.expectEqual(exp_disp, cfg.dispatcher_threads);
     try testing.expectEqual(@as(u16, 4_096),  cfg.delay_queue_capacity);
     try testing.expectEqual(@as(u64, 60_000), cfg.retry_after_max_ms);
     try testing.expectEqual(@as(u64, 1_000),  cfg.retry_after_default_ms);
+
+    // [metrics]: METRICS_ADDR unset disables the endpoint.
+    try testing.expectEqual(@as(?std.Io.net.IpAddress, null), cfg.metrics_addr);
 }
 
-test "thread counts scale with CPU and accept explicit overrides" {
-    const cpu_count = std.Thread.getCpuCount() catch 1;
-
-    // Absent: worker/dispatcher/conn-pool default to CPU-scaled values (min 2).
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-
-        // WORKER_THREADS → cpu_count, minimum 2.
-        const exp_worker: u32 = @max(2, @as(u32, @intCast(@min(cpu_count, @as(usize, std.math.maxInt(u32))))));
-        try testing.expectEqual(exp_worker, cfg.worker_threads);
-        try testing.expect(cfg.worker_threads >= 2);
-
-        // DISPATCHER_THREADS → 2 * cpu_count, minimum 2.
-        const exp_disp: u8 = @max(2, @as(u8, @intCast(@min(cpu_count * 2, @as(usize, std.math.maxInt(u8))))));
-        try testing.expectEqual(exp_disp, cfg.dispatcher_threads);
-        try testing.expect(cfg.dispatcher_threads >= 2);
-
-        // WEBHOOK_POOL_THREADS → cpu_count, minimum 2.
-        try testing.expect(cfg.webhook_pool_threads >= 2);
-    }
-    // An explicit WEBHOOK_POOL_THREADS is used verbatim.
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-            .{ "WEBHOOK_POOL_THREADS", "5" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(u8, 5), cfg.webhook_pool_threads);
-    }
-}
-
-test "WORKER_THREADS trims whitespace; minimum is 2, not 1" {
+test "WORKER_THREADS trims whitespace and accepts the minimum of 2" {
     // Whitespace around the value is trimmed.
     {
         var env = try makeEnv(testing.allocator, &.{
@@ -544,15 +508,6 @@ test "WORKER_THREADS trims whitespace; minimum is 2, not 1" {
         const cfg = try loadFromMap(testing.allocator, env);
         defer deinit(cfg, testing.allocator);
         try testing.expectEqual(@as(u32, 4), cfg.worker_threads);
-    }
-    // 1 is below the mandated minimum of 2 — must be rejected.
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-            .{ "WORKER_THREADS", "1" },
-        });
-        defer env.deinit();
-        try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
     }
     // 2 is the minimum — must be accepted.
     {
@@ -588,18 +543,33 @@ test "missing a required field returns MissingRequiredField" {
     }
 }
 
-test "numeric fields reject non-numeric input" {
-    // Every integer field rejects a value that is not a base-10 integer. The
-    // float case guards against accidental parseFloat tolerance.
+test "invalid values return InvalidConfig" {
+    // Integer fields reject a value that is not a base-10 integer; the float
+    // case guards against accidental parseFloat tolerance. Counts and ring
+    // capacities reject an explicit 0: it would divide by zero (hash routing,
+    // ring buffer) or silently process nothing. An empty WEBHOOK_SECRET would
+    // match a request that sends an empty secret header, so it is rejected
+    // too.
     const cases = [_]struct { key: []const u8, val: []const u8 }{
-        .{ .key = "WORKER_THREADS",            .val = "not_a_number" },
-        .{ .key = "WORKER_THREADS",            .val = "3.5" },
-        .{ .key = "WORKER_QUEUE_CAPACITY",          .val = "lots" },
-        .{ .key = "DISPATCHER_THREADS",      .val = "four" },
-        .{ .key = "IO_POOL_THREADS",         .val = "many" },
-        .{ .key = "WORKER_MAX_INFLIGHT", .val = "lots" },
-        .{ .key = "WORKFLOW_DEADLINE_MS",    .val = "never" },
-        .{ .key = "JSON_MAX_BYTES",          .val = "abc" },
+        .{ .key = "WORKER_THREADS",        .val = "not_a_number" },
+        .{ .key = "WORKER_THREADS",        .val = "3.5" },
+        .{ .key = "WORKER_QUEUE_CAPACITY", .val = "lots" },
+        .{ .key = "DISPATCHER_THREADS",    .val = "four" },
+        .{ .key = "IO_POOL_THREADS",       .val = "many" },
+        .{ .key = "WORKER_MAX_INFLIGHT",   .val = "lots" },
+        .{ .key = "WORKFLOW_DEADLINE_MS",  .val = "never" },
+        .{ .key = "JSON_MAX_BYTES",        .val = "abc" },
+        .{ .key = "WORKER_THREADS",        .val = "1" },
+        .{ .key = "WORKER_THREADS",        .val = "0" },
+        .{ .key = "WORKER_QUEUE_CAPACITY", .val = "0" },
+        .{ .key = "DISPATCHER_THREADS",    .val = "0" },
+        .{ .key = "IO_POOL_THREADS",       .val = "0" },
+        .{ .key = "IO_QUEUE_CAPACITY",     .val = "0" },
+        .{ .key = "WORKER_MAX_INFLIGHT",   .val = "0" },
+        .{ .key = "API_VALIDATION",        .val = "loud" },
+        .{ .key = "METRICS_LOG",           .val = "yes" },
+        .{ .key = "METRICS_ADDR",          .val = "not-an-address" },
+        .{ .key = "WEBHOOK_SECRET",        .val = "" },
     };
     for (cases) |c| {
         var env = try makeEnv(testing.allocator, &.{
@@ -614,257 +584,36 @@ test "numeric fields reject non-numeric input" {
     }
 }
 
-test "positive-count fields reject an explicit zero" {
-    // Counts and ring-buffer capacities that must be ≥1. An explicit 0 would
-    // divide by zero (hash routing, ring buffer) or silently process nothing
-    // (dispatcher, io-pool, inflight bound), so loadFromMap rejects it. The
-    // CPU-scaled defaults are already positive; this guards the explicit case.
-    const keys = [_][]const u8{
-        "WORKER_THREADS",
-        "WORKER_QUEUE_CAPACITY",
-        "DISPATCHER_THREADS",
-        "IO_POOL_THREADS",
-        "IO_QUEUE_CAPACITY",
-        "WORKER_MAX_INFLIGHT",
+test "API_VALIDATION and METRICS_LOG accept every spelling" {
+    const cases = [_]struct { key: []const u8, val: []const u8, mode: types.ValidationMode = .warn, log: bool = false }{
+        .{ .key = "API_VALIDATION", .val = "off",    .mode = .off },
+        .{ .key = "API_VALIDATION", .val = "warn",   .mode = .warn },
+        .{ .key = "API_VALIDATION", .val = "strict", .mode = .strict },
+        .{ .key = "METRICS_LOG",    .val = "false",  .log = false },
+        .{ .key = "METRICS_LOG",    .val = "0",      .log = false },
+        .{ .key = "METRICS_LOG",    .val = "true",   .log = true },
     };
-    for (keys) |key| {
+    for (cases) |c| {
         var env = try makeEnv(testing.allocator, &.{
             .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-            .{ key, "0" },
-        });
-        defer env.deinit();
-        testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env)) catch |e| {
-            std.debug.print("field {s}=0 did not return InvalidConfig\n", .{key});
-            return e;
-        };
-    }
-}
-
-test "BOT_API_BASE absent uses the default; present is used" {
-    var env_default = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env_default.deinit();
-    const cfg_default = try loadFromMap(testing.allocator, env_default);
-    defer deinit(cfg_default, testing.allocator);
-    try testing.expectEqualStrings("https://api.telegram.org", cfg_default.bot_api_base);
-
-    var env_set = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-        .{ "BOT_API_BASE", "http://127.0.0.1:9000" },
-    });
-    defer env_set.deinit();
-    const cfg_set = try loadFromMap(testing.allocator, env_set);
-    defer deinit(cfg_set, testing.allocator);
-    try testing.expectEqualStrings("http://127.0.0.1:9000", cfg_set.bot_api_base);
-}
-
-test "API_VALIDATION parsed; default warn; invalid → InvalidConfig" {
-    var env_default = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env_default.deinit();
-    const cfg_default = try loadFromMap(testing.allocator, env_default);
-    defer deinit(cfg_default, testing.allocator);
-    try testing.expectEqual(types.ValidationMode.warn, cfg_default.api_validation);
-
-    inline for (.{ "off", "warn", "strict" }) |mode_str| {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-            .{ "API_VALIDATION", mode_str },
+            .{ c.key, c.val },
         });
         defer env.deinit();
         const cfg = try loadFromMap(testing.allocator, env);
         defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(
-            @field(types.ValidationMode, mode_str),
-            cfg.api_validation,
-        );
-    }
-
-    var env_bad = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-        .{ "API_VALIDATION", "loud" },
-    });
-    defer env_bad.deinit();
-    try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env_bad));
-}
-
-test "SCHEMA_FILE absent uses the default; present is used" {
-    var env_default = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-    });
-    defer env_default.deinit();
-    const cfg_default = try loadFromMap(testing.allocator, env_default);
-    defer deinit(cfg_default, testing.allocator);
-    try testing.expectEqualStrings("schema/botapi.json", cfg_default.schema_file);
-
-    var env_set = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-        .{ "SCHEMA_FILE", "/etc/zora/api.json" },
-    });
-    defer env_set.deinit();
-    const cfg_set = try loadFromMap(testing.allocator, env_set);
-    defer deinit(cfg_set, testing.allocator);
-    try testing.expectEqualStrings("/etc/zora/api.json", cfg_set.schema_file);
-}
-
-test "JSON_MAX_BYTES parses a value and defaults to 1 MB" {
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(usize, 1048576), cfg.json_max_bytes);
-    }
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-            .{ "JSON_MAX_BYTES", "524288" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(usize, 524288), cfg.json_max_bytes);
-    }
-}
-
-test "io_pool fields parse explicit values and apply defaults" {
-    // Absent → defaults.
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(u8,    8),      cfg.io_pool_threads);
-        try testing.expectEqual(@as(u16,   256),    cfg.io_queue_capacity);
-        try testing.expectEqual(@as(u64,   30_000), cfg.io_job_timeout_ms);
-        try testing.expectEqual(@as(usize, 65_536), cfg.proc_max_output_bytes);
-    }
-    // Present → parsed.
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN",         "tok" }, .{ "WEBHOOK_SECRET",   "sec" },
-            .{ "IO_POOL_THREADS",   "8" },   .{ "IO_QUEUE_CAPACITY", "512" },
-            .{ "IO_JOB_TIMEOUT_MS", "10000" }, .{ "PROC_MAX_OUTPUT_BYTES", "131072" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(u8,    8),       cfg.io_pool_threads);
-        try testing.expectEqual(@as(u16,   512),     cfg.io_queue_capacity);
-        try testing.expectEqual(@as(u64,   10_000),  cfg.io_job_timeout_ms);
-        try testing.expectEqual(@as(usize, 131_072), cfg.proc_max_output_bytes);
-    }
-}
-
-test "WORKER_MAX_INFLIGHT and WORKFLOW_DEADLINE_MS parse and default" {
-    // Absent → defaults.
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(u16, 64),     cfg.worker_max_inflight);
-        try testing.expectEqual(@as(u64, 60_000), cfg.workflow_deadline_ms);
-    }
-    // Present → parsed.
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-            .{ "WORKER_MAX_INFLIGHT", "32" }, .{ "WORKFLOW_DEADLINE_MS", "30000" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(u16, 32),     cfg.worker_max_inflight);
-        try testing.expectEqual(@as(u64, 30_000), cfg.workflow_deadline_ms);
-    }
-}
-
-test "METRICS_LOG parses booleans and rejects invalid values" {
-    const ok = [_]struct { val: ?[]const u8, want: bool }{
-        .{ .val = null,    .want = false }, // absent → default false (deprecated)
-        .{ .val = "false", .want = false },
-        .{ .val = "0",     .want = false },
-        .{ .val = "true",  .want = true },
-    };
-    for (ok) |c| {
-        var env = if (c.val) |v|
-            try makeEnv(testing.allocator, &.{
-                .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" }, .{ "METRICS_LOG", v },
-            })
-        else
-            try makeEnv(testing.allocator, &.{
-                .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-            });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(c.want, cfg.metrics_log);
-    }
-    // An unrecognised value is rejected.
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" }, .{ "METRICS_LOG", "yes" },
-        });
-        defer env.deinit();
-        try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
-    }
-}
-
-test "throttle config defaults and overrides" {
-    // Defaults (only required keys provided).
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "t" }, .{ "WEBHOOK_SECRET", "s" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(u16, 4096),  cfg.delay_queue_capacity);
-        try testing.expectEqual(@as(u64, 60000), cfg.retry_after_max_ms);
-        try testing.expectEqual(@as(u64, 1000),  cfg.retry_after_default_ms);
-    }
-    // Overrides.
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "t" }, .{ "WEBHOOK_SECRET", "s" },
-            .{ "DELAY_QUEUE_CAPACITY", "256" },
-            .{ "RETRY_AFTER_MAX_MS", "30000" },
-            .{ "RETRY_AFTER_DEFAULT_MS", "500" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(u16, 256),   cfg.delay_queue_capacity);
-        try testing.expectEqual(@as(u64, 30000), cfg.retry_after_max_ms);
-        try testing.expectEqual(@as(u64, 500),   cfg.retry_after_default_ms);
+        try testing.expectEqual(c.mode, cfg.api_validation);
+        try testing.expectEqual(c.log, cfg.metrics_log);
     }
 }
 
 test "logEffective output: subsystem groups, field lines, and secret masking" {
-    // Verifies the formatted output of writeEffective (the function logEffective
-    // delegates to) against the three audit items:
-    //   P3-1: each [subsystem] KEY=value line appears for all five groups.
-    //   P4-3: BOT_TOKEN and WEBHOOK_SECRET lines contain "****" and do NOT
-    //         contain the full secret values (end-to-end masking).
-    //   P4-43: all five group prefixes ([bot], [server], [worker], [io],
-    //          [dispatcher]) appear.
+    // Checks the output of writeEffective (the function logEffective delegates
+    // to): the five group prefixes appear, each group carries a representative
+    // KEY=value line, and the BOT_TOKEN and WEBHOOK_SECRET lines are masked
+    // ("****", never the full value).
     //
     // The token and secret are long enough for maskSecret to produce a partial
     // reveal (both exceed 12 chars → front 3 + "****" + back 4 visible).
-    //
-    // The production logEffective function calls writeEffective and routes each
-    // line through std.log.  Tests inspect writeEffective directly because the
-    // test_runner.zig root owns std_options and the log backend cannot be
-    // redirected from a test file.
     const token  = "1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ";
     const secret = "supersecretvalue";
 
@@ -879,14 +628,14 @@ test "logEffective output: subsystem groups, field lines, and secret masking" {
     var buf: [2048]u8 = undefined;
     const captured = captureEffective(cfg, &buf);
 
-    // --- P4-43: all five subsystem group prefixes present ---
+    // --- All five subsystem group prefixes present ---
     try testing.expect(std.mem.find(u8, captured, "[bot]")        != null);
     try testing.expect(std.mem.find(u8, captured, "[server]")     != null);
     try testing.expect(std.mem.find(u8, captured, "[worker]")     != null);
     try testing.expect(std.mem.find(u8, captured, "[io]")         != null);
     try testing.expect(std.mem.find(u8, captured, "[dispatcher]") != null);
 
-    // --- P3-1: representative field per group ---
+    // --- Representative field per group ---
     try testing.expect(std.mem.find(u8, captured, "[bot] BOT_TOKEN=")                != null);
     try testing.expect(std.mem.find(u8, captured, "[bot] WEBHOOK_SECRET=")           != null);
     try testing.expect(std.mem.find(u8, captured, "[bot] BOT_API_BASE=")             != null);
@@ -896,7 +645,7 @@ test "logEffective output: subsystem groups, field lines, and secret masking" {
     try testing.expect(std.mem.find(u8, captured, "[io] IO_POOL_THREADS=")           != null);
     try testing.expect(std.mem.find(u8, captured, "[dispatcher] DISPATCHER_THREADS=") != null);
 
-    // --- P4-3: masking end-to-end ---
+    // --- Masking end-to-end ---
     // The BOT_TOKEN line must contain "****" and must NOT contain the full token.
     const tok_start = std.mem.find(u8, captured, "[bot] BOT_TOKEN=").?;
     const tok_end   = std.mem.findPos(u8, captured, tok_start, "\n") orelse captured.len;
@@ -930,38 +679,6 @@ test "maskSecret reveals a scaled prefix and suffix and hides the middle" {
     try testing.expectEqualStrings("****", maskSecret("", &buf));
 }
 
-test "empty WEBHOOK_SECRET is rejected with InvalidConfig" {
-    // An empty WEBHOOK_SECRET is syntactically present but semantically invalid:
-    // the webhook auth check in server.zig compares against this string, and an
-    // empty secret would match any request that omits the header (or sends an
-    // empty one), breaking authentication. loadFromMap rejects it at line 40.
-    var env = try makeEnv(testing.allocator, &.{
-        .{ "BOT_TOKEN",      "tok" },
-        .{ "WEBHOOK_SECRET", "" },
-    });
-    defer env.deinit();
-    try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
-}
-
-test "STATE_ENCRYPTION_KEY is parsed when present and null when absent" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try env.put("BOT_TOKEN", "t");
-    try env.put("WEBHOOK_SECRET", "s");
-    {
-        const cfg = try loadFromMap(std.testing.allocator, env);
-        defer deinit(cfg, std.testing.allocator);
-        try std.testing.expectEqual(@as(?[]const u8, null), cfg.state_encryption_key);
-    }
-    try env.put("STATE_ENCRYPTION_KEY", "passphrase");
-    {
-        const cfg = try loadFromMap(std.testing.allocator, env);
-        defer deinit(cfg, std.testing.allocator);
-        try std.testing.expect(cfg.state_encryption_key != null);
-        try std.testing.expectEqualStrings("passphrase", cfg.state_encryption_key.?);
-    }
-}
-
 test "sanitizeChildEnv strips secrets and keeps the rest" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
@@ -976,37 +693,4 @@ test "sanitizeChildEnv strips secrets and keeps the rest" {
     try std.testing.expectEqual(@as(?[]const u8, null), clean.get("WEBHOOK_SECRET"));
     try std.testing.expectEqual(@as(?[]const u8, null), clean.get("STATE_ENCRYPTION_KEY"));
     try std.testing.expectEqualStrings("/usr/bin", clean.get("PATH").?);
-}
-
-test "METRICS_ADDR parses when set, disables when unset, rejects garbage" {
-    // Unset → disabled (null).
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(?std.Io.net.IpAddress, null), cfg.metrics_addr);
-    }
-    // Set → parsed address.
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-            .{ "METRICS_ADDR", "127.0.0.1:9100" },
-        });
-        defer env.deinit();
-        const cfg = try loadFromMap(testing.allocator, env);
-        defer deinit(cfg, testing.allocator);
-        try testing.expectEqual(@as(u16, 9100), cfg.metrics_addr.?.ip4.port);
-    }
-    // Garbage → InvalidConfig.
-    {
-        var env = try makeEnv(testing.allocator, &.{
-            .{ "BOT_TOKEN", "tok" }, .{ "WEBHOOK_SECRET", "sec" },
-            .{ "METRICS_ADDR", "not-an-address" },
-        });
-        defer env.deinit();
-        try testing.expectError(error.InvalidConfig, loadFromMap(testing.allocator, env));
-    }
 }

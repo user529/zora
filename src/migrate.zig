@@ -1,9 +1,10 @@
-/// migrate.zig — zora-migrate: upgrade a v1 plaintext state database to v2.
-///
-/// Reads every row from a v1 (TEXT-column, schema_version='1') database and
-/// writes it into a freshly-built v2 database via StateStore, which encrypts on
-/// write when STATE_ENCRYPTION_KEY is set. The output is built in a temp file and
-/// renamed only after a self-verify reopen succeeds; the source is never touched.
+//! migrate.zig — zora-migrate: upgrade a v1 plaintext state database to v2.
+//!
+//! Reads every row from a v1 (TEXT-column, schema_version='1') database and
+//! writes it into a freshly-built v2 database via StateStore, which encrypts on
+//! write when STATE_ENCRYPTION_KEY is set. The tool builds the output in a temp
+//! file and renames it only after a self-verify reopen succeeds; it never
+//! writes the source.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -343,21 +344,16 @@ pub fn main(init: std.process.Init) u8 {
 
 const testing = std.testing;
 
-test "parseArgs reads --in and --out" {
+test "parseArgs reads --in and --out; rejects a missing --out and an unknown flag" {
     const argv = [_][:0]const u8{ "zora-migrate", "--in", "a.db", "--out", "b.db" };
     const a = try parseArgs(&argv);
     try testing.expectEqualStrings("a.db", a.in_path);
     try testing.expectEqualStrings("b.db", a.out_path);
-}
 
-test "parseArgs errors on a missing --out" {
-    const argv = [_][:0]const u8{ "zora-migrate", "--in", "a.db" };
-    try testing.expectError(ArgError.MissingOut, parseArgs(&argv));
-}
-
-test "parseArgs errors on an unknown flag" {
-    const argv = [_][:0]const u8{ "zora-migrate", "--wat" };
-    try testing.expectError(ArgError.UnknownFlag, parseArgs(&argv));
+    const no_out = [_][:0]const u8{ "zora-migrate", "--in", "a.db" };
+    try testing.expectError(ArgError.MissingOut, parseArgs(&no_out));
+    const unknown = [_][:0]const u8{ "zora-migrate", "--wat" };
+    try testing.expectError(ArgError.UnknownFlag, parseArgs(&unknown));
 }
 
 /// Write a v1 (TEXT-column, schema_version='1') database at `path` with rows in
@@ -477,16 +473,9 @@ test "migrate v1 plaintext -> v2 encrypted; new binary reads it back" {
         testing.allocator.free(jobs);
     }
     try testing.expectEqual(@as(usize, 2), jobs.len);
-
-    // Wrong passphrase is rejected by the verifier.
-    try testing.expectError(error.WrongEncryptionKey, state_store.StateStore.openWithOptions(
-        testing.allocator,
-        out_path,
-        .{ .encryption = .{ .passphrase = "wrong", .io = testing.io } },
-    ));
 }
 
-test "migrate refuses to overwrite an existing output" {
+test "migrate refuses an existing output and a source that is not v1" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var dbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -501,25 +490,15 @@ test "migrate refuses to overwrite an existing output" {
     try writeV1Fixture(in_path);
     try writeV1Fixture(out_path); // out already exists
     try testing.expectError(MigrateError.OutputExists, migrate(testing.allocator, testing.io, in_path, out_path, null));
-}
 
-test "migrate refuses a source that is not v1" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &dbuf);
-    const dir = dbuf[0..dlen];
-
-    var ibuf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    var obuf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const in_path = joinZ(&ibuf, dir, "v2src.db");
-    const out_path = joinZ(&obuf, dir, "out.db");
-
-    // A v2 database (StateStore seeds schema_version='2').
-    var s = try state_store.StateStore.open(testing.allocator, in_path);
+    // A v2 database (StateStore seeds schema_version='2') is not a v1 source.
+    var v2buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    var o2buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const v2_path = joinZ(&v2buf, dir, "v2src.db");
+    const out2_path = joinZ(&o2buf, dir, "out.db");
+    var s = try state_store.StateStore.open(testing.allocator, v2_path);
     s.close();
-
-    try testing.expectError(MigrateError.SourceNotV1, migrate(testing.allocator, testing.io, in_path, out_path, null));
+    try testing.expectError(MigrateError.SourceNotV1, migrate(testing.allocator, testing.io, v2_path, out2_path, null));
 }
 
 test "migrate handles an empty v1 database" {

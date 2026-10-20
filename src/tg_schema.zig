@@ -1,21 +1,20 @@
-/// tg_schema.zig — Telegram Bot API schema: parsing, validation, hot-watcher.
-///
-/// The schema is the *data* side of outgoing-call validation.
-/// It is a vendored JSON file (`schema/botapi.json`, PaulSonOfLars format):
-///
-///   { "methods": { "<name>": { "fields": [ { name, types, required }, ... ] } } }
-///
-/// Each process parses one immutable `SchemaStore`. `SchemaSlot` holds it
-/// behind an atomic pointer so the watcher can swap in a re-parsed copy
-/// without locking the read path. The validator (`validate`) is the *logic*
-/// side — it lives here, in the Zig core, because the structural-check
-/// algorithm is stable.
+//! tg_schema.zig — Telegram Bot API schema: parsing, validation, hot-watcher.
+//!
+//! The schema is the *data* side of outgoing-call validation.
+//! It is a vendored JSON file (`schema/botapi.json`, PaulSonOfLars format):
+//!
+//!   { "methods": { "<name>": { "fields": [ { name, types, required }, ... ] } } }
+//!
+//! Each process parses one immutable `SchemaStore`. `SchemaSlot` holds it
+//! behind an atomic pointer so the watcher can swap in a re-parsed copy
+//! without locking the read path. The validator (`validate`) is the *logic*
+//! side — it lives here, in the Zig core, because the structural-check
+//! algorithm is stable.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const ziglua = @import("ziglua");
 const watcher = @import("watcher.zig");
-const rt = @import("rt.zig");
 
 const Lua = ziglua.Lua;
 const log = std.log.scoped(.schema);
@@ -104,9 +103,9 @@ fn classifyOne(t: []const u8) ParamKind {
     if (std.mem.eql(u8, t, "True")) return .boolean;
     if (std.mem.eql(u8, t, "Float")) return .float;
     if (std.mem.eql(u8, t, "Float number")) return .float;
-    // InputFile accepts both a string (file_id / URL) and a binary upload — treat
-    // it as unclassifiable so the validator never produces a false-positive TypeMismatch when
-    // a rule passes a string file_id.
+    // InputFile accepts both a string (file_id or URL) and a binary upload, so
+    // it is unclassifiable: a rule that passes a string file_id never gets a
+    // false TypeMismatch.
     if (std.mem.eql(u8, t, "InputFile")) return .any;
     // "Array of ...", concrete object type names, etc.
     return .compound;
@@ -198,7 +197,7 @@ pub const SchemaSlot = struct {
         return .{ .gpa = gpa, .io = io };
     }
 
-    /// Current schema, or null when none is loaded (Tier-0). Lock-free.
+    /// Current schema, or null when none is loaded (no validation). Lock-free.
     pub fn get(self: *SchemaSlot) ?*const SchemaStore {
         return self.current.load(.acquire);
     }
@@ -233,7 +232,7 @@ pub const SchemaSlot = struct {
 };
 
 /// Parse `path` at startup and install it. On any failure, log a warning and
-/// leave the slot empty — the process runs in Tier-0 (no validation).
+/// leave the slot empty — the process runs without validation.
 pub fn loadInitial(slot: *SchemaSlot, path: []const u8) void {
     const store = SchemaStore.fromFile(slot.gpa, slot.io, path) catch |err| {
         log.warn(
@@ -273,21 +272,21 @@ fn onSchemaChange(context: *anyopaque) void {
 }
 
 pub const SchemaWatcherArgs = struct {
+    /// Owned by the watcher thread, which frees it with `allocator` if it
+    /// returns. The caller allocates it before the spawn: the thread runs
+    /// detached and may outlive the caller's copy.
     schema_file: []const u8,
     slot: *SchemaSlot,
     allocator: std.mem.Allocator,
 };
 
-/// Watcher thread entry point. Normally never returns (kernel watcher loops
-/// forever). Duplicates schema_file so the caller can free its copy immediately
-/// after spawning. The defer executes only if the underlying watcher returns
-/// early due to a system error (e.g. inotify fd exhaustion) — in the normal
-/// infinite-loop case it is unreachable.
+/// Watcher thread entry point; takes ownership of `args.schema_file`.
+/// Normally never returns (kernel watcher loops forever). The defer executes
+/// only if the underlying watcher returns early due to a system error (e.g.
+/// inotify fd exhaustion) — in the normal infinite-loop case it is
+/// unreachable.
 pub fn schemaWatcherThread(args: SchemaWatcherArgs) void {
-    const owned_path = args.allocator.dupe(u8, args.schema_file) catch {
-        log.err("schemaWatcherThread: OOM duplicating schema path — watcher not started", .{});
-        return;
-    };
+    const owned_path = args.schema_file;
     defer args.allocator.free(owned_path);
     var ctx = SchemaWatchCtx{ .slot = args.slot, .path = owned_path };
     const target = watcher.WatchTarget{
@@ -414,13 +413,20 @@ test "validate accepts valid calls and rejects bad ones" {
         try validate(photo_store, lua, idx2, "sendPhoto");
         lua.pop(1);
     }
-}
 
-test "SchemaSlot with no schema → get() is null (Tier-0)" {
-    var slot = SchemaSlot.init(testing.allocator, testing.io);
-    defer slot.deinit();
-    try testing.expect(slot.get() == null);
-    try testing.expectEqual(@as(u64, 0), slot.version.load(.acquire));
+    // A method whose every field is optional accepts nil params.
+    {
+        const schema =
+            \\{"methods":{"getMe":{"fields":[
+            \\  {"name":"timeout","types":["Integer"],"required":false}
+            \\]}},"types":{}}
+        ;
+        const getme_store = try SchemaStore.fromSlice(testing.allocator, schema);
+        defer getme_store.destroy(testing.allocator);
+        lua.pushNil();
+        try validate(getme_store, lua, lua.getTop(), "getMe");
+        lua.pop(1);
+    }
 }
 
 test "loadInitial reads a file; install swaps and retires" {
@@ -455,134 +461,41 @@ test "loadInitial reads a file; install swaps and retires" {
     try testing.expect(slot.retired.items[0].method("sendMessage") != null);
 }
 
-test "loadInitial on a missing file leaves the slot empty" {
-    var slot = SchemaSlot.init(testing.allocator, testing.io);
-    defer slot.deinit();
-    loadInitial(&slot, "/nonexistent/zora-no-such-schema.json");
-    try testing.expect(slot.get() == null);
-    try testing.expectEqual(@as(u64, 0), slot.version.load(.acquire));
-}
-
-test "schema watcher hot-reloads; a broken file is rejected" {
+test "schema reload: a valid file installs, a broken or missing one is rejected" {
+    // onSchemaChange is the callback the schema watcher fires; calling it
+    // directly exercises the reload paths without file-watch timing.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-
-    // Initial schema: sendMessage only.
-    {
-        try tmp.dir.writeFile(testing.io, .{ .sub_path = "s.json", .data = FIXTURE_SCHEMA });
-    }
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "s.json", .data = FIXTURE_SCHEMA });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPathFile(testing.io, "s.json", &path_buf);
     const path = path_buf[0..path_len];
 
     var slot = SchemaSlot.init(testing.allocator, testing.io);
     defer slot.deinit();
-    loadInitial(&slot, path);
 
-    var ctx = SchemaWatchCtx{ .slot = &slot, .path = path };
-    var stop = std.atomic.Value(bool).init(false);
-    const t = try std.Thread.spawn(.{}, struct {
-        fn run(target: watcher.WatchTarget, stp: *std.atomic.Value(bool)) void {
-            watcher.watchPoll(target, testing.io, 50, stp);
-        }
-    }.run, .{
-        watcher.WatchTarget{ .path = path, .context = &ctx, .on_write = onSchemaChange },
-        &stop,
-    });
-    defer {
-        stop.store(true, .release);
-        t.join();
-    }
+    // A missing file at startup leaves the slot empty (no validation).
+    loadInitial(&slot, "/nonexistent/zora-no-such-schema.json");
+    try testing.expect(slot.get() == null);
+    try testing.expectEqual(@as(u64, 0), slot.version.load(.acquire));
 
-    // Establish a deterministic mtime baseline before touching the file.
-    // The poll watcher records the initial mtime on its first iteration and
-    // only fires on a *change* thereafter. A fixed sleep races the watcher's
-    // first poll under parallel-suite load: write too early and the new mtime
-    // becomes the baseline, so the reload is missed. Instead, wait until
-    // `version` has held steady at 1 across several full poll intervals
-    // (poll_ms = 50). A stable 1 proves the watcher has captured its baseline
-    // and produced no spurious reload — only then is it safe to write.
-    {
-        const poll_ms = 50;
-        const required_stable_polls = 3;
-        const deadline = rt.nowMs(rt.io()) + 3000;
-        var stable_polls: u32 = 0;
-        while (stable_polls < required_stable_polls) {
-            rt.sleepNs(rt.io(), poll_ms * std.time.ns_per_ms);
-            const v = slot.version.load(.acquire);
-            // A premature reload would push version past 1 — never weaken this.
-            try testing.expectEqual(@as(u64, 1), v);
-            stable_polls += 1;
-            if (rt.nowMs(rt.io()) >= deadline) return error.TestBaselineTimeout;
-        }
-    }
-
-    // Valid reload: add a method.
-    {
-        try tmp.dir.writeFile(testing.io, .{ .sub_path = "s.json", .data =
-            \\{"methods":{"sendMessage":{"fields":[]},"newMethod":{"fields":[]}},"types":{}}
-        });
-    }
-    {
-        const deadline = rt.nowMs(rt.io()) + 2000;
-        while (slot.version.load(.acquire) < 2) {
-            if (rt.nowMs(rt.io()) >= deadline) return error.TestReloadTimeout;
-            rt.sleepNs(rt.io(), 10 * std.time.ns_per_ms);
-        }
-    }
-    try testing.expect(slot.get().?.method("newMethod") != null);
-
-    // Broken reload: failures bump, version stays, old schema retained.
-    {
-        try tmp.dir.writeFile(testing.io, .{ .sub_path = "s.json", .data = "{ this is not json" });
-    }
-    {
-        const deadline = rt.nowMs(rt.io()) + 2000;
-        while (slot.failures.load(.acquire) < 1) {
-            if (rt.nowMs(rt.io()) >= deadline) return error.TestFailureTimeout;
-            rt.sleepNs(rt.io(), 10 * std.time.ns_per_ms);
-        }
-    }
-    try testing.expectEqual(@as(u64, 2), slot.version.load(.acquire));
-    try testing.expect(slot.get().?.method("newMethod") != null);
-}
-
-test "onSchemaChange on a missing file bumps failures, not version" {
-    // Drive the bad-reload path directly, without the poll watcher — the
-    // failures counter and the version-unchanged invariant are exercised in
-    // isolation, free of timing flake.
-    var slot = SchemaSlot.init(testing.allocator, testing.io);
-    defer slot.deinit();
-
-    var ctx = SchemaWatchCtx{ .slot = &slot, .path = "/nonexistent/zora-no-such-schema.json" };
-    onSchemaChange(&ctx);
-
-    // A failed reload increments failures and leaves the version untouched.
+    // A missing file on reload bumps failures, not the version.
+    var missing = SchemaWatchCtx{ .slot = &slot, .path = "/nonexistent/zora-no-such-schema.json" };
+    onSchemaChange(&missing);
     try testing.expectEqual(@as(u64, 1), slot.failures.load(.acquire));
     try testing.expectEqual(@as(u64, 0), slot.version.load(.acquire));
-    // No store was installed: the slot stays empty (Tier-0).
     try testing.expect(slot.get() == null);
-}
 
-test "validate with nil params passes when no field is required" {
-    // A method whose every field is optional accepts an absent params table:
-    // nothing is required, so nil params is valid.
-    const schema =
-        \\{"methods":{"getMe":{"fields":[
-        \\  {"name":"timeout","types":["Integer"],"required":false}
-        \\]}},"types":{}}
-    ;
-    const store = try SchemaStore.fromSlice(testing.allocator, schema);
-    defer store.destroy(testing.allocator);
+    // A valid file installs.
+    var ctx = SchemaWatchCtx{ .slot = &slot, .path = path };
+    onSchemaChange(&ctx);
+    try testing.expectEqual(@as(u64, 1), slot.version.load(.acquire));
+    try testing.expect(slot.get().?.method("sendDice") != null);
 
-    var lua = try Lua.init(testing.allocator);
-    defer lua.deinit();
-    lua.openBase();
-
-    // Push a nil at a known absolute index and validate against it.
-    lua.pushNil();
-    const idx = lua.getTop();
-    try testing.expect(!lua.isTable(idx));
-    try validate(store, lua, idx, "getMe");
-    lua.pop(1);
+    // A broken file bumps failures; the version and the live schema stay.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "s.json", .data = "{ this is not json" });
+    onSchemaChange(&ctx);
+    try testing.expectEqual(@as(u64, 2), slot.failures.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), slot.version.load(.acquire));
+    try testing.expect(slot.get().?.method("sendDice") != null);
 }

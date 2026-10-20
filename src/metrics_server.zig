@@ -7,11 +7,13 @@
 //!
 //! A scrape failure never affects the bot: connection errors are logged at
 //! warn and the loop continues. One thread comfortably serves the usual
-//! 15-second scrape interval.
+//! 15-second scrape interval. Between scrapes the thread sleeps in poll() with
+//! no timeout; a stop latch wakes it for shutdown.
 
 const std = @import("std");
 const metrics_mod = @import("metrics.zig");
 const types = @import("types.zig");
+const Latch = @import("latch.zig").Latch;
 
 const log = std.log.scoped(.metrics_server);
 
@@ -34,7 +36,8 @@ pub const MetricsServer = struct {
     metrics: *const metrics_mod.Metrics,
     sources: metrics_mod.RenderSources,
     listener: std.Io.net.Server,
-    stop: std.atomic.Value(bool),
+    /// deinit() sets it to wake the serve thread out of poll().
+    stop: Latch,
     thread: std.Thread,
 
     /// Bind and start the serve thread. Returns a heap-allocated server;
@@ -48,38 +51,29 @@ pub const MetricsServer = struct {
         self.sources = args.sources;
         self.listener = try args.listen_addr.listen(args.io, .{ .reuse_address = true });
         errdefer self.listener.deinit(args.io);
-        self.stop = std.atomic.Value(bool).init(false);
+        self.stop = try Latch.init();
+        errdefer self.stop.deinit();
         self.thread = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, serveLoop, .{self});
         return self;
     }
 
     pub fn deinit(self: *MetricsServer) void {
-        self.stop.store(true, .release);
+        self.stop.set();
         self.thread.join();
+        self.stop.deinit();
         self.listener.deinit(self.io);
         self.allocator.destroy(self);
-    }
-
-    /// The bound address (for tests that listen on port 0).
-    /// 0.16's net.Server drops listen_address, so query the socket directly.
-    pub fn listenAddress(self: *const MetricsServer) std.Io.net.IpAddress {
-        var sa: std.posix.sockaddr.in = undefined;
-        var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-        _ = std.posix.system.getsockname(self.listener.socket.handle, @ptrCast(&sa), &len);
-        return .{ .ip4 = .{
-            .bytes = @bitCast(sa.addr),
-            .port = std.mem.bigToNative(u16, sa.port),
-        } };
     }
 };
 
 fn serveLoop(srv: *MetricsServer) void {
     const fd = srv.listener.socket.handle;
-    while (!srv.stop.load(.acquire)) {
-        var pfd = std.posix.pollfd{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
-        const n = std.posix.poll(@as(*[1]std.posix.pollfd, &pfd)[0..1], 100) catch return;
-        if (n == 0) continue;
-        if (pfd.revents & std.posix.POLL.IN == 0) continue;
+    while (true) {
+        const ready = srv.stop.waitReadable(fd) catch |err| {
+            log.err("poll: {s} — scrape endpoint stopped", .{@errorName(err)});
+            return;
+        };
+        if (!ready) return;
         const stream = srv.listener.accept(srv.io) catch |err| {
             log.warn("accept: {s}", .{@errorName(err)});
             continue;
@@ -144,6 +138,7 @@ fn handleRequest(srv: *MetricsServer, stream: std.Io.net.Stream) !void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 
 /// Send one request and return the full raw response (status line + headers +
 /// body). The server closes the connection, so read-to-EOF terminates.
@@ -165,9 +160,8 @@ test "GET /metrics serves the exposition; other requests get 404" {
     var m = metrics_mod.Metrics{};
     _ = m.updates_received_total.fetchAdd(5, .monotonic);
 
-    // 127.0.0.2 matches the convention used by server.zig/dispatcher.zig/io_pool.zig
-    // tests in this tree: some sandboxes used to run this suite block outbound
-    // connect() to 127.0.0.1 specifically (loopback secondary address is unaffected).
+    // 127.0.0.2, as in the other socket tests: some sandboxes block connect()
+    // to 127.0.0.1 but not to other loopback addresses.
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
     const srv = try MetricsServer.init(.{
         .listen_addr = addr,
@@ -177,7 +171,7 @@ test "GET /metrics serves the exposition; other requests get 404" {
         .allocator = testing.allocator,
     });
     defer srv.deinit();
-    const bound = srv.listenAddress();
+    const bound = test_util.boundAddress(&srv.listener);
 
     var buf: [65536]u8 = undefined;
 
