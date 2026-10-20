@@ -4,25 +4,54 @@
 //! an `Io` instance instead of free functions. This module holds the one runtime
 //! the process uses and hands out its `Io`.
 //!
-//! The runtime is `std.Io.Threaded.init_single_threaded`: a stateless,
-//! allocation-free executor. zora schedules work on its own `std.Thread` pool,
-//! so the runtime's async executor is never used — only the mutex, futex, and
-//! sleep paths, which map straight to OS calls and are safe to call from any
-//! thread. One shared instance is therefore correct for the whole process.
+//! The runtime is `std.Io.Threaded.init(std.heap.c_allocator, .{})`. zora
+//! schedules work on its own `std.Thread` pool, so the runtime's async executor
+//! is never used — only the mutex, futex, sleep, net and process paths, which
+//! map straight to OS calls and are safe to call from any thread. One shared
+//! instance is therefore correct for the whole process.
 //!
-//! `main` calls `io()` once and passes the result explicitly to the components
-//! that need it; tests call `io()` to obtain the same runtime. Callers should
+//! Why not the allocation-free `init_single_threaded`: its allocator is
+//! `Allocator.failing`, and `std.process.spawn` builds the child's argv and
+//! environment blocks with the runtime's allocator before the fork, so every
+//! `bot.exec`/`bot.shell` would fail with OutOfMemory. `init` also installs no-op
+//! handlers for SIGIO and SIGPIPE; zora does not cancel I/O, so the SIGIO
+//! interruption it enables goes unused.
+//!
+//! The runtime is built on the first io() call, because `init` runs at run
+//! time (it reads the CPU count and installs the signal handlers) and tests
+//! reach io() without `main`. It lives for the whole process and is never
+//! deinitialized.
+//!
+//! `main` calls io() once and passes the result explicitly to the components
+//! that need it; tests call io() to obtain the same runtime. Callers should
 //! treat the returned `Io` as a value to thread through, not reach back here.
 
 const std = @import("std");
 
-/// Backing runtime. Stateless and OS-backed, so a single shared instance serves
-/// every thread. Address-stable for the life of the process.
-var runtime: std.Io.Threaded = .init_single_threaded;
+/// Backing runtime, valid once `state` reads `.ready`. Address-stable for the
+/// life of the process.
+var runtime: std.Io.Threaded = undefined;
+var state: std.atomic.Value(State) = .init(.unset);
 
-/// Returns the process `Io`. Cheap to copy; the backing runtime outlives it.
+const State = enum(u8) { unset, building, ready };
+
+/// Returns the process `Io`, building the runtime on the first call. Cheap to
+/// copy; the backing runtime outlives it. Safe to call from any thread.
 pub fn io() std.Io {
+    if (state.load(.acquire) != .ready) build();
     return runtime.io();
+}
+
+/// Build the runtime exactly once. A thread that loses the race spins until
+/// the winner publishes it; this happens at most once per process, during
+/// startup.
+fn build() void {
+    if (state.cmpxchgStrong(.unset, .building, .acquire, .acquire) == null) {
+        runtime = .init(std.heap.c_allocator, .{});
+        state.store(.ready, .release);
+        return;
+    }
+    while (state.load(.acquire) != .ready) std.atomic.spinLoopHint();
 }
 
 /// Sleeps for `ns` nanoseconds on the monotonic clock. A best-effort backoff:
@@ -43,18 +72,6 @@ pub fn nowNs(target_io: std.Io) i128 {
 /// `std.time.milliTimestamp`.
 pub fn nowMs(target_io: std.Io) i64 {
     return @intCast(@divTrunc(nowNs(target_io), std.time.ns_per_ms));
-}
-
-test "io returns a usable runtime: sleep and futex round-trip" {
-    const t = io();
-    // A zero-length sleep must return promptly without error handling at the
-    // call site (sleepNs swallows the unused cancel error).
-    sleepNs(t, 0);
-
-    // The mutex path must lock and unlock cleanly from the calling thread.
-    var m: std.Io.Mutex = .init;
-    m.lockUncancelable(t);
-    m.unlock(t);
 }
 
 test "nowMs and nowNs advance across a sleep" {

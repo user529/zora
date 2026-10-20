@@ -32,23 +32,27 @@ pub const DelayQueue = struct {
     const PQ = std.PriorityQueue(DelayedCall, void, earlier);
 
     pq:        PQ,
-    allocator: std.mem.Allocator, // 0.16 PriorityQueue is unmanaged
+    // Owns the heap storage (0.16 `PriorityQueue` is unmanaged) and frees the
+    // held `ApiCall`s in deinitDrain(), so pushed calls must come from it too.
+    allocator: std.mem.Allocator,
     mutex:     std.Io.Mutex = .init,
-    // Bumped on every push; waiters block on it with a timeout. Replaces the
-    // 0.16-removed Condition.timedWait — same futex primitive, with a deadline.
+    // Bumped on every push and on close(); the consumer waits on it, with a
+    // deadline while a call is held. Replaces the 0.16-removed
+    // `Condition.timedWait` — same futex primitive.
     wake:      std.atomic.Value(u32) = .init(0),
     io:        std.Io,
     capacity:  usize,
     seq:       u64 = 0,
+    closed:    bool = false, // set by close(); read under mutex
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, capacity: usize) DelayQueue {
         return .{ .pq = .empty, .allocator = allocator, .io = io, .capacity = capacity };
     }
 
     /// Free any held ApiCalls, then release the heap. Call on shutdown only.
-    pub fn deinitDrain(self: *DelayQueue, allocator: std.mem.Allocator) void {
-        while (self.pq.pop()) |dc| types.freeApiCall(dc.call, allocator);
-        self.pq.deinit(allocator);
+    pub fn deinitDrain(self: *DelayQueue) void {
+        while (self.pq.pop()) |dc| types.freeApiCall(dc.call, self.allocator);
+        self.pq.deinit(self.allocator);
     }
 
     /// Park `call` until `ready_at_ms`. error.Full when at capacity (caller
@@ -74,28 +78,48 @@ pub const DelayQueue = struct {
         return self.pq.pop().?.call;
     }
 
-    /// Block until the next call is due, a new earlier call is pushed, or
-    /// `max_ns` elapses (so the caller can re-check a stop flag).
-    pub fn waitNext(self: *DelayQueue, now_ms: i64, max_ns: u64) void {
+    /// Block until the earliest call is due, or a push or close() arrives.
+    /// With an empty heap there is no deadline: an idle consumer sleeps until
+    /// the next push. Returns false once the queue is closed, true otherwise.
+    pub fn waitNext(self: *DelayQueue) bool {
         self.mutex.lockUncancelable(self.io);
-        var wait_ns: u64 = max_ns;
-        if (self.pq.peek()) |top| {
-            if (top.ready_at_ms <= now_ms) {
-                self.mutex.unlock(self.io);
-                return; // due now — don't sleep
-            }
-            // Guarded above (top is strictly in the future); both are epoch-ms, so the
-            // difference is positive and the cast is safe.
-            const diff_ms: u64 = @intCast(top.ready_at_ms - now_ms);
-            wait_ns = @min(max_ns, diff_ms *| std.time.ns_per_ms);
+        if (self.closed) {
+            self.mutex.unlock(self.io);
+            return false;
         }
-        // Snapshot the wake counter under the lock, release, then wait for a
-        // push (counter change) or the deadline — whichever comes first.
+        // Snapshot the wake counter under the lock: a push or close() after
+        // the unlock changes it, so the futex wait below returns at once.
         const s = self.wake.load(.acquire);
+        const top = self.pq.peek();
         self.mutex.unlock(self.io);
-        self.io.futexWaitTimeout(u32, &self.wake.raw, s, .{
-            .duration = .{ .raw = .fromNanoseconds(@intCast(wait_ns)), .clock = .awake },
-        }) catch {};
+
+        if (top) |t| {
+            const now_ms = rt.nowMs(self.io);
+            if (t.ready_at_ms <= now_ms) return true; // due now — don't sleep
+            // Guarded above (`t` is strictly in the future); both are epoch-ms, so
+            // the difference is positive and the cast is safe.
+            const diff_ms: u64 = @intCast(t.ready_at_ms - now_ms);
+            self.io.futexWaitTimeout(u32, &self.wake.raw, s, .{
+                .duration = .{ .raw = .fromNanoseconds(@intCast(diff_ms *| std.time.ns_per_ms)), .clock = .awake },
+            }) catch {};
+        } else {
+            self.io.futexWaitUncancelable(u32, &self.wake.raw, s);
+        }
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return !self.closed;
+    }
+
+    /// Mark the queue closed and wake the consumer, so requeueThread() exits.
+    /// Calls still held stay in the heap for deinitDrain(). A second close()
+    /// has no effect.
+    pub fn close(self: *DelayQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        self.closed = true;
+        self.mutex.unlock(self.io);
+        _ = self.wake.fetchAdd(1, .release);
+        self.io.futexWake(u32, &self.wake.raw, std.math.maxInt(u32));
     }
 };
 
@@ -136,27 +160,24 @@ pub const BlockedMap = struct {
 pub const RequeueArgs = struct {
     delay_q:   *DelayQueue,
     disp_q:    *queue_mod.Queue(types.ApiCall),
-    stop:      *std.atomic.Value(bool),
     metrics:   ?*metrics_mod.Metrics,
-    allocator: std.mem.Allocator,
 };
 
-/// Single thread: release due calls from delay_q back into disp_q. Sleeps on
-/// the heap timer (woken early by pushes); never busy-waits. The 50ms cap keeps
-/// `stop` responsive.
+/// Single thread: release due calls from `delay_q` back into `disp_q`. Sleeps
+/// on the heap timer, or with an empty heap until the next push; never polls.
+/// Exits when `delay_q.close()` runs.
 pub fn requeueThread(args: RequeueArgs) void {
-    while (!args.stop.load(.acquire)) {
+    while (args.delay_q.waitNext()) {
         const now = rt.nowMs(args.delay_q.io);
         while (args.delay_q.popReady(now)) |call| {
             args.disp_q.push(call) catch {
                 // disp_q full — drop (rare). Count as shed.
                 if (args.metrics) |m| _ = m.throttle_shed_total.fetchAdd(1, .monotonic);
                 log.warn("requeue: disp_q full, dropped a delayed call", .{});
-                types.freeApiCall(call, args.allocator);
+                types.freeApiCall(call, args.delay_q.allocator);
             };
             if (args.metrics) |m| _ = m.throttle_delay_depth.fetchSub(1, .monotonic);
         }
-        args.delay_q.waitNext(rt.nowMs(args.delay_q.io), 50 * std.time.ns_per_ms);
     }
     log.info("requeue thread stopped", .{});
 }
@@ -173,7 +194,7 @@ fn dummyCall(allocator: std.mem.Allocator, chat_id: i64) !types.ApiCall {
 
 test "DelayQueue popReady orders by ready_at then seq and respects ready time" {
     var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
-    defer dq.deinitDrain(testing.allocator);
+    defer dq.deinitDrain();
 
     // Same ready_at for chat 1 then chat 2 (push order), earlier ready_at for chat 3.
     try dq.push(100, try dummyCall(testing.allocator, 1));
@@ -197,19 +218,12 @@ test "DelayQueue popReady orders by ready_at then seq and respects ready time" {
 
 test "DelayQueue push past capacity returns error.Full" {
     var dq = DelayQueue.init(testing.allocator, rt.io(), 2);
-    defer dq.deinitDrain(testing.allocator);
+    defer dq.deinitDrain();
     try dq.push(10, try dummyCall(testing.allocator, 1));
     try dq.push(10, try dummyCall(testing.allocator, 2));
     const overflow = try dummyCall(testing.allocator, 3);
     try testing.expectError(error.Full, dq.push(10, overflow));
     types.freeApiCall(overflow, testing.allocator); // caller frees the rejected call
-}
-
-test "DelayQueue deinitDrain frees held calls (no leak)" {
-    var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
-    try dq.push(10, try dummyCall(testing.allocator, 1));
-    try dq.push(20, try dummyCall(testing.allocator, 2));
-    dq.deinitDrain(testing.allocator); // must free both — leak check via testing allocator
 }
 
 test "BlockedMap returns window while blocked, prunes when expired" {
@@ -227,12 +241,11 @@ test "requeueThread moves a due call to disp_q after its delay" {
     var disp = try queue_mod.Queue(types.ApiCall).init(testing.allocator, rt.io(), 16);
     defer disp.deinit(testing.allocator);
     var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
-    defer dq.deinitDrain(testing.allocator);
-    var stop = std.atomic.Value(bool).init(false);
+    defer dq.deinitDrain();
 
     const t = try std.Thread.spawn(.{}, requeueThread, .{RequeueArgs{
-        .delay_q = &dq, .disp_q = &disp, .stop = &stop,
-        .metrics = null, .allocator = testing.allocator,
+        .delay_q = &dq, .disp_q = &disp,
+        .metrics = null,
     }});
 
     // Push a call due 100 ms out; record the push instant to bound the gap.
@@ -253,7 +266,7 @@ test "requeueThread moves a due call to disp_q after its delay" {
     // delay so it stays reliable under load.
     try testing.expect(delivered_at - pushed_at >= 80);
 
-    stop.store(true, .release);
+    dq.close();
     t.join();
 }
 
@@ -265,16 +278,15 @@ test "requeueThread sheds a due call when disp_q is full" {
     try disp.push(filler);
 
     var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
-    defer dq.deinitDrain(testing.allocator);
+    defer dq.deinitDrain();
     var metrics = metrics_mod.Metrics{};
-    var stop = std.atomic.Value(bool).init(false);
 
     // A due item: requeueThread pops it, fails to push (disp_q full), sheds it.
     try dq.push(rt.nowMs(rt.io()) - 1, try dummyCall(testing.allocator, 1));
 
     const t = try std.Thread.spawn(.{}, requeueThread, .{RequeueArgs{
-        .delay_q = &dq, .disp_q = &disp, .stop = &stop,
-        .metrics = &metrics, .allocator = testing.allocator,
+        .delay_q = &dq, .disp_q = &disp,
+        .metrics = &metrics,
     }});
 
     // Poll the shed counter with a bounded timeout instead of a fixed sleep.
@@ -283,7 +295,7 @@ test "requeueThread sheds a due call when disp_q is full" {
         rt.sleepNs(rt.io(), std.time.ns_per_ms);
     }
 
-    stop.store(true, .release);
+    dq.close();
     t.join();
 
     // Exactly one shed; the full disp_q was not force-enqueued.
@@ -297,15 +309,15 @@ test "requeueThread sheds a due call when disp_q is full" {
 
 test "DelayQueue waitNext is woken early by a push" {
     var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
-    defer dq.deinitDrain(testing.allocator);
+    defer dq.deinitDrain();
 
     const Blocker = struct {
-        // Block in waitNext with a 2 s ceiling and record the elapsed time.
+        // Block in waitNext() and record the elapsed time.
         fn run(q: *DelayQueue, elapsed_ms: *i64, started: *std.atomic.Value(bool)) void {
             const before = rt.nowMs(q.io);
             started.store(true, .release);
-            // No entry yet ⇒ waitNext parks on the wake futex for up to 2 s.
-            q.waitNext(rt.nowMs(q.io), 2 * std.time.ns_per_s);
+            // No entry yet ⇒ waitNext() parks on the wake futex until a push.
+            _ = q.waitNext();
             elapsed_ms.* = rt.nowMs(q.io) - before;
         }
     };
@@ -323,4 +335,45 @@ test "DelayQueue waitNext is woken early by a push" {
 
     // The push woke waitNext well before the 2 s ceiling.
     try testing.expect(elapsed_ms < 500);
+}
+
+test "DelayQueue waitNext on an empty heap parks with no timeout until close" {
+    var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
+    defer dq.deinitDrain();
+
+    const Waiter = struct {
+        fn run(q: *DelayQueue, result: *bool, done: *std.atomic.Value(bool)) void {
+            result.* = q.waitNext();
+            done.store(true, .release);
+        }
+    };
+    var result = true;
+    var done = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Waiter.run, .{ &dq, &result, &done });
+
+    // An idle consumer must stay parked: a periodic timeout would return well
+    // inside this window.
+    rt.sleepNs(rt.io(), 200 * std.time.ns_per_ms);
+    try testing.expect(!done.load(.acquire));
+
+    // close() releases the waiter, and waitNext() reports the queue closed.
+    dq.close();
+    t.join();
+    try testing.expect(!result);
+}
+
+test "requeueThread exits on close with a call still held" {
+    var disp = try queue_mod.Queue(types.ApiCall).init(testing.allocator, rt.io(), 16);
+    defer disp.deinit(testing.allocator);
+    var dq = DelayQueue.init(testing.allocator, rt.io(), 16);
+    defer dq.deinitDrain(); // frees the held call
+
+    // Due in an hour: the thread parks on the heap timer.
+    try dq.push(rt.nowMs(rt.io()) + std.time.ms_per_hour, try dummyCall(testing.allocator, 1));
+    const t = try std.Thread.spawn(.{}, requeueThread, .{RequeueArgs{
+        .delay_q = &dq, .disp_q = &disp, .metrics = null,
+    }});
+    dq.close();
+    t.join();
+    try testing.expectEqual(@as(usize, 0), disp.len());
 }

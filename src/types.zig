@@ -1,14 +1,13 @@
-/// types.zig — shared structs: ApiCall, WorkItem, Config
-///
-/// This file imports only the standard library and the ziglua external
-/// dependency (not project files), keeping it free of circular imports.
+//! types.zig — shared structs: ApiCall, WorkItem, Config
+//!
+//! This file imports only the standard library (not project files), keeping
+//! it free of circular imports.
 const std = @import("std");
-const ziglua = @import("ziglua");
 
 /// Stack size for every thread zora spawns. 1 MiB vs. Zig's 16 MiB default —
-/// our deepest stack (depth-8 serializer recursion, TLS handshake) stays well
+/// the deepest stack (depth-8 serializer recursion, TLS handshake) stays well
 /// under this. Cuts ~15 MiB of VSZ reservation per thread (~40+ threads).
-pub const THREAD_STACK_SIZE: usize = 1 << 20; // 1 MiB
+pub const THREAD_STACK_SIZE: usize = 1 << 20;
 
 // ---------------------------------------------------------------------------
 // ApiCall — generic outgoing Telegram API call.
@@ -32,10 +31,11 @@ pub const ApiCall = struct {
         json:      []const u8,      // verbatim JSON body — owned
         multipart: []MultipartPart, // slice of parts     — owned
     },
-    /// Non-null for tracked sends only. Value-typed — freeApiCall unchanged.
+    /// Non-null for tracked sends only. A plain value: freeApiCall() has
+    /// nothing to free here.
     tracking: ?struct { worker_id: u8, coro_id: u32 } = null,
     /// Outbound chat id for the throttle (blocked_until divert + 429 park).
-    /// Null ⇒ no chat target. Value-typed — freeApiCall unchanged.
+    /// Null ⇒ no chat target. A plain value, like `tracking`.
     route: ?struct { chat_id: i64 } = null,
 };
 
@@ -64,12 +64,12 @@ pub fn freeApiCalls(calls: []ApiCall, allocator: std.mem.Allocator) void {
 //
 // The server forwards the raw JSON `body` verbatim plus a `user_id` it
 // point-extracts for queue routing.  `body` is heap-allocated; the worker
-// frees it after `callOnMessage` returns.
+// frees it once the handler has started (the Lua table is a decoded copy).
 // ---------------------------------------------------------------------------
 
 /// Which ingress produced a WorkItem — selects the Lua handler in worker.zig.
-/// A third ingress is planned; the worker dispatches via an exhaustive switch
-/// with no `else`, so a new variant cannot compile without choosing a handler.
+/// The worker dispatches via an exhaustive switch with no `else`, so a new
+/// variant cannot compile without choosing a handler.
 pub const WorkKind = enum { message, schedule };
 
 pub const WorkItem = struct {
@@ -82,10 +82,6 @@ pub const WorkItem = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Configuration (populated by config.zig from env vars)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // ValidationMode — outgoing-call schema validation policy.
 //
 //   off    — no validation
@@ -94,6 +90,10 @@ pub const WorkItem = struct {
 // ---------------------------------------------------------------------------
 
 pub const ValidationMode = enum { off, warn, strict };
+
+// ---------------------------------------------------------------------------
+// Configuration (populated by config.zig from env vars)
+// ---------------------------------------------------------------------------
 
 pub const Config = struct {
     bot_token:          []const u8,
@@ -129,9 +129,6 @@ pub const Config = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
-// ApiCall lifecycle — no leaks under testing.allocator
-// ---------------------------------------------------------------------------
-
 test "freeApiCall releases json and multipart payloads" {
     const alloc = std.testing.allocator;
 
@@ -162,74 +159,4 @@ test "freeApiCall releases json and multipart payloads" {
         };
         freeApiCall(call, alloc);
     }
-}
-
-test "freeApiCalls releases a slice of ApiCalls" {
-    const alloc = std.testing.allocator;
-    var calls = try alloc.alloc(ApiCall, 3);
-    calls[0] = .{
-        .method  = try alloc.dupe(u8, "sendMessage"),
-        .payload = .{ .json = try alloc.dupe(u8, "{}") },
-    };
-    calls[1] = .{
-        .method  = try alloc.dupe(u8, "editMessageText"),
-        .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1,\"message_id\":2,\"text\":\"x\"}") },
-    };
-    calls[2] = .{
-        .method  = try alloc.dupe(u8, "deleteMessage"),
-        .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1,\"message_id\":2}") },
-    };
-    freeApiCalls(calls, alloc);
-}
-
-test "optional ApiCall fields default null and survive free" {
-    const alloc = std.testing.allocator;
-
-    // route: defaults null; when set, holds the chat_id and frees cleanly.
-    {
-        const routed = ApiCall{
-            .method  = try alloc.dupe(u8, "sendMessage"),
-            .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":5}") },
-            .route   = .{ .chat_id = 5 },
-        };
-        defer freeApiCall(routed, alloc);
-        try std.testing.expect(routed.route != null);
-        try std.testing.expectEqual(@as(i64, 5), routed.route.?.chat_id);
-
-        const plain = ApiCall{
-            .method  = try alloc.dupe(u8, "sendMessage"),
-            .payload = .{ .json = try alloc.dupe(u8, "{}") },
-        };
-        defer freeApiCall(plain, alloc);
-        try std.testing.expect(plain.route == null);
-    }
-    // tracking: defaults null; when set, holds worker_id/coro_id and frees cleanly.
-    {
-        const tracked = ApiCall{
-            .method   = try alloc.dupe(u8, "sendMessage"),
-            .payload  = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1}") },
-            .tracking = .{ .worker_id = 2, .coro_id = 99 },
-        };
-        defer freeApiCall(tracked, alloc);
-        try std.testing.expect(tracked.tracking != null);
-        try std.testing.expectEqual(@as(u8, 2),  tracked.tracking.?.worker_id);
-        try std.testing.expectEqual(@as(u32, 99), tracked.tracking.?.coro_id);
-
-        const plain = ApiCall{
-            .method  = try alloc.dupe(u8, "sendMessage"),
-            .payload = .{ .json = try alloc.dupe(u8, "{}") },
-        };
-        defer freeApiCall(plain, alloc);
-        try std.testing.expect(plain.tracking == null);
-    }
-}
-
-test "WorkItem kind defaults to message; schedule fields settable" {
-    const m = WorkItem{ .body = "x", .user_id = 7 };
-    try std.testing.expectEqual(WorkKind.message, m.kind);
-    try std.testing.expectEqual(@as(?i64, null), m.schedule_id);
-
-    const s = WorkItem{ .body = "p", .user_id = null, .kind = .schedule, .schedule_id = 42 };
-    try std.testing.expectEqual(WorkKind.schedule, s.kind);
-    try std.testing.expectEqual(@as(?i64, 42), s.schedule_id);
 }

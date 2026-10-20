@@ -1,8 +1,11 @@
-/// state_store.zig — SQLite-backed persistence for user, chat, and global state.
-///
-/// One StateStore per worker thread (owns its own SQLite connection).
-/// WAL mode allows concurrent readers across connections on the same file.
-/// open() applies the schema idempotently; a version mismatch aborts startup.
+//! state_store.zig — SQLite-backed persistence for user, chat, global, and
+//! schedule state.
+//!
+//! One StateStore per worker thread (owns its own SQLite connection).
+//! WAL mode allows concurrent readers across connections on the same file.
+//! open() applies the schema idempotently; a version mismatch aborts startup.
+//! With a passphrase, openWithOptions() encrypts payloads at rest
+//! (state_crypto.zig); otherwise they are stored as plaintext JSON.
 
 const std = @import("std");
 
@@ -19,8 +22,8 @@ pub const SCHEMA_VERSION: u32 = 2;
 const PRAGMA_SQL: [:0]const u8 = @embedFile("pragma.sql");
 const SCHEMA_SQL: [:0]const u8 = @embedFile("schema.sql");
 
-/// The six hot-path CRUD statements, in cache slot order
-/// (get_user, set_user, get_chat, set_chat, get_global, set_global).
+/// The six hot-path CRUD statements, one per Stmt slot, in Stmt order.
+const Stmt = enum { get_user, set_user, get_chat, set_chat, get_global, set_global };
 const CACHED_SQL = [6][:0]const u8{
     "SELECT data FROM user_state WHERE user_id = ?",
     "INSERT OR REPLACE INTO user_state (user_id, data) VALUES (?, ?)",
@@ -57,18 +60,13 @@ pub const StateStore = struct {
     allocator: std.mem.Allocator,
     // Cached hot-path CRUD statements: compiled once in open(), reused via
     // sqlite3_reset, finalized in close(). Default `undefined`; always assigned
-    // by prepareStatements() before open() returns success.
-    stmt_get_user:   *c.sqlite3_stmt = undefined,
-    stmt_set_user:   *c.sqlite3_stmt = undefined,
-    stmt_get_chat:   *c.sqlite3_stmt = undefined,
-    stmt_set_chat:   *c.sqlite3_stmt = undefined,
-    stmt_get_global: *c.sqlite3_stmt = undefined,
-    stmt_set_global: *c.sqlite3_stmt = undefined,
+    // before open() returns success.
+    stmts: std.enums.EnumArray(Stmt, *c.sqlite3_stmt) = undefined,
 
-    /// Test-only fault injection. When true, the next `commit()` returns
+    /// Test-only fault injection. When true, the next commit() returns
     /// `error.SqliteError` instead of issuing COMMIT, leaving the open
     /// transaction unresolved (the real failure shape: the caller must
-    /// `rollback()`). The flag auto-clears so only one commit fails. Default
+    /// rollback()). The flag auto-clears so only one commit fails. Default
     /// false — inert in production; no path sets it except tests.
     fail_next_commit: bool = false,
     /// Set when the database is in encrypted mode; null in plaintext mode.
@@ -108,19 +106,14 @@ pub const StateStore = struct {
         if (fresh) try store.applySchema();
         try store.checkSchemaVersion();
         if (fresh) try store.seedEncryption(opts) else try store.reconcileEncryption(opts);
-        try store.prepareStatements();
+        store.stmts = .{ .values = try prepareInto(store.db, CACHED_SQL) };
         return store;
     }
 
     pub fn close(self: *StateStore) void {
         // Finalize cached statements before closing, or sqlite3_close returns
         // SQLITE_BUSY and leaks the connection.
-        _ = c.sqlite3_finalize(self.stmt_get_user);
-        _ = c.sqlite3_finalize(self.stmt_set_user);
-        _ = c.sqlite3_finalize(self.stmt_get_chat);
-        _ = c.sqlite3_finalize(self.stmt_set_chat);
-        _ = c.sqlite3_finalize(self.stmt_get_global);
-        _ = c.sqlite3_finalize(self.stmt_set_global);
+        for (self.stmts.values) |stmt| _ = c.sqlite3_finalize(stmt);
         self.enc_buf.deinit(self.allocator);
         if (self.cipher) |*cph| cph.deinit();
         _ = c.sqlite3_close(self.db);
@@ -153,16 +146,6 @@ pub const StateStore = struct {
         _ = c.sqlite3_exec(self.db, "ROLLBACK", null, null, null);
     }
 
-    fn prepareStatements(self: *StateStore) !void {
-        const s = try prepareInto(self.db, CACHED_SQL);
-        self.stmt_get_user   = s[0];
-        self.stmt_set_user   = s[1];
-        self.stmt_get_chat   = s[2];
-        self.stmt_set_chat   = s[3];
-        self.stmt_get_global = s[4];
-        self.stmt_set_global = s[5];
-    }
-
     // -----------------------------------------------------------------------
     // User state
     // -----------------------------------------------------------------------
@@ -170,12 +153,12 @@ pub const StateStore = struct {
     /// Returns the stored JSON blob for `user_id`, or "{}" if not yet set.
     /// Caller owns the returned slice.
     pub fn getUserState(self: *StateStore, user_id: i64) ![]u8 {
-        return self.getStateById(self.stmt_get_user, user_id);
+        return self.getStateById(self.stmts.get(.get_user), user_id);
     }
 
     /// Upsert the JSON blob for `user_id`.
     pub fn setUserState(self: *StateStore, user_id: i64, data: []const u8) !void {
-        return self.setStateById(self.stmt_set_user, user_id, data);
+        return self.setStateById(self.stmts.get(.set_user), user_id, data);
     }
 
     // -----------------------------------------------------------------------
@@ -183,11 +166,11 @@ pub const StateStore = struct {
     // -----------------------------------------------------------------------
 
     pub fn getChatState(self: *StateStore, chat_id: i64) ![]u8 {
-        return self.getStateById(self.stmt_get_chat, chat_id);
+        return self.getStateById(self.stmts.get(.get_chat), chat_id);
     }
 
     pub fn setChatState(self: *StateStore, chat_id: i64, data: []const u8) !void {
-        return self.setStateById(self.stmt_set_chat, chat_id, data);
+        return self.setStateById(self.stmts.get(.set_chat), chat_id, data);
     }
 
     // -----------------------------------------------------------------------
@@ -197,7 +180,7 @@ pub const StateStore = struct {
     /// Returns the value for `key`, or null if absent.
     /// Caller owns the returned slice (free with the same allocator).
     pub fn getGlobal(self: *StateStore, key: []const u8) !?[]u8 {
-        const stmt = self.stmt_get_global;
+        const stmt = self.stmts.get(.get_global);
         defer {
             _ = c.sqlite3_reset(stmt);
             _ = c.sqlite3_clear_bindings(stmt);
@@ -219,7 +202,7 @@ pub const StateStore = struct {
 
     /// Upsert a global key-value pair.
     pub fn setGlobal(self: *StateStore, key: []const u8, value: []const u8) !void {
-        const stmt = self.stmt_set_global;
+        const stmt = self.stmts.get(.set_global);
         defer {
             _ = c.sqlite3_reset(stmt);
             _ = c.sqlite3_clear_bindings(stmt);
@@ -235,15 +218,16 @@ pub const StateStore = struct {
     // -----------------------------------------------------------------------
     //
     // The schedule path is not hot, so these statements do not join the six
-    // cached CRUD statements. Reuse-first (PRINCIPLESv2 §1): all four methods
-    // funnel through prepareBound/execParams instead of repeating the
-    // prepare -> bind -> step -> finalize dance.
+    // cached CRUD statements. All four methods go through
+    // prepareBound/execParams instead of repeating prepare -> bind -> step ->
+    // finalize.
 
-    /// One positional bind value for a cold-path statement. A `text` or `blob`
-    /// slice binds with SQLITE_STATIC (the `null` destructor), so its bytes must
-    /// stay valid until the statement is stepped and finalized — true for every
-    /// caller here, which binds slices that outlive the statement.
-    const Param = union(enum) { int: i64, text: []const u8, blob: []const u8 };
+    /// One positional bind value for a cold-path statement. A `text` slice
+    /// binds with SQLITE_STATIC (the `null` destructor), so its bytes must stay
+    /// valid until the statement is stepped and finalized — true for every
+    /// caller here, which binds slices that outlive the statement. A payload
+    /// column binds through bindPayload instead, which encrypts it.
+    const Param = union(enum) { int: i64, text: []const u8 };
 
     /// Prepare `sql` and bind `params` positionally (1-based); return the bound,
     /// not-yet-stepped statement — the shared prepare+bind prefix for every
@@ -259,7 +243,6 @@ pub const StateStore = struct {
             switch (p) {
                 .int  => |v| try sqliteOk(c.sqlite3_bind_int64(stmt, idx, v)),
                 .text => |v| try sqliteOk(c.sqlite3_bind_text(stmt, idx, v.ptr, @intCast(v.len), null)),
-                .blob => |v| try sqliteOk(c.sqlite3_bind_blob(stmt, idx, v.ptr, @intCast(v.len), null)),
             }
         }
         return stmt;
@@ -278,15 +261,13 @@ pub const StateStore = struct {
 
     /// Insert a job; returns its rowid.
     pub fn scheduleInsert(self: *StateStore, fire_at_ms: i64, payload: []const u8) !i64 {
-        const sql = "INSERT INTO schedule (fire_at_ms, payload) VALUES (?, ?)";
-        if (self.cipher) |cph| {
-            const buf = try self.allocator.alloc(u8, payload.len + state_crypto.overhead);
-            defer self.allocator.free(buf);
-            const blob = cph.encryptInto(buf, payload);
-            try self.execParams(sql, &.{ .{ .int = fire_at_ms }, .{ .blob = blob } });
-        } else {
-            try self.execParams(sql, &.{ .{ .int = fire_at_ms }, .{ .text = payload } });
-        }
+        const stmt = try self.prepareBound(
+            "INSERT INTO schedule (fire_at_ms, payload) VALUES (?, ?)",
+            &.{.{ .int = fire_at_ms }},
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try self.bindPayload(stmt, 2, payload);
+        try sqliteDone(c.sqlite3_step(stmt));
         return c.sqlite3_last_insert_rowid(self.db);
     }
 
@@ -617,7 +598,7 @@ fn readPragmaInt(store: *StateStore, pragma: [:0]const u8) !i64 {
     return c.sqlite3_column_int64(stmt, 0);
 }
 
-test "fresh in-memory DB creates all tables without error" {
+test "fresh in-memory DB creates all tables and the schedule index" {
     var store = try openMem();
     defer store.close();
 
@@ -638,10 +619,18 @@ test "fresh in-memory DB creates all tables without error" {
         const rc = c.sqlite3_step(stmt);
         try testing.expect(rc == c.SQLITE_ROW or rc == c.SQLITE_DONE);
     }
+
+    // The fire-time index exists.
+    const idx = try store.prepare(
+        "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='idx_schedule_fire'",
+    );
+    defer _ = c.sqlite3_finalize(idx);
+    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(idx));
+    try testing.expectEqual(@as(c_int, 1), c.sqlite3_column_int(idx, 0));
 }
 
 test "schema_version is seeded, matched on open, and mismatch is rejected" {
-    // A fresh DB seeds meta.schema_version = '1'.
+    // A fresh DB seeds meta.schema_version = '2'.
     {
         var store = try openMem();
         defer store.close();
@@ -668,7 +657,7 @@ test "schema_version is seeded, matched on open, and mismatch is rejected" {
         var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
         const db_path = try std.mem.printSentinel(&db_path_buf, "{s}/v.db", .{dir_path}, 0);
 
-        // First open creates and seeds schema_version = '1'.
+        // First open creates and seeds schema_version = '2'.
         var store = try StateStore.open(testing.allocator, db_path);
         // Corrupt the stored version to '99'.
         const upd = try store.prepare("UPDATE meta SET value = '99' WHERE key = 'schema_version'");
@@ -681,48 +670,50 @@ test "schema_version is seeded, matched on open, and mismatch is rejected" {
     }
 }
 
-test "state round-trips for user, chat, and global" {
+test "state CRUD: defaults, round-trip, upsert; the six cached statements are reused" {
     var store = try openMem();
     defer store.close();
 
-    // user_state
+    // Unknown user/chat ids return "{}"; a missing global key returns null.
+    {
+        const u_empty = try store.getUserState(42);
+        defer testing.allocator.free(u_empty);
+        try testing.expectEqualStrings("{}", u_empty);
+        const ch_empty = try store.getChatState(-100);
+        defer testing.allocator.free(ch_empty);
+        try testing.expectEqualStrings("{}", ch_empty);
+        try testing.expectEqual(@as(?[]u8, null), try store.getGlobal("total"));
+    }
+
+    // Each kind round-trips, and a second write upserts over the first. The
+    // reads in between reuse the cached statements, so a stale binding or row
+    // left by a previous use would show up as a wrong value here.
+    try store.setUserState(42, "{\"count\":1}");
+    try store.setChatState(-100, "{\"muted\":true}");
+    try store.setGlobal("total", "98");
     try store.setUserState(42, "{\"count\":7}");
+    try store.setGlobal("total", "99");
+
     const u = try store.getUserState(42);
     defer testing.allocator.free(u);
     try testing.expectEqualStrings("{\"count\":7}", u);
 
-    // chat_state
-    try store.setChatState(-100, "{\"muted\":true}");
     const ch = try store.getChatState(-100);
     defer testing.allocator.free(ch);
     try testing.expectEqualStrings("{\"muted\":true}", ch);
 
-    // global_state
-    try store.setGlobal("total", "99");
     const g = try store.getGlobal("total");
     defer if (g) |v| testing.allocator.free(v);
-    try testing.expect(g != null);
     try testing.expectEqualStrings("99", g.?);
+
+    // A different missing key still reads null after populated reads.
+    try testing.expectEqual(@as(?[]u8, null), try store.getGlobal("absent"));
+
+    // Statements are reused, not re-prepared: still exactly the six cached.
+    try testing.expectEqual(@as(usize, 6), countStmts(store.db));
 }
 
-test "unknown keys return the empty default" {
-    var store = try openMem();
-    defer store.close();
-
-    // Unknown user/chat ids return "{}".
-    const u = try store.getUserState(999_999);
-    defer testing.allocator.free(u);
-    try testing.expectEqualStrings("{}", u);
-
-    const ch = try store.getChatState(1);
-    defer testing.allocator.free(ch);
-    try testing.expectEqualStrings("{}", ch);
-
-    // A missing global key returns null.
-    try testing.expectEqual(@as(?[]u8, null), try store.getGlobal("no_such_key"));
-}
-
-test "3 connections on same file-based DB, concurrent reads, WAL confirmed" {
+test "two connections on one file: WAL, pragmas, interleaved writes, cross reads" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -732,31 +723,29 @@ test "3 connections on same file-based DB, concurrent reads, WAL confirmed" {
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
     const db_path = try std.mem.printSentinel(&db_path_buf, "{s}/wal.db", .{dir_path}, 0);
 
-    // Seed via first connection
     var s1 = try StateStore.open(testing.allocator, db_path);
-    try s1.setUserState(1, "{\"x\":1}");
-    try s1.setUserState(2, "{\"x\":2}");
-
-    // Open two more connections
-    var s2 = try StateStore.open(testing.allocator, db_path);
-    var s3 = try StateStore.open(testing.allocator, db_path);
     defer s1.close();
+    var s2 = try StateStore.open(testing.allocator, db_path);
     defer s2.close();
-    defer s3.close();
 
-    // Concurrent reads from all three
-    const r1 = try s1.getUserState(1);
+    // Interleaved writes from two connections: busy_timeout lets each wait
+    // for the other's write lock rather than fail with SQLITE_BUSY.
+    for (0..50) |i| {
+        try s1.setUserState(@intCast(i), "{\"x\":1}");
+        try s2.setUserState(@intCast(i + 1000), "{\"x\":2}");
+    }
+
+    // Each connection reads the other's committed rows.
+    const r1 = try s1.getUserState(1000);
     defer testing.allocator.free(r1);
-    const r2 = try s2.getUserState(2);
+    try testing.expectEqualStrings("{\"x\":2}", r1);
+    const r2 = try s2.getUserState(1);
     defer testing.allocator.free(r2);
-    const r3 = try s3.getUserState(1);
-    defer testing.allocator.free(r3);
+    try testing.expectEqualStrings("{\"x\":1}", r2);
 
-    try testing.expectEqualStrings("{\"x\":1}", r1);
-    try testing.expectEqualStrings("{\"x\":2}", r2);
-    try testing.expectEqualStrings("{\"x\":1}", r3);
-
-    // Verify WAL mode is active (file-based DB only — in-memory always reports "memory")
+    // WAL is on (a file DB only: in-memory always reports "memory"), and the
+    // per-connection pragmas hold on both connections: busy_timeout 5000,
+    // synchronous NORMAL (1), foreign_keys ON (1).
     const jm_stmt = try s1.prepare("PRAGMA journal_mode");
     defer _ = c.sqlite3_finalize(jm_stmt);
     try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(jm_stmt));
@@ -765,55 +754,41 @@ test "3 connections on same file-based DB, concurrent reads, WAL confirmed" {
     try testing.expect(jm_text != null);
     try testing.expectEqualStrings("wal", jm_text[0..jm_len]);
 
-    // The other required pragmas must also be in effect on the
-    // connection (synchronous=NORMAL == 1, foreign_keys=ON == 1).
-    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s1, "PRAGMA synchronous"));
-    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s1, "PRAGMA foreign_keys"));
-}
-
-test "a second write upserts over the first" {
-    var store = try openMem();
-    defer store.close();
-
-    // user_state upsert.
-    try store.setUserState(1, "{\"v\":\"A\"}");
-    try store.setUserState(1, "{\"v\":\"B\"}");
-    const u = try store.getUserState(1);
-    defer testing.allocator.free(u);
-    try testing.expectEqualStrings("{\"v\":\"B\"}", u);
-
-    // global_state upsert.
-    try store.setGlobal("k", "first");
-    try store.setGlobal("k", "second");
-    const g = try store.getGlobal("k");
-    defer if (g) |v| testing.allocator.free(v);
-    try testing.expectEqualStrings("second", g.?);
-}
-
-test "an immediate transaction commits and rolls back" {
-    var store = try openMem();
-    defer store.close();
-
-    // commit persists the write.
-    try store.beginImmediate();
-    try store.setUserState(1, "{\"x\":42}");
-    try store.commit();
-    {
-        const data = try store.getUserState(1);
-        defer store.allocator.free(data);
-        try testing.expect(std.mem.find(u8, data, "\"x\":42") != null);
+    for ([_]*StateStore{ &s1, &s2 }) |s| {
+        try testing.expectEqual(@as(i64, 5000), try readPragmaInt(s, "PRAGMA busy_timeout"));
+        try testing.expectEqual(@as(i64, 1), try readPragmaInt(s, "PRAGMA synchronous"));
+        try testing.expectEqual(@as(i64, 1), try readPragmaInt(s, "PRAGMA foreign_keys"));
     }
+}
 
-    // rollback reverts the write to the last committed value.
-    try store.setUserState(2, "{\"x\":0}");
-    try store.beginImmediate();
-    try store.setUserState(2, "{\"x\":99}");
-    store.rollback();
-    {
-        const data = try store.getUserState(2);
-        defer store.allocator.free(data);
-        try testing.expect(std.mem.find(u8, data, "\"x\":0") != null);
-        try testing.expect(std.mem.find(u8, data, "\"x\":99") == null);
+test "immediate and deferred transactions commit and roll back" {
+    var store = try openMem();
+    defer store.close();
+
+    // The start path uses beginImmediate; a resumed coroutine segment uses
+    // beginDeferred (lazy write lock). Both must persist on commit and revert
+    // to the last committed value on rollback.
+    const Begin = enum { immediate, deferred };
+    for ([_]Begin{ .immediate, .deferred }) |kind| {
+        try store.setUserState(1, "{\"v\":\"base\"}");
+
+        if (kind == .immediate) try store.beginImmediate() else try store.beginDeferred();
+        try store.setUserState(1, "{\"v\":\"discarded\"}");
+        store.rollback();
+        {
+            const data = try store.getUserState(1);
+            defer testing.allocator.free(data);
+            try testing.expectEqualStrings("{\"v\":\"base\"}", data);
+        }
+
+        if (kind == .immediate) try store.beginImmediate() else try store.beginDeferred();
+        try store.setUserState(1, "{\"v\":\"committed\"}");
+        try store.commit();
+        {
+            const data = try store.getUserState(1);
+            defer testing.allocator.free(data);
+            try testing.expectEqualStrings("{\"v\":\"committed\"}", data);
+        }
     }
 }
 
@@ -823,37 +798,6 @@ fn countStmts(db: *c.sqlite3) usize {
     var s: ?*c.sqlite3_stmt = c.sqlite3_next_stmt(db, null);
     while (s != null) : (s = c.sqlite3_next_stmt(db, s)) n += 1;
     return n;
-}
-
-test "open prepares exactly 6 cached statements; close tears down cleanly" {
-    var store = try openMem();
-    // Exactly the six cached CRUD statements are live after open().
-    try testing.expectEqual(@as(usize, 6), countStmts(store.db));
-    // Exercise the real close() teardown (finalize all six, then sqlite3_close).
-    // close() discards sqlite3_close's return code by design, so this test cannot
-    // assert SQLITE_OK directly. The teardown's success is asserted by the
-    // companion white-box test "finalizing the six cached statements lets
-    // sqlite3_close return OK", which mirrors close()'s exact finalize sequence
-    // and checks the SQLITE_OK return. A finalize omission here would leave the
-    // connection BUSY and leak it — surfaced by countStmts being non-zero and by
-    // the suite-wide `defer store.close()` usage.
-    try testing.expectEqual(@as(usize, 6), countStmts(store.db));
-    store.close();
-}
-
-test "finalizing the six cached statements lets sqlite3_close return OK" {
-    // White-box check mirroring close()'s teardown: finalizing exactly the six
-    // cached statements leaves no live statement, so sqlite3_close returns
-    // SQLITE_OK (it would return SQLITE_BUSY if any statement were still live).
-    // The store is torn down manually here, so no `defer store.close()`.
-    const store = try openMem();
-    _ = c.sqlite3_finalize(store.stmt_get_user);
-    _ = c.sqlite3_finalize(store.stmt_set_user);
-    _ = c.sqlite3_finalize(store.stmt_get_chat);
-    _ = c.sqlite3_finalize(store.stmt_set_chat);
-    _ = c.sqlite3_finalize(store.stmt_get_global);
-    _ = c.sqlite3_finalize(store.stmt_set_global);
-    try testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_close(store.db));
 }
 
 test "prepareInto finalizes the prepared prefix on a mid-sequence failure" {
@@ -870,112 +814,6 @@ test "prepareInto finalizes the prepared prefix on a mid-sequence failure" {
     try testing.expectError(error.SqliteError, prepareInto(store.db, bad));
     // No leak: the 5 successful prepares were finalized, count is unchanged.
     try testing.expectEqual(before, countStmts(store.db));
-}
-
-test "setGlobal/getGlobal reuse the cached statement (count stays 6)" {
-    var store = try openMem();
-    defer store.close();
-
-    var i: usize = 0;
-    while (i < 1000) : (i += 1) {
-        var vbuf: [16]u8 = undefined;
-        const v = try std.fmt.bufPrint(&vbuf, "{d}", .{i});
-        try store.setGlobal("total", v);
-    }
-    const got = try store.getGlobal("total");
-    defer testing.allocator.free(got.?);
-    try testing.expectEqualStrings("999", got.?);
-
-    // No statement growth across 1000+ reuses: still exactly the 6 cached.
-    try testing.expectEqual(@as(usize, 6), countStmts(store.db));
-}
-
-test "user/chat statements reset cleanly across mixed access" {
-    var store = try openMem();
-    defer store.close();
-
-    // unknown id -> "{}"
-    const u_empty = try store.getUserState(1);
-    defer testing.allocator.free(u_empty);
-    try testing.expectEqualStrings("{}", u_empty);
-
-    // write user, write chat (different cached stmts), read both back
-    try store.setUserState(1, "{\"count\":1}");
-    try store.setChatState(2, "{\"room\":\"a\"}");
-
-    const user_state1 = try store.getUserState(1);
-    defer testing.allocator.free(user_state1);
-    try testing.expectEqualStrings("{\"count\":1}", user_state1);
-
-    const ch = try store.getChatState(2);
-    defer testing.allocator.free(ch);
-    try testing.expectEqualStrings("{\"room\":\"a\"}", ch);
-
-    // overwrite user, re-read -- no stale row/binding from prior reuse
-    try store.setUserState(1, "{\"count\":2}");
-    const user_state2 = try store.getUserState(1);
-    defer testing.allocator.free(user_state2);
-    try testing.expectEqualStrings("{\"count\":2}", user_state2);
-
-    // statements reused, not re-prepared: still the 6 cached
-    try testing.expectEqual(@as(usize, 6), countStmts(store.db));
-}
-
-test "global statement reset is clean across mixed read/write/miss" {
-    var store = try openMem();
-    defer store.close();
-
-    // miss -> null
-    try testing.expectEqual(@as(?[]u8, null), try store.getGlobal("k"));
-
-    // write then read same key
-    try store.setGlobal("k", "v1");
-    const a = try store.getGlobal("k");
-    defer testing.allocator.free(a.?);
-    try testing.expectEqualStrings("v1", a.?);
-
-    // overwrite then read -- no stale binding/row state leaks between reuses
-    try store.setGlobal("k", "v2");
-    const b = try store.getGlobal("k");
-    defer testing.allocator.free(b.?);
-    try testing.expectEqualStrings("v2", b.?);
-
-    // a different missing key still returns null after prior populated reads
-    try testing.expectEqual(@as(?[]u8, null), try store.getGlobal("absent"));
-}
-
-test "busy_timeout set — concurrent writers complete without BUSY error" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPath(testing.io, &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-    var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.mem.printSentinel(&db_path_buf, "{s}/busy.db", .{dir_path}, 0);
-
-    var s1 = try StateStore.open(testing.allocator, db_path);
-    var s2 = try StateStore.open(testing.allocator, db_path);
-    defer s1.close();
-    defer s2.close();
-
-    // Interleaved writes from two connections — busy_timeout lets them retry
-    // rather than immediately returning SQLITE_BUSY.
-    for (0..50) |i| {
-        try s1.setUserState(@intCast(i), "{}");
-        try s2.setUserState(@intCast(i + 1000), "{}");
-    }
-
-    // busy_timeout must be 5000 on BOTH connections (the second query reads
-    // s2, not s1 again).
-    try testing.expectEqual(@as(i64, 5000), try readPragmaInt(&s1, "PRAGMA busy_timeout"));
-    try testing.expectEqual(@as(i64, 5000), try readPragmaInt(&s2, "PRAGMA busy_timeout"));
-
-    // The other required pragmas hold on both connections too.
-    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s1, "PRAGMA synchronous"));
-    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s2, "PRAGMA synchronous"));
-    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s1, "PRAGMA foreign_keys"));
-    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&s2, "PRAGMA foreign_keys"));
 }
 
 test "scheduleInsert returns rowid; scheduleDelete reports removal" {
@@ -1040,67 +878,8 @@ test "scheduleClaimDue selects only due rows, ordered, capped, and stamps lease"
     try std.testing.expectEqualStrings("{\"n\":2}", claimed2[0].payload);
 }
 
-test "schedule table and index exist after open" {
-    var store = try StateStore.open(std.testing.allocator, ":memory:");
-    defer store.close();
-
-    // The table is queryable (would error 'no such table' if absent).
-    const tbl = try store.prepare("SELECT count(*) FROM schedule");
-    defer _ = c.sqlite3_finalize(tbl);
-    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(tbl));
-    try std.testing.expectEqual(@as(c_int, 0), c.sqlite3_column_int(tbl, 0));
-
-    // The fire-time index exists.
-    const idx = try store.prepare(
-        "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='idx_schedule_fire'",
-    );
-    defer _ = c.sqlite3_finalize(idx);
-    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(idx));
-    try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_column_int(idx, 0));
-}
-
-test "open applies synchronous=NORMAL and foreign_keys=ON" {
-    // pragma.sql sets synchronous=NORMAL and foreign_keys=ON, both
-    // mandatory. A regression dropping either pragma is
-    // otherwise undetected. The readback values are SQLite's canonical
-    // encodings: synchronous NORMAL == 1, foreign_keys ON == 1.
-    var store = try openMem();
-    defer store.close();
-    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&store, "PRAGMA synchronous"));
-    try testing.expectEqual(@as(i64, 1), try readPragmaInt(&store, "PRAGMA foreign_keys"));
-}
-
-test "beginDeferred commits a write and rolls one back" {
-    // P4-7: the worker's resumed-coroutine path wraps each post-yield segment in
-    // beginDeferred (lazy write lock). Commit must persist the segment's write;
-    // rollback must discard it, leaving the last committed value intact.
-    var store = try openMem();
-    defer store.close();
-
-    // Commit path: write under a deferred txn, commit, read back the new value.
-    try store.beginDeferred();
-    try store.setUserState(1, "{\"v\":\"committed\"}");
-    try store.commit();
-    {
-        const data = try store.getUserState(1);
-        defer testing.allocator.free(data);
-        try testing.expectEqualStrings("{\"v\":\"committed\"}", data);
-    }
-
-    // Rollback path: write under a second deferred txn, roll back, confirm the
-    // committed value is unchanged.
-    try store.beginDeferred();
-    try store.setUserState(1, "{\"v\":\"discarded\"}");
-    store.rollback();
-    {
-        const data = try store.getUserState(1);
-        defer testing.allocator.free(data);
-        try testing.expectEqualStrings("{\"v\":\"committed\"}", data);
-    }
-}
-
 test "scheduleClaimDue substitutes {} for a NULL payload" {
-    // P4-27: scheduleClaimDue defensively duplicates "{}" when a claimed row's
+    // scheduleClaimDue defensively duplicates "{}" when a claimed row's
     // payload column is SQL NULL. The shipped schema marks payload NOT NULL, so
     // the only way to reach that branch is to bypass the constraint. Recreate
     // the schedule table without NOT NULL (raw test-local SQL), insert a row
@@ -1125,130 +904,65 @@ test "scheduleClaimDue substitutes {} for a NULL payload" {
     try testing.expectEqualStrings("{}", claimed[0].payload);
 }
 
-test "fail_next_commit seam makes one commit fail, then auto-resets" {
-    // Test-only fault seam used by the worker resume-path test (B4b): set
-    // fail_next_commit, run a txn + write, and the next commit() errors without
-    // issuing COMMIT (transaction left open for rollback). The flag clears
-    // itself, so the following commit succeeds normally.
-    var store = try openMem();
-    defer store.close();
-
-    store.fail_next_commit = true;
-    try store.beginDeferred();
-    try store.setUserState(1, "{\"v\":\"A\"}");
-    try testing.expectError(error.SqliteError, store.commit());
-    // The seam cleared itself.
-    try testing.expect(!store.fail_next_commit);
-    // The transaction is still open (commit was never issued); roll it back so
-    // the write is discarded — the real failure-handling shape.
-    store.rollback();
-    {
-        const data = try store.getUserState(1);
-        defer testing.allocator.free(data);
-        try testing.expectEqualStrings("{}", data);
-    }
-
-    // A subsequent normal commit succeeds: the seam is one-shot.
-    try store.beginDeferred();
-    try store.setUserState(1, "{\"v\":\"B\"}");
-    try store.commit();
-    {
-        const data = try store.getUserState(1);
-        defer testing.allocator.free(data);
-        try testing.expectEqualStrings("{\"v\":\"B\"}", data);
-    }
-}
-
-test "fresh plaintext DB records encryption=none" {
-    var store = try StateStore.open(testing.allocator, ":memory:");
-    defer store.close();
-    const mode = try store.getMeta(testing.allocator, "encryption");
-    defer if (mode) |m| testing.allocator.free(m);
-    try testing.expect(mode != null);
-    try testing.expectEqualStrings("none", mode.?);
-}
-
-test "fresh encrypted DB seeds marker, salt, params, verifier and sets cipher" {
-    var store = try StateStore.openWithOptions(testing.allocator, ":memory:", .{
-        .encryption = .{ .passphrase = "pw", .io = testing.io },
-    });
-    defer store.close();
-    try testing.expect(store.cipher != null);
-    const mode = try store.getMeta(testing.allocator, "encryption");
-    defer if (mode) |m| testing.allocator.free(m);
-    try testing.expectEqualStrings("xchacha20poly1305", mode.?);
-    inline for (.{ "kdf_salt", "kdf_params", "enc_verifier" }) |k| {
-        const v = try store.getMeta(testing.allocator, k);
-        defer if (v) |x| testing.allocator.free(x);
-        try testing.expect(v != null);
-    }
-}
-
-test "reopening an encrypted DB with the right passphrase succeeds" {
+test "encryption marker is seeded on create; reopen checks passphrase and mode" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(testing.io, &path_buf);
     var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.mem.printSentinel(&db_buf, "{s}/e.db", .{path_buf[0..dir_len]}, 0);
-
-    {
-        var s = try StateStore.openWithOptions(testing.allocator, db_path, .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
-        s.close();
-    }
-    var s2 = try StateStore.openWithOptions(testing.allocator, db_path, .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
-    defer s2.close();
-    try testing.expect(s2.cipher != null);
-}
-
-test "reopening an encrypted DB with the wrong passphrase aborts" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_len = try tmp.dir.realPath(testing.io, &path_buf);
-    var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.mem.printSentinel(&db_buf, "{s}/e.db", .{path_buf[0..dir_len]}, 0);
-
-    {
-        var s = try StateStore.openWithOptions(testing.allocator, db_path, .{ .encryption = .{ .passphrase = "right", .io = testing.io } });
-        s.close();
-    }
-    try testing.expectError(error.WrongEncryptionKey, StateStore.openWithOptions(testing.allocator, db_path, .{ .encryption = .{ .passphrase = "wrong", .io = testing.io } }));
-}
-
-test "mode mismatch aborts in both directions" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_len = try tmp.dir.realPath(testing.io, &path_buf);
-    var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-
-    // Encrypted DB opened without a passphrase → mismatch.
-    const enc_path = try std.mem.printSentinel(&db_buf, "{s}/m1.db", .{path_buf[0..dir_len]}, 0);
-    {
-        var s = try StateStore.openWithOptions(testing.allocator, enc_path, .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
-        s.close();
-    }
-    try testing.expectError(error.EncryptionModeMismatch, StateStore.open(testing.allocator, enc_path));
-
-    // Plaintext DB opened with a passphrase → mismatch.
     var db_buf2: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const plain_path = try std.mem.printSentinel(&db_buf2, "{s}/m2.db", .{path_buf[0..dir_len]}, 0);
+    const enc_path = try std.mem.printSentinel(&db_buf, "{s}/enc.db", .{path_buf[0..dir_len]}, 0);
+    const plain_path = try std.mem.printSentinel(&db_buf2, "{s}/plain.db", .{path_buf[0..dir_len]}, 0);
+    const pw: OpenOptions = .{ .encryption = .{ .passphrase = "pw", .io = testing.io } };
+
+    // A fresh encrypted DB seeds the marker, salt, params and verifier.
+    {
+        var s = try StateStore.openWithOptions(testing.allocator, enc_path, pw);
+        defer s.close();
+        try testing.expect(s.cipher != null);
+        const mode = try s.getMeta(testing.allocator, "encryption");
+        defer if (mode) |m| testing.allocator.free(m);
+        try testing.expectEqualStrings("xchacha20poly1305", mode.?);
+        inline for (.{ "kdf_salt", "kdf_params", "enc_verifier" }) |k| {
+            const v = try s.getMeta(testing.allocator, k);
+            defer if (v) |x| testing.allocator.free(x);
+            try testing.expect(v != null);
+        }
+    }
+    // A fresh plaintext DB records encryption=none.
     {
         var s = try StateStore.open(testing.allocator, plain_path);
-        s.close();
+        defer s.close();
+        const mode = try s.getMeta(testing.allocator, "encryption");
+        defer if (mode) |m| testing.allocator.free(m);
+        try testing.expectEqualStrings("none", mode.?);
     }
-    try testing.expectError(error.EncryptionModeMismatch, StateStore.openWithOptions(testing.allocator, plain_path, .{ .encryption = .{ .passphrase = "pw", .io = testing.io } }));
+
+    // The right passphrase reopens; a wrong one aborts.
+    {
+        var s = try StateStore.openWithOptions(testing.allocator, enc_path, pw);
+        defer s.close();
+        try testing.expect(s.cipher != null);
+    }
+    try testing.expectError(error.WrongEncryptionKey, StateStore.openWithOptions(
+        testing.allocator,
+        enc_path,
+        .{ .encryption = .{ .passphrase = "wrong", .io = testing.io } },
+    ));
+
+    // A mode mismatch aborts in both directions.
+    try testing.expectError(error.EncryptionModeMismatch, StateStore.open(testing.allocator, enc_path));
+    try testing.expectError(error.EncryptionModeMismatch, StateStore.openWithOptions(testing.allocator, plain_path, pw));
 }
 
-test "encrypted mode round-trips user/chat/global/schedule" {
+test "encrypted mode: every kind round-trips, bytes at rest are ciphertext, corruption is caught" {
     var store = try StateStore.openWithOptions(testing.allocator, ":memory:", .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
     defer store.close();
 
-    try store.setUserState(1, "{\"count\":7}");
+    try store.setUserState(1, "{\"secret\":\"swordfish\"}");
     const u = try store.getUserState(1);
     defer testing.allocator.free(u);
-    try testing.expectEqualStrings("{\"count\":7}", u);
+    try testing.expectEqualStrings("{\"secret\":\"swordfish\"}", u);
 
     try store.setChatState(-100, "{\"muted\":true}");
     const ch = try store.getChatState(-100);
@@ -1260,39 +974,36 @@ test "encrypted mode round-trips user/chat/global/schedule" {
     defer if (g) |v| testing.allocator.free(v);
     try testing.expectEqualStrings("99", g.?);
 
+    // Both schedule write paths encrypt; scheduleClaimDue decrypts.
     const id = try store.scheduleInsert(1000, "{\"job\":1}");
-    const claimed = try store.scheduleClaimDue(2000, 0, 16, testing.allocator);
-    defer {
-        for (claimed) |j| testing.allocator.free(j.payload);
-        testing.allocator.free(claimed);
+    try store.insertScheduleRowRaw(id + 10, 1500, null, "{\"x\":true}");
+    {
+        const claimed = try store.scheduleClaimDue(2000, 0, 16, testing.allocator);
+        defer {
+            for (claimed) |j| testing.allocator.free(j.payload);
+            testing.allocator.free(claimed);
+        }
+        try testing.expectEqual(@as(usize, 2), claimed.len);
+        try testing.expectEqual(id, claimed[0].id);
+        try testing.expectEqualStrings("{\"job\":1}", claimed[0].payload);
+        try testing.expectEqual(id + 10, claimed[1].id);
+        try testing.expectEqualStrings("{\"x\":true}", claimed[1].payload);
     }
-    try testing.expectEqual(@as(usize, 1), claimed.len);
-    try testing.expectEqual(id, claimed[0].id);
-    try testing.expectEqualStrings("{\"job\":1}", claimed[0].payload);
-}
 
-test "on-disk bytes are not the plaintext in encrypted mode" {
-    var store = try StateStore.openWithOptions(testing.allocator, ":memory:", .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
-    defer store.close();
-    try store.setUserState(1, "{\"secret\":\"swordfish\"}");
+    // The raw stored column is a BLOB that does not contain the plaintext.
+    {
+        const stmt = try store.prepare("SELECT data FROM user_state WHERE user_id = 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+        try testing.expectEqual(c.SQLITE_BLOB, c.sqlite3_column_type(stmt, 0));
+        const raw = c.sqlite3_column_blob(stmt, 0);
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        const bytes = @as([*]const u8, @ptrCast(raw))[0..len];
+        try testing.expect(std.mem.find(u8, bytes, "swordfish") == null);
+        try testing.expect(len >= state_crypto.overhead);
+    }
 
-    // Read the raw stored column directly (bypassing decryption).
-    const stmt = try store.prepare("SELECT data FROM user_state WHERE user_id = 1");
-    defer _ = c.sqlite3_finalize(stmt);
-    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
-    try testing.expectEqual(c.SQLITE_BLOB, c.sqlite3_column_type(stmt, 0));
-    const raw = c.sqlite3_column_blob(stmt, 0);
-    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-    const bytes = @as([*]const u8, @ptrCast(raw))[0..len];
-    try testing.expect(std.mem.find(u8, bytes, "swordfish") == null);
-    try testing.expect(len >= state_crypto.overhead);
-}
-
-test "a corrupted encrypted row reports DecryptFailed" {
-    var store = try StateStore.openWithOptions(testing.allocator, ":memory:", .{ .encryption = .{ .passphrase = "pw", .io = testing.io } });
-    defer store.close();
-    try store.setUserState(1, "{\"x\":1}");
-    // Corrupt the stored blob in place.
+    // A blob corrupted in place reports DecryptFailed.
     try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(store.db,
         "UPDATE user_state SET data = X'00000000000000000000000000000000000000000000000000000000' WHERE user_id = 1",
         null, null, null));
@@ -1320,25 +1031,4 @@ test "insertScheduleRowRaw preserves id and claimed_at_ms (plaintext)" {
     try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
     try testing.expectEqual(@as(i64, 6), c.sqlite3_column_int64(stmt, 0));
     try testing.expectEqual(@as(i64, 1234), c.sqlite3_column_int64(stmt, 3));
-}
-
-test "insertScheduleRowRaw payload round-trips under encryption" {
-    var store = try StateStore.openWithOptions(
-        testing.allocator,
-        ":memory:",
-        .{ .encryption = .{ .passphrase = "pw", .io = testing.io } },
-    );
-    defer store.close();
-
-    try store.insertScheduleRowRaw(7, 50, null, "{\"x\":true}");
-
-    // scheduleClaimDue is the only read path that decrypts a schedule payload.
-    const jobs = try store.scheduleClaimDue(100, 0, 10, testing.allocator);
-    defer {
-        for (jobs) |j| testing.allocator.free(j.payload);
-        testing.allocator.free(jobs);
-    }
-    try testing.expectEqual(@as(usize, 1), jobs.len);
-    try testing.expectEqual(@as(i64, 7), jobs[0].id);
-    try testing.expectEqualStrings("{\"x\":true}", jobs[0].payload);
 }

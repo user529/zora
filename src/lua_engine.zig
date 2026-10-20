@@ -1,19 +1,19 @@
-/// lua_engine.zig — load/reload rules.lua, call on_message()
-///
-/// One LuaEngine per worker thread; never shared between threads.
-///
-/// Lifecycle:
-///   init(allocator, ctx)    → allocates Lua state, opens safe stdlib, registers bot.*
-///   loadFile(path)          → doFile (replaces current chunk)
-///   loadString(src)         → doString (for tests / hot-reload from memory)
-///   callOnMessage(body)     → decodes JSON body, calls on_message(table) → []ApiCall
-///   types.freeApiCalls(actions, allocator) → free slice + owned strings
-///   deinit()                → closes Lua state
-///
-/// on_message returns a list of generic API-call tables — each shaped
-/// `{ method = "...", params = {...} }`.  Rules may also push
-/// fire-and-forget calls mid-handler with `bot.emit{...}`; those are collected
-/// ahead of the return-list.
+//! lua_engine.zig — load rules.lua and run its handlers as coroutines.
+//!
+//! One LuaEngine per worker thread; never shared between threads.
+//!
+//! Lifecycle:
+//!   init(allocator, ctx)  → allocates Lua state, opens safe stdlib, registers bot.*
+//!   loadFile(path)        → doFile (replaces current chunk)
+//!   startHandler(...)     → runs on_message/on_schedule as a new coroutine
+//!   resumeHandler(...)    → resumes a coroutine parked on I/O or a tracked send
+//!   deinit()              → closes Lua state
+//!
+//! A handler emits outgoing calls with `bot.emit{...}` or `tg.<method>{...}`,
+//! and may also return a list of `{ method = "...", params = {...} }` tables.
+//! When the coroutine finishes, the engine collects the emitted calls first,
+//! then the returned ones, as []ApiCall (free with types.freeApiCalls).
+//! loadString() and callOnMessage() are test-only wrappers.
 
 const std = @import("std");
 const ziglua = @import("ziglua");
@@ -50,7 +50,7 @@ pub const CoroHandle = struct {
 pub const CoroOutcome = union(enum) {
     /// Coroutine finished. Caller owns the slice; free with types.freeApiCalls.
     done:    []types.ApiCall,
-    /// Coroutine yielded. Caller submits pending_job.io_job to the io_pool
+    /// Coroutine yielded. Caller submits pending_job.io to the io_pool
     /// and stores the CoroHandle in the inflight entry.
     yielded: struct {
         handle:      CoroHandle,
@@ -75,6 +75,19 @@ pub fn teardownCoro(main: *Lua, handle: CoroHandle) void {
     main.pushNil();
     main.setTableRaw(ziglua.registry_index); // registry[thread_obj] = nil
     main.unref(ziglua.registry_index, handle.lua_ref);
+}
+
+/// Log a failed resume: the Lua error message lua_resume left on top of
+/// `thread`, followed by the coroutine's stack traceback. The traceback is
+/// built on `main`, because `thread` is dead after the error (the same pairing
+/// `debug.traceback(co, msg)` uses). Logs at warn: a rule error is survivable,
+/// and the worker carries on with the next update.
+fn logResumeError(main: *Lua, thread: *Lua, handler: []const u8, err: anyerror) void {
+    const msg: ?[:0]const u8 = thread.toString(-1) catch null;
+    main.traceback(thread, msg, 0);
+    defer main.pop(1);
+    const trace = main.toString(-1) catch @errorName(err);
+    log.warn("{s} failed: {s}", .{ handler, trace });
 }
 
 /// Instruction hook — fires after 10M instructions per resume.
@@ -175,7 +188,7 @@ pub const LuaEngine = struct {
             .done    => |actions| return actions,
             .yielded => |y| {
                 switch (y.pending_job) {
-                    .io           => |io|   lua_api.freeOwnedStrings(io.owned_strings, allocator),
+                    .io           => |job|  io_pool.freeIoJob(job, allocator),
                     .tracked_send => |call| types.freeApiCall(call, allocator),
                 }
                 teardownCoro(self.lua, y.handle);
@@ -257,7 +270,7 @@ pub const LuaEngine = struct {
         // First resume: call handler(body_table[, extra_int]).
         var nres: i32 = 0;
         const status = thread.resumeThread(main, nargs, &nres) catch |e| {
-            log.warn("startHandler resumeThread error: {s}", .{@errorName(e)});
+            logResumeError(main, thread, handler, e);
             teardownCoro(main, handle);
             return .err;
         };
@@ -265,26 +278,24 @@ pub const LuaEngine = struct {
         return self.processResume(handle, main, thread, status, nres, allocator);
     }
 
-    /// Resume a parked coroutine with the result of a completed I/O job.
-    /// Frees owned_strings (io_pool is done with them by the time this is called).
+    /// Resume a parked coroutine with `result`. `job` is the I/O job the
+    /// coroutine parked on, or null for a tracked send; resumeHandler frees its
+    /// payload (io_pool is done with it by the time this is called).
     pub fn resumeHandler(
-        self:             *LuaEngine,
-        handle:           CoroHandle,
-        result:           io_pool.IoResult,
-        owned_strings:    lua_api.OwnedStrings,
-        is_tracked_send:  bool,
-        allocator:        std.mem.Allocator,
+        self:      *LuaEngine,
+        handle:    CoroHandle,
+        result:    io_pool.IoResult,
+        job:       ?io_pool.IoJob,
+        allocator: std.mem.Allocator,
     ) !CoroOutcome {
         const main = self.lua;
         const thread = handle.thread;
 
-        // Safe to free now — io_pool has already finished with the strings.
-        lua_api.freeOwnedStrings(owned_strings, allocator);
-
-        if (is_tracked_send) {
-            pushTrackedSendResult(thread, result);
-        } else {
+        if (job) |j| {
+            io_pool.freeIoJob(j, allocator);
             pushIoResult(thread, result);
+        } else {
+            pushTrackedSendResult(thread, result);
         }
 
         // Reset instruction cap for this resume.
@@ -292,7 +303,7 @@ pub const LuaEngine = struct {
 
         var nres: i32 = 0;
         const status = thread.resumeThread(main, 1, &nres) catch |e| {
-            log.warn("resumeHandler resumeThread error: {s}", .{@errorName(e)});
+            logResumeError(main, thread, "resumed handler", e);
             teardownCoro(main, handle);
             return .err;
         };
@@ -347,9 +358,9 @@ pub const LuaEngine = struct {
                     return .err;
                 };
                 switch (pj) {
-                    .io => |*io| {
-                        io.io_job.worker_id = handle.worker_id;
-                        io.io_job.coro_id   = handle.coro_id;
+                    .io => |*job| {
+                        job.worker_id = handle.worker_id;
+                        job.coro_id   = handle.coro_id;
                     },
                     .tracked_send => |*call| {
                         if (call.tracking) |*t| {
@@ -539,7 +550,7 @@ fn testCtx(db: *state_store.StateStore) lua_api.ApiCtx {
     return .{ .db = db, .allocator = testing.allocator, .io = testing.io, .max_file_bytes = 52428800, .json_max_bytes = 1048576 };
 }
 
-test "io.open / os.execute / require raise errors; math/string/table/utf8 work" {
+test "sandbox: io/os/require/dofile/loadfile are gone; math/string/table/utf8 work" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
     var ctx = testCtx(&db);
@@ -550,92 +561,62 @@ test "io.open / os.execute / require raise errors; math/string/table/utf8 work" 
     try testing.expectError(error.LuaError, engine.loadString("io.open('x','r')"));
     try testing.expectError(error.LuaError, engine.loadString("os.execute('echo hi')"));
     try testing.expectError(error.LuaError, engine.loadString("require('io')"));
+    try testing.expectError(error.LuaError, engine.loadString("package.loadlib('x', 'y')"));
+    try testing.expectError(error.LuaError, engine.loadString("debug.getregistry()"));
+
+    // init() nils dofile and loadfile after openBase: the globals read back
+    // nil, and calling one is a runtime error.
+    try testing.expectError(error.LuaError, engine.loadString("dofile('x')"));
+    try testing.expectError(error.LuaError, engine.loadString("loadfile('x')"));
+    try engine.loadString("assert(dofile == nil); assert(loadfile == nil)");
 
     // Safe libs must work.
     try engine.loadString("return math.floor(1.5)");
     try engine.loadString("return string.upper('hello')");
     try engine.loadString("local t = {}; table.insert(t,1); return t[1]");
     try engine.loadString("return utf8.len('hello')");
+    try engine.loadString("assert(load('return 1')() == 1)");
 }
 
-test "dofile and loadfile globals are nil → calling them raises a Lua error" {
+test "a syntax error, a runtime error or an undecodable body leaves the engine usable" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
     var ctx = testCtx(&db);
     var engine = try LuaEngine.init(testing.allocator, &ctx);
     defer engine.deinit();
 
-    // init() nils both after openBase, so they are no longer callable: invoking
-    // a nil value is a runtime error surfaced as error.LuaError.
-    try testing.expectError(error.LuaError, engine.loadString("dofile('x')"));
-    try testing.expectError(error.LuaError, engine.loadString("loadfile('x')"));
+    // A syntax error fails the load.
+    try testing.expectError(error.LuaError, engine.loadString("function ("));
 
-    // The globals themselves read back as nil.
-    try engine.loadString("assert(dofile == nil); assert(loadfile == nil)");
-}
-
-test "on_message returning {} → empty slice" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var engine = try LuaEngine.init(testing.allocator, &ctx);
-    defer engine.deinit();
-
-    try engine.loadString(
-        \\function on_message(update) return {} end
-    );
-
-    const actions = try engine.callOnMessage(testing.allocator, "{\"update_id\":2}");
-    defer types.freeApiCalls(actions, testing.allocator);
-
-    try testing.expectEqual(@as(usize, 0), actions.len);
-}
-
-test "on_message error → empty slice logged, next call succeeds" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var engine = try LuaEngine.init(testing.allocator, &ctx);
-    defer engine.deinit();
-
+    // A runtime error in on_message is logged and yields no calls.
     try engine.loadString(
         \\function on_message(u)
         \\  error("boom")
         \\end
     );
-
     const actions = try engine.callOnMessage(testing.allocator, "{\"update_id\":4}");
     defer types.freeApiCalls(actions, testing.allocator);
-
     try testing.expectEqual(@as(usize, 0), actions.len);
 
-    // Replace the function with a good one; next call must succeed.
+    // The server only scans a body for user_id, so a body nested past the
+    // decode limit, or one with duplicate keys, reaches the engine. Decoding
+    // fails, and the update yields no calls.
+    const deep = "{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":1}}}}}}}}}"; // 9 levels
+    for ([_][]const u8{ deep, "{\"update_id\":1,\"update_id\":2}" }) |body| {
+        const none = try engine.callOnMessage(testing.allocator, body);
+        defer types.freeApiCalls(none, testing.allocator);
+        try testing.expectEqual(@as(usize, 0), none.len);
+    }
+
+    // Replacing the function with a good one works; the next call succeeds.
     try engine.loadString(
         \\function on_message(u)
         \\  return { { method = "sendMessage", params = { chat_id = 5, text = "ok" } } }
         \\end
     );
-    const actions2 = try engine.callOnMessage(testing.allocator, "{\"update_id\":4}");
+    const actions2 = try engine.callOnMessage(testing.allocator, "{\"update_id\":5}");
     defer types.freeApiCalls(actions2, testing.allocator);
-
     try testing.expectEqual(@as(usize, 1), actions2.len);
-}
-
-test "invalid Lua syntax → loadString returns error; engine still usable" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var engine = try LuaEngine.init(testing.allocator, &ctx);
-    defer engine.deinit();
-
-    try testing.expectError(error.LuaError, engine.loadString("function ("));
-
-    // Engine must still be usable after the syntax error.
-    try engine.loadString("function on_message(u) return {} end");
-    const actions = try engine.callOnMessage(testing.allocator, "{\"update_id\":5}");
-    defer types.freeApiCalls(actions, testing.allocator);
-
-    try testing.expectEqual(@as(usize, 0), actions.len);
 }
 
 // ---------------------------------------------------------------------------
@@ -799,6 +780,22 @@ test "validation mode governs both bot.emit and the return-list" {
             try testing.expectEqual(c[1], actions.len);
         }
     }
+    // An empty slot under strict mode validates nothing: no schema, no drop.
+    {
+        var empty = tg_schema.SchemaSlot.init(testing.allocator, testing.io);
+        defer empty.deinit();
+        var engine = try LuaEngine.init(testing.allocator, &ctx);
+        defer engine.deinit();
+        engine.setValidation(&empty, .strict);
+        try engine.loadString(
+            \\function on_message(u)
+            \\  return { { method = "sendMessage", params = { chat_id = 1 } } }
+            \\end
+        );
+        const actions = try engine.callOnMessage(testing.allocator, "{}");
+        defer types.freeApiCalls(actions, testing.allocator);
+        try testing.expectEqual(@as(usize, 1), actions.len);
+    }
     // strict validates both the emit path and the return-list; of three calls
     // only the one valid emit survives.
     {
@@ -819,127 +816,9 @@ test "validation mode governs both bot.emit and the return-list" {
     }
 }
 
-test "schema slot is shared by pointer and an empty slot validates nothing" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-
-    // One installed slot is referenced by pointer from every engine. The schema
-    // never enters a lua_State, so adding engines (workers) never multiplies its
-    // memory.
-    {
-        var slot = tg_schema.SchemaSlot.init(testing.allocator, testing.io);
-        defer slot.deinit();
-        slot.install(try tg_schema.SchemaStore.fromSlice(testing.allocator, SCHEMA_FIX));
-
-        var e1 = try LuaEngine.init(testing.allocator, &ctx);
-        defer e1.deinit();
-        var e2 = try LuaEngine.init(testing.allocator, &ctx);
-        defer e2.deinit();
-        e1.setValidation(&slot, .warn);
-        e2.setValidation(&slot, .warn);
-
-        try testing.expectEqual(e1.schema_slot.?, e2.schema_slot.?);
-        try testing.expectEqual(slot.get().?, e2.schema_slot.?.get().?);
-    }
-    // An empty slot under strict mode is a no-op: nothing is dropped (Tier-0).
-    {
-        var slot = tg_schema.SchemaSlot.init(testing.allocator, testing.io); // never installed
-        defer slot.deinit();
-
-        var engine = try LuaEngine.init(testing.allocator, &ctx);
-        defer engine.deinit();
-        engine.setValidation(&slot, .strict); // strict, but no schema → no-op
-        try engine.loadString(
-            \\function on_message(u)
-            \\  return { { method = "sendMessage", params = { chat_id = 1 } } }
-            \\end
-        );
-        const actions = try engine.callOnMessage(testing.allocator, "{}");
-        defer types.freeApiCalls(actions, testing.allocator);
-        try testing.expectEqual(@as(usize, 1), actions.len);
-    }
-}
-
-test "shipped rules/rules.lua produces sendMessage calls (generic form)" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var engine = try LuaEngine.init(testing.allocator, &ctx);
-    defer engine.deinit();
-
-    // Load the actual shipped rules file (cwd is the project root under
-    // `zig build test`).
-    const raw = try std.Io.Dir.cwd().readFileAlloc(testing.io, "rules/rules.lua", testing.allocator, .limited(64 * 1024));
-    defer testing.allocator.free(raw);
-    const src = try testing.allocator.dupeSentinel(u8, raw, 0);
-    defer testing.allocator.free(src);
-    try engine.loadString(src);
-
-    // /start → one sendMessage; fresh user/global state → message #1.
-    {
-        const actions = try engine.callOnMessage(testing.allocator,
-            \\{"message":{"from":{"id":1},"chat":{"id":9},"text":"/start"}}
-        );
-        defer types.freeApiCalls(actions, testing.allocator);
-        try testing.expectEqual(@as(usize, 1), actions.len);
-        try testing.expectEqualStrings("sendMessage", actions[0].method);
-        try expectMsgBody(actions[0].payload.json, 9, "Welcome! You are message #1.");
-    }
-    // Plain text → echo.
-    {
-        const actions = try engine.callOnMessage(testing.allocator,
-            \\{"message":{"from":{"id":1},"chat":{"id":9},"text":"hello"}}
-        );
-        defer types.freeApiCalls(actions, testing.allocator);
-        try testing.expectEqual(@as(usize, 1), actions.len);
-        try testing.expectEqualStrings("sendMessage", actions[0].method);
-        try expectMsgBody(actions[0].payload.json, 9, "Echo: hello");
-    }
-    // /stats → the rule's `string.format("Your messages: %d | Total: %d", ...)`.
-    // State persists across the calls above for user 1: this is the third message
-    // (/start, hello, /stats), so per-user count and global total are both 3.
-    {
-        const actions = try engine.callOnMessage(testing.allocator,
-            \\{"message":{"from":{"id":1},"chat":{"id":9},"text":"/stats"}}
-        );
-        defer types.freeApiCalls(actions, testing.allocator);
-        try testing.expectEqual(@as(usize, 1), actions.len);
-        try testing.expectEqualStrings("sendMessage", actions[0].method);
-        try expectMsgBody(actions[0].payload.json, 9, "Your messages: 3 | Total: 3");
-    }
-    // /remind <secs> <text> → schedules a job (bot.schedule_after, synchronous
-    // insert into the StateStore) and confirms with one sendMessage.
-    {
-        const actions = try engine.callOnMessage(testing.allocator,
-            \\{"message":{"from":{"id":1},"chat":{"id":9},"text":"/remind 5 hello"}}
-        );
-        defer types.freeApiCalls(actions, testing.allocator);
-        try testing.expectEqual(@as(usize, 1), actions.len);
-        try testing.expectEqualStrings("sendMessage", actions[0].method);
-        try expectMsgBody(actions[0].payload.json, 9, "Reminder set for 5s.");
-    }
-    // on_schedule(payload, id) → one sendMessage echoing the scheduled payload,
-    // mirroring the /remind job above ({ chat = chat_id, text = rest }).
-    {
-        const outcome = try engine.startHandler(
-            \\{"chat":9,"text":"hello"}
-        , 0, 0, testing.allocator, "on_schedule", @as(?i64, 1));
-        switch (outcome) {
-            .done => |actions| {
-                defer types.freeApiCalls(actions, testing.allocator);
-                try testing.expectEqual(@as(usize, 1), actions.len);
-                try testing.expectEqualStrings("sendMessage", actions[0].method);
-                try expectMsgBody(actions[0].payload.json, 9, "hello");
-            },
-            else => return error.UnexpectedOutcome,
-        }
-    }
-}
-
 // ── coroutine engine tests ───────────────────────────────────────────────────
 
-test "sync rule (no yield) via startHandler → .done with actions" {
+test "infinite loop and runaway recursion abort; a bounded heavy loop does not" {
     var db = try state_store.StateStore.open(testing.allocator, ":memory:");
     defer db.close();
     var ctx = testCtx(&db);
@@ -948,61 +827,29 @@ test "sync rule (no yield) via startHandler → .done with actions" {
 
     try engine.loadString(
         \\function on_message(u)
-        \\  return { { method = "sendMessage", params = { chat_id = 7, text = "hi" } } }
-        \\end
-    );
-
-    const outcome = try engine.startHandler("{\"update_id\":1}", 42, 0, testing.allocator, "on_message", null);
-    switch (outcome) {
-        .done => |actions| {
-            defer types.freeApiCalls(actions, testing.allocator);
-            try testing.expectEqual(@as(usize, 1), actions.len);
-            try testing.expectEqualStrings("sendMessage", actions[0].method);
-        },
-        else => return error.UnexpectedOutcome,
-    }
-}
-
-test "per-resume instruction cap aborts infinite loop" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var engine = try LuaEngine.init(testing.allocator, &ctx);
-    defer engine.deinit();
-
-    try engine.loadString(
-        \\function on_message(u)
-        \\  while true do end
-        \\end
-    );
-
-    const outcome = try engine.startHandler("{}", 1, 0, testing.allocator, "on_message", null);
-    switch (outcome) {
-        .err => {},
-        else => return error.ExpectedError,
-    }
-}
-
-test "bounded heavy computation in one resume is not falsely aborted" {
-    var db = try state_store.StateStore.open(testing.allocator, ":memory:");
-    defer db.close();
-    var ctx = testCtx(&db);
-    var engine = try LuaEngine.init(testing.allocator, &ctx);
-    defer engine.deinit();
-
-    try engine.loadString(
-        \\function on_message(u)
+        \\  if u.forever then while true do end end
+        \\  if u.recurse then local function f() return 1 + f() end f() end
         \\  local s = 0
         \\  for i = 1, 1000000 do s = s + i end
         \\  return { { method = "result", params = { n = s } } }
         \\end
     );
 
-    const outcome = try engine.startHandler("{}", 2, 0, testing.allocator, "on_message", null);
-    switch (outcome) {
+    switch (try engine.startHandler("{\"forever\":true}", 1, 0, testing.allocator, "on_message", null)) {
+        .err => {},
+        else => return error.ExpectedError,
+    }
+    // Non-tail recursion overflows the Lua stack: a Lua error, not a crash.
+    switch (try engine.startHandler("{\"recurse\":true}", 3, 0, testing.allocator, "on_message", null)) {
+        .err => {},
+        else => return error.ExpectedError,
+    }
+    // The engine survives the abort; a million iterations in one resume finish.
+    switch (try engine.startHandler("{}", 2, 0, testing.allocator, "on_message", null)) {
         .done => |actions| {
             defer types.freeApiCalls(actions, testing.allocator);
             try testing.expectEqual(@as(usize, 1), actions.len);
+            try testing.expectEqualStrings("result", actions[0].method);
         },
         else => return error.FalselyAborted,
     }

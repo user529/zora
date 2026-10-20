@@ -141,6 +141,7 @@ pub fn build(b: *std.Build) void {
 
     const src_files = [_][]const u8{
         "src/rt.zig",
+        "src/latch.zig",
         "src/types.zig",
         "src/metrics.zig",
         "src/config.zig",

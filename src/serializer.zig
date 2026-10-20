@@ -1,12 +1,12 @@
-/// serializer.zig — bidirectional Lua table ↔ JSON conversion
-///
-/// Two public functions:
-///   luaTableToJson  — serialize any Lua value at a stack index → owned JSON []u8
-///   jsonToLuaTable  — parse a JSON string → push result onto Lua stack
-///
-/// Limits (both directions):
-///   MAX_DEPTH = 8  — nesting levels; 9th level returns error.MaxDepthExceeded
-///   MAX_SIZE  = 64 KiB — serialized output; returns error.MaxSizeExceeded
+//! serializer.zig — bidirectional Lua table ↔ JSON conversion
+//!
+//! Two public functions:
+//!   luaTableToJson  — serialize any Lua value at a stack index → owned JSON []u8
+//!   jsonToLuaTable  — parse a JSON string → push result onto Lua stack
+//!
+//! Limits (both directions):
+//!   MAX_DEPTH = 8  — nesting levels; 9th level returns error.MaxDepthExceeded
+//!   MAX_SIZE  = 64 KiB — serialized output; returns error.MaxSizeExceeded
 
 const std = @import("std");
 const ziglua = @import("ziglua");
@@ -15,21 +15,11 @@ const Lua = ziglua.Lua;
 pub const MAX_DEPTH: u32 = 8;
 pub const MAX_SIZE: usize = 64 * 1024;
 
-/// Error set shared by all serializer functions.
+/// Error set for the Lua → JSON direction.
 pub const SerializeError = error{
     MaxDepthExceeded,
     MaxSizeExceeded,
     UnsupportedKeyType,
-    /// Returned by ziglua when a type conversion fails (e.g. toInteger on non-integer).
-    LuaError,
-    OutOfMemory,
-};
-
-/// Error set for JSON → Lua direction.
-pub const DeserializeError = error{
-    MaxDepthExceeded,
-    MaxSizeExceeded,
-    InvalidJson,
     OutOfMemory,
 };
 
@@ -95,29 +85,16 @@ fn serializeValue(
         .boolean => try appendChecked(buf, allocator, if (lua.toBoolean(index)) "true" else "false", max_size),
 
         .number => {
-            if (lua.isInteger(index)) {
-                // isInteger is true here, so toInteger cannot fail.
-                const n = lua.toInteger(index) catch unreachable;
-                try appendFmtChecked(buf, allocator, "{d}", .{n}, max_size);
+            // JSON has no NaN or infinity: such a float becomes null.
+            if (!lua.isInteger(index) and !std.math.isFinite(lua.toNumber(index) catch unreachable)) {
+                try appendChecked(buf, allocator, "null", max_size);
             } else {
-                // The value is a number but not an integer, so toNumber cannot fail.
-                const n = lua.toNumber(index) catch unreachable;
-                if (!std.math.isFinite(n)) {
-                    // NaN / ±Inf are not valid JSON — emit null
-                    try appendChecked(buf, allocator, "null", max_size);
-                } else {
-                    try appendFloat(buf, allocator, n, max_size);
-                }
+                try appendNumber(lua, index, buf, allocator, max_size);
             }
         },
 
-        .string => {
-            // The switch guarantees a string value, so toString cannot fail.
-            const s = lua.toString(index) catch unreachable;
-            try appendChecked(buf, allocator, "\"", max_size);
-            try serializeStringContent(buf, allocator, s, max_size);
-            try appendChecked(buf, allocator, "\"", max_size);
-        },
+        // The switch guarantees a string value, so toString cannot fail.
+        .string => try appendString(buf, allocator, lua.toString(index) catch unreachable, max_size),
 
         .table => {
             if (depth >= MAX_DEPTH) return error.MaxDepthExceeded;
@@ -159,30 +136,16 @@ fn serializeTable(
             switch (key_type) {
                 .string => {
                     if (!first) try appendChecked(buf, allocator, ",", max_size);
-                    first = false;
                     // key_type is .string, so toString cannot fail.
-                    const k = lua.toString(-2) catch unreachable;
-                    try appendChecked(buf, allocator, "\"", max_size);
-                    try serializeStringContent(buf, allocator, k, max_size);
-                    try appendChecked(buf, allocator, "\":", max_size);
-                    try serializeValue(lua, -1, allocator, buf, depth + 1, max_size);
+                    try appendString(buf, allocator, lua.toString(-2) catch unreachable, max_size);
                 },
                 .number => {
+                    // Numeric key → quoted string representation in JSON.
+                    // (toString would convert the key in place and break next().)
                     if (!first) try appendChecked(buf, allocator, ",", max_size);
-                    first = false;
-                    // Numeric key → quoted string representation in JSON
                     try appendChecked(buf, allocator, "\"", max_size);
-                    if (lua.isInteger(-2)) {
-                        // Guarded by isInteger; toInteger cannot fail.
-                        const k = lua.toInteger(-2) catch unreachable;
-                        try appendFmtChecked(buf, allocator, "{d}", .{k}, max_size);
-                    } else {
-                        // A non-integer number key; toNumber cannot fail.
-                        const k = lua.toNumber(-2) catch unreachable;
-                        try appendFloat(buf, allocator, k, max_size);
-                    }
-                    try appendChecked(buf, allocator, "\":", max_size);
-                    try serializeValue(lua, -1, allocator, buf, depth + 1, max_size);
+                    try appendNumber(lua, -2, buf, allocator, max_size);
+                    try appendChecked(buf, allocator, "\"", max_size);
                 },
                 else => {
                     // Boolean keys, table keys, etc. are not supported
@@ -190,6 +153,9 @@ fn serializeTable(
                     return error.UnsupportedKeyType;
                 },
             }
+            first = false;
+            try appendChecked(buf, allocator, ":", max_size);
+            try serializeValue(lua, -1, allocator, buf, depth + 1, max_size);
             lua.pop(1); // pop value, keep key for next()
         }
         try appendChecked(buf, allocator, "}", max_size);
@@ -266,7 +232,34 @@ fn appendFloat(
     if (!has_point) try appendChecked(buf, allocator, ".0", max_size);
 }
 
-/// Write a JSON-escaped version of `s` into buf (without surrounding quotes).
+/// Append the Lua number at `index`: an integer in decimal, a float with a
+/// decimal point or exponent so it reads back as a float.
+fn appendNumber(
+    lua: *Lua,
+    index: i32,
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    max_size: usize,
+) SerializeError!void {
+    if (lua.isInteger(index)) {
+        try appendFmtChecked(buf, allocator, "{d}", .{lua.toInteger(index) catch unreachable}, max_size);
+    } else {
+        try appendFloat(buf, allocator, lua.toNumber(index) catch unreachable, max_size);
+    }
+}
+
+/// Append `s` as a quoted, escaped JSON string.
+fn appendString(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    s: [:0]const u8,
+    max_size: usize,
+) SerializeError!void {
+    try appendChecked(buf, allocator, "\"", max_size);
+    try serializeStringContent(buf, allocator, s, max_size);
+    try appendChecked(buf, allocator, "\"", max_size);
+}
+
 fn serializeStringContent(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -299,7 +292,7 @@ fn serializeStringContent(
 // JSON → Lua (private)
 // ---------------------------------------------------------------------------
 
-fn pushJsonValue(lua: *Lua, value: std.json.Value, depth: u32) DeserializeError!void {
+fn pushJsonValue(lua: *Lua, value: std.json.Value, depth: u32) error{MaxDepthExceeded}!void {
     switch (value) {
         .null => lua.pushNil(),
         .bool => |b| lua.pushBoolean(b),
@@ -468,7 +461,7 @@ test "scalar values round-trip through JSON" {
     }
 }
 
-test "string with special chars escapes correctly" {
+test "string escapes encode and decode to their literal bytes" {
     var lua = try newLua(testing.allocator);
     defer lua.deinit();
 
@@ -481,6 +474,10 @@ test "string with special chars escapes correctly" {
         "\"line1\\nline2\\ttab\\\"quote\\\\back\"",
         json,
     );
+
+    try jsonToLuaTable(lua, json, testing.allocator);
+    try testing.expectEqualStrings("line1\nline2\ttab\"quote\\back", try lua.toString(-1));
+    lua.pop(1);
 }
 
 test "table shape maps to a JSON array or object" {
@@ -737,20 +734,19 @@ test "stack stays balanced across success and error" {
         try testing.expectEqual(@as(ziglua.Integer, 77), try lua.toInteger(-1));
         lua.pop(1);
     }
-}
+    // A boolean key cannot be represented in JSON: UnsupportedKeyType aborts
+    // the traversal partway, and the stack still returns to its prior depth.
+    {
+        lua.createTable(0, 1);
+        lua.pushBoolean(true);
+        lua.pushInteger(1);
+        lua.setTableRaw(-3);
 
-test "boolean key returns error.UnsupportedKeyType" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // { [true] = 1 } — a boolean key cannot be represented in JSON.
-    lua.createTable(0, 1);
-    lua.pushBoolean(true);
-    lua.pushInteger(1);
-    lua.setTableRaw(-3);
-
-    try testing.expectError(error.UnsupportedKeyType, luaTableToJson(lua, -1, testing.allocator));
-    lua.pop(1);
+        const top_before = lua.getTop();
+        try testing.expectError(error.UnsupportedKeyType, luaTableToJson(lua, -1, testing.allocator));
+        try testing.expectEqual(top_before, lua.getTop());
+        lua.pop(1);
+    }
 }
 
 test "JSON integer beyond i64 range pushes the literal as a string" {
@@ -767,34 +763,5 @@ test "JSON integer beyond i64 range pushes the literal as a string" {
     // is that the value was stored as a string literal, not a parsed number.
     try testing.expectEqual(ziglua.LuaType.string, lua.typeOf(-1));
     try testing.expectEqualStrings(literal, try lua.toString(-1));
-    lua.pop(1);
-}
-
-test "luaTableToJson keeps the stack balanced on an error" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // A boolean key forces error.UnsupportedKeyType partway through table
-    // traversal; the stack must return to its prior depth despite the abort.
-    lua.createTable(0, 1);
-    lua.pushBoolean(true);
-    lua.pushInteger(1);
-    lua.setTableRaw(-3);
-
-    const top_before = lua.getTop();
-    try testing.expectError(error.UnsupportedKeyType, luaTableToJson(lua, -1, testing.allocator));
-    try testing.expectEqual(top_before, lua.getTop());
-    lua.pop(1);
-}
-
-test "JSON string escapes decode to their literal bytes" {
-    var lua = try newLua(testing.allocator);
-    defer lua.deinit();
-
-    // The JSON source carries \n, \t, \" and \\ escapes; the Lua value must
-    // hold the actual newline, tab, quote and backslash bytes.
-    try jsonToLuaTable(lua, "\"a\\nb\\tc\\\"d\\\\e\"", testing.allocator);
-    try testing.expect(lua.isString(-1));
-    try testing.expectEqualStrings("a\nb\tc\"d\\e", try lua.toString(-1));
     lua.pop(1);
 }

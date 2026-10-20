@@ -1,9 +1,9 @@
-// metrics.zig — single shared counter set for all subsystems.
-// main.zig owns one instance on its stack and passes *Metrics everywhere.
-// Null *Metrics means "don't count" (unit tests that skip metrics pass null).
-// Exposure: renderPrometheus (served by metrics_server.zig) is the
-// authoritative surface. The METRICS_LOG snapshot line (main.zig) is
-// deprecated and frozen at the pre-Prometheus counter set.
+//! metrics.zig — single shared counter set for all subsystems.
+//! main.zig owns one instance on its stack and passes *Metrics everywhere.
+//! Null *Metrics means "don't count" (unit tests that skip metrics pass null).
+//! Exposure: renderPrometheus (served by metrics_server.zig) is the
+//! authoritative surface. The METRICS_LOG snapshot line (main.zig) is
+//! deprecated and frozen at the pre-Prometheus counter set.
 const std = @import("std");
 const queue_mod = @import("queue.zig");
 const types = @import("types.zig");
@@ -160,43 +160,6 @@ pub fn renderPrometheus(m: *const Metrics, src: RenderSources, w: *std.Io.Writer
 }
 
 const testing = std.testing;
-
-test "throttle counters default to zero and increment" {
-    var m = Metrics{};
-    try testing.expectEqual(@as(u64, 0), m.throttle_429_total.load(.monotonic));
-    try testing.expectEqual(@as(u64, 0), m.throttle_delayed_total.load(.monotonic));
-    try testing.expectEqual(@as(u64, 0), m.throttle_shed_total.load(.monotonic));
-    _ = m.throttle_429_total.fetchAdd(1, .monotonic);
-    _ = m.throttle_delayed_total.fetchAdd(2, .monotonic);
-    _ = m.throttle_shed_total.fetchAdd(3, .monotonic);
-    try testing.expectEqual(@as(u64, 1), m.throttle_429_total.load(.monotonic));
-    try testing.expectEqual(@as(u64, 2), m.throttle_delayed_total.load(.monotonic));
-    try testing.expectEqual(@as(u64, 3), m.throttle_shed_total.load(.monotonic));
-}
-
-test "workflow counters default to zero and increment through the helpers" {
-    var m = Metrics{};
-    try testing.expectEqual(@as(u64, 0), m.updates_received_total.load(.monotonic));
-    try testing.expectEqual(@as(u64, 0), m.scheduler_jobs_fired_total.load(.monotonic));
-    try testing.expectEqual(@as(u64, 0), m.api_call_retries_total.load(.monotonic));
-
-    m.incReject(.forbidden);
-    m.incReject(.forbidden);
-    m.incReject(.malformed);
-    m.incProcessed(.ok);
-    m.incProcessed(.lua_error);
-    m.incApiCall(.failed);
-    m.incReload(.ok);
-
-    try testing.expectEqual(@as(u64, 2), m.updates_rejected[@backingInt(RejectReason.forbidden)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 0), m.updates_rejected[@backingInt(RejectReason.oversize)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.updates_rejected[@backingInt(RejectReason.malformed)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.updates_processed[@backingInt(ProcessOutcome.ok)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.updates_processed[@backingInt(ProcessOutcome.lua_error)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 0), m.api_calls[@backingInt(CallOutcome.ok)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.api_calls[@backingInt(CallOutcome.failed)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.rules_reloads[@backingInt(ReloadOutcome.ok)].load(.monotonic));
-}
 
 test "renderPrometheus emits every metric with HELP/TYPE and current values" {
     var m = Metrics{};

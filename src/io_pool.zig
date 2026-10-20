@@ -1,12 +1,14 @@
-/// io_pool.zig — blocking I/O thread pool
-///
-/// Executes HTTP requests and subprocesses on behalf of worker coroutines.
-/// Each pool thread owns a std.http.Client, receives jobs from a bounded
-/// MPSC queue, and pushes results to per-worker IoResult queues.
-///
-/// Ownership:
-///   IoJob payload strings  — NOT owned by pool (caller guarantees lifetime)
-///   IoResult outcome strings — owned by pool, freed by caller via freeIoResult
+//! io_pool.zig — blocking I/O thread pool
+//!
+//! Executes HTTP requests and subprocesses on behalf of worker coroutines.
+//! Each pool thread owns a std.http.Client, receives jobs from a bounded
+//! MPSC queue, and pushes results to per-worker IoResult queues.
+//!
+//! Ownership:
+//!   IoJob payload strings  — NOT owned by pool: the submitting coroutine owns
+//!                            them and frees them with freeIoJob once the job's
+//!                            result has resumed it (or it is reaped)
+//!   IoResult outcome strings — owned by pool, freed by caller via freeIoResult
 const std = @import("std");
 const queue_mod = @import("queue.zig");
 const metrics_mod = @import("metrics.zig");
@@ -27,7 +29,6 @@ pub const IoJob = struct {
             method:  []const u8,
             url:     []const u8,
             /// Forwarded to the request as std.http extra_headers.
-            /// Owned by the submitting coroutine's OwnedStrings; not freed here.
             headers: []const std.http.Header,
             body:    []const u8,
         },
@@ -52,14 +53,28 @@ pub const IoResult = struct {
     outcome: IoOutcome,
 };
 
+/// Free the payload strings of a job built by lua_api (every string, and the
+/// header and argv slices, are allocated from `allocator`).
+pub fn freeIoJob(job: IoJob, allocator: std.mem.Allocator) void {
+    switch (job.payload) {
+        .http_request => |h| {
+            allocator.free(h.method);
+            allocator.free(h.url);
+            freeHeaders(allocator, h.headers);
+            allocator.free(h.body);
+        },
+        .exec => |e| {
+            for (e.argv) |arg| allocator.free(arg);
+            allocator.free(e.argv);
+        },
+        .shell => |s| allocator.free(s.command),
+    }
+}
+
 pub fn freeIoResult(result: IoResult, allocator: std.mem.Allocator) void {
     switch (result.outcome) {
         .http => |h| {
-            for (h.headers) |hdr| {
-                allocator.free(hdr.name);
-                allocator.free(hdr.value);
-            }
-            allocator.free(h.headers);
+            freeHeaders(allocator, h.headers);
             allocator.free(h.body);
         },
         .proc => |p| allocator.free(p.stdout),
@@ -68,9 +83,18 @@ pub fn freeIoResult(result: IoResult, allocator: std.mem.Allocator) void {
     }
 }
 
-/// Free every duped name and value in a header list, then the list's backing
-/// memory. Used on error paths in executeHttp before the list is handed off.
-fn freeHeaderListItems(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(std.http.Header)) void {
+/// Free every name and value in `headers`, then the slice itself.
+fn freeHeaders(allocator: std.mem.Allocator, headers: []const std.http.Header) void {
+    for (headers) |hdr| {
+        allocator.free(hdr.name);
+        allocator.free(hdr.value);
+    }
+    allocator.free(headers);
+}
+
+/// Free every name and value in a header list still being built, then the
+/// list's backing memory. The error-path counterpart of freeHeaders.
+pub fn freeHeaderList(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(std.http.Header)) void {
     for (list.items) |hdr| {
         allocator.free(hdr.name);
         allocator.free(hdr.value);
@@ -89,14 +113,20 @@ const TimerCtx = struct {
     done:       *std.atomic.Value(bool),
 };
 
-fn timerThread(ctx: TimerCtx) void {
+/// Sleep in 10 ms steps until `done` is set or `timeout_ms` passes. Returns
+/// true when `done` was set in time.
+fn waitDone(done: *std.atomic.Value(bool), timeout_ms: u64, io: std.Io) bool {
     const poll_ms: u64 = 10;
     var waited_ms: u64 = 0;
-    while (!ctx.done.load(.acquire) and waited_ms < ctx.timeout_ms) {
-        rt.sleepNs(ctx.io, poll_ms * std.time.ns_per_ms);
+    while (!done.load(.acquire) and waited_ms < timeout_ms) {
+        rt.sleepNs(io, poll_ms * std.time.ns_per_ms);
         waited_ms += poll_ms;
     }
-    if (!ctx.done.load(.acquire)) {
+    return done.load(.acquire);
+}
+
+fn timerThread(ctx: TimerCtx) void {
+    if (!waitDone(ctx.done, ctx.timeout_ms, ctx.io)) {
         std.posix.kill(ctx.pid, std.posix.SIG.KILL) catch {};
     }
 }
@@ -114,7 +144,7 @@ const HttpWatchdogCtx = struct {
 };
 
 /// Shut the connection's socket down once timeout_ms elapses, unless the request
-/// finished first (done). 0.16's blocking Io has no socket read timeout, so a
+/// finished first (done). The blocking Io has no socket read timeout, so a
 /// peer that accepts the connection but never replies would otherwise pin the
 /// pool thread in receiveHead/streamRemaining forever. The shutdown turns that
 /// stall into a read error, so executeHttp returns. timed_out is set before the
@@ -122,13 +152,7 @@ const HttpWatchdogCtx = struct {
 /// The HTTP counterpart of timerThread; it shuts a socket down instead of
 /// killing a child.
 fn httpWatchdog(ctx: HttpWatchdogCtx) void {
-    const poll_ms: u64 = 10;
-    var waited_ms: u64 = 0;
-    while (!ctx.done.load(.acquire) and waited_ms < ctx.timeout_ms) {
-        rt.sleepNs(ctx.io, poll_ms * std.time.ns_per_ms);
-        waited_ms += poll_ms;
-    }
-    if (!ctx.done.load(.acquire)) {
+    if (!waitDone(ctx.done, ctx.timeout_ms, ctx.io)) {
         ctx.timed_out.store(true, .release);
         var s = ctx.stream;
         s.shutdown(ctx.io, .both) catch {};
@@ -209,8 +233,7 @@ pub const IoPool = struct {
 
     pub fn deinit(self: *IoPool) void {
         self.stop.store(true, .release);
-        // Wake parked pool threads so they drain and exit (replaces the old
-        // 10 ms stop-poll).
+        // Wake parked pool threads so they drain and exit.
         self.job_queue.close();
         // SIGKILL any in-flight child processes so blocked child.wait() returns.
         for (self.current_pids) |*pv| {
@@ -273,7 +296,7 @@ pub const IoPool = struct {
         defer http_client.deinit();
 
         // Park indefinitely until a job arrives or the pool is closed at
-        // shutdown — no 10 ms poll, so an idle pool thread consumes no CPU.
+        // shutdown, with no timeout, so an idle pool thread consumes no CPU.
         // popBlocking drains the queue before reporting null, so jobs queued at
         // close are still run; no separate drain loop is needed.
         while (pool.job_queue.popBlocking()) |job| {
@@ -290,6 +313,23 @@ pub const IoPool = struct {
         }
     }
 
+    /// Run one HTTP job and push its outcome, or an error message, to the
+    /// submitting worker. A request the watchdog cut off reports "timeout",
+    /// whatever error the cut caused.
+    fn executeHttp(pool: *IoPool, client: *std.http.Client, job: IoJob) void {
+        var timed_out = std.atomic.Value(bool).init(false);
+        const outcome = pool.fetchHttp(client, job, &timed_out) catch |err| {
+            pool.pushErr(job, if (timed_out.load(.acquire)) "timeout" else switch (err) {
+                error.OutOfMemory => "OOM",
+                error.UnsupportedHttpMethod => "unsupported_http_method",
+                error.UnsupportedContentEncoding => "unsupported_content_encoding",
+                else => @errorName(err),
+            });
+            return;
+        };
+        pool.pushResult(job, outcome);
+    }
+
     /// Drive one HTTP request through the manual std.http flow so the response
     /// headers can be captured (client.fetch discards them). Mirrors the steps
     /// in std.http.Client.fetch: request -> send -> receiveHead (follows
@@ -298,19 +338,18 @@ pub const IoPool = struct {
     /// Headers are duped before the body reader is initialised: reader() and
     /// readerDecompressing() call head.invalidateStrings(), which clobbers
     /// head.bytes and so invalidates every name/value slice.
-    fn executeHttp(pool: *IoPool, client: *std.http.Client, job: IoJob) void {
+    fn fetchHttp(
+        pool: *IoPool,
+        client: *std.http.Client,
+        job: IoJob,
+        timed_out: *std.atomic.Value(bool),
+    ) !IoOutcome {
         const req_job = job.payload.http_request;
         const alloc = pool.allocator;
 
-        const method = std.meta.stringToEnum(std.http.Method, req_job.method) orelse {
-            pool.pushErr(job, "unsupported_http_method");
-            return;
-        };
-
-        const uri = std.Uri.parse(req_job.url) catch |err| {
-            pool.pushErr(job, @errorName(err));
-            return;
-        };
+        const method = std.meta.stringToEnum(std.http.Method, req_job.method) orelse
+            return error.UnsupportedHttpMethod;
+        const uri = try std.Uri.parse(req_job.url);
 
         // A payload makes the request non-repeatable, so std.http cannot follow
         // redirects for it; match fetch's choice of redirect behaviour.
@@ -318,19 +357,16 @@ pub const IoPool = struct {
         const redirect_behavior: std.http.Client.Request.RedirectBehavior =
             if (has_payload) .unhandled else .init(3);
 
-        var request = client.request(method, uri, .{
+        var request = try client.request(method, uri, .{
             .redirect_behavior = redirect_behavior,
             .keep_alive        = true,
             .extra_headers     = req_job.headers,
-        }) catch |err| {
-            pool.pushErr(job, @errorName(err));
-            return;
-        };
+        });
         defer request.deinit();
 
         // Bound the response wait. A peer that accepts the connection but never
         // replies would otherwise block this pool thread in receiveHead /
-        // streamRemaining forever — 0.16's blocking Io has no socket read
+        // streamRemaining forever — the blocking Io has no socket read
         // timeout. A watchdog shuts the connection's socket down at timeout_ms,
         // turning the stall into a read error; this mirrors the child-process
         // timer in executeProc. Caveat: the connect and TLS handshake run inside
@@ -343,7 +379,6 @@ pub const IoPool = struct {
         // io_uring net_receive/net_read batch path is an unimplemented panic
         // upstream.
         var wd_done = std.atomic.Value(bool).init(false);
-        var wd_timed_out = std.atomic.Value(bool).init(false);
         const watchdog: ?std.Thread = std.Thread.spawn(
             .{ .stack_size = types.THREAD_STACK_SIZE },
             httpWatchdog,
@@ -352,7 +387,7 @@ pub const IoPool = struct {
                 .timeout_ms = pool.timeout_ms,
                 .io         = pool.io,
                 .done       = &wd_done,
-                .timed_out  = &wd_timed_out,
+                .timed_out  = timed_out,
             }},
         ) catch |err| blk: {
             log.warn("http watchdog spawn failed for coro={d}: {s} — request runs unbounded", .{ job.coro_id, @errorName(err) });
@@ -367,27 +402,12 @@ pub const IoPool = struct {
 
         if (has_payload) {
             request.transfer_encoding = .{ .content_length = req_job.body.len };
-            var body_writer = request.sendBodyUnflushed(&.{}) catch |err| {
-                pool.pushErr(job, @errorName(err));
-                return;
-            };
-            body_writer.writer.writeAll(req_job.body) catch |err| {
-                pool.pushErr(job, @errorName(err));
-                return;
-            };
-            body_writer.end() catch |err| {
-                pool.pushErr(job, @errorName(err));
-                return;
-            };
-            request.connection.?.flush() catch |err| {
-                pool.pushErr(job, @errorName(err));
-                return;
-            };
+            var body_writer = try request.sendBodyUnflushed(&.{});
+            try body_writer.writer.writeAll(req_job.body);
+            try body_writer.end();
+            try request.connection.?.flush();
         } else {
-            request.sendBodiless() catch |err| {
-                pool.pushErr(job, @errorName(err));
-                return;
-            };
+            try request.sendBodiless();
         }
 
         // Redirect target storage; must outlive receiveHead. Empty when not
@@ -395,122 +415,55 @@ pub const IoPool = struct {
         var redirect_buf: [8 * 1024]u8 = undefined;
         const redirect_slice: []u8 = if (redirect_behavior == .unhandled) &.{} else &redirect_buf;
 
-        var response = request.receiveHead(redirect_slice) catch |err| {
-            pool.pushErr(job, if (wd_timed_out.load(.acquire)) "timeout" else @errorName(err));
-            return;
-        };
-
+        var response = try request.receiveHead(redirect_slice);
         const status: u16 = @backingInt(response.head.status);
-        const content_encoding = response.head.content_encoding;
 
         // Capture headers now, before any reader invalidates head.bytes.
         // Case-insensitive de-dup, last value wins, original casing preserved.
         var hdr_list: std.ArrayListUnmanaged(std.http.Header) = .empty;
-        var capture_failed = false;
+        errdefer freeHeaderList(alloc, &hdr_list);
         var it = response.head.iterateHeaders();
-        capture: while (it.next()) |hdr| {
-            // Replace an earlier same-name (case-insensitive) entry if present.
+        next_header: while (it.next()) |hdr| {
+            const name = try alloc.dupe(u8, hdr.name);
+            errdefer alloc.free(name);
+            const value = try alloc.dupe(u8, hdr.value);
+            errdefer alloc.free(value);
             for (hdr_list.items) |*existing| {
                 if (std.ascii.eqlIgnoreCase(existing.name, hdr.name)) {
-                    const new_name = alloc.dupe(u8, hdr.name) catch {
-                        capture_failed = true;
-                        break :capture;
-                    };
-                    const new_value = alloc.dupe(u8, hdr.value) catch {
-                        alloc.free(new_name);
-                        capture_failed = true;
-                        break :capture;
-                    };
                     alloc.free(existing.name);
                     alloc.free(existing.value);
-                    existing.name = new_name;
-                    existing.value = new_value;
-                    continue :capture;
+                    existing.* = .{ .name = name, .value = value };
+                    continue :next_header;
                 }
             }
-            const name = alloc.dupe(u8, hdr.name) catch {
-                capture_failed = true;
-                break :capture;
-            };
-            const value = alloc.dupe(u8, hdr.value) catch {
-                alloc.free(name);
-                capture_failed = true;
-                break :capture;
-            };
-            hdr_list.append(alloc, .{ .name = name, .value = value }) catch {
-                alloc.free(name);
-                alloc.free(value);
-                capture_failed = true;
-                break :capture;
-            };
-        }
-        if (capture_failed) {
-            freeHeaderListItems(alloc, &hdr_list);
-            pool.pushErr(job, "OOM");
-            return;
+            try hdr_list.append(alloc, .{ .name = name, .value = value });
         }
 
         // Decompression buffer sized per negotiated content-encoding, matching
         // std.http.Client.fetch. compress (LZW) is unsupported.
-        const decompress_buffer: []u8 = switch (content_encoding) {
+        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
             .identity => &.{},
-            .zstd => alloc.alloc(u8, std.compress.zstd.default_window_len) catch {
-                freeHeaderListItems(alloc, &hdr_list);
-                pool.pushErr(job, "OOM");
-                return;
-            },
-            .deflate, .gzip => alloc.alloc(u8, std.compress.flate.max_window_len) catch {
-                freeHeaderListItems(alloc, &hdr_list);
-                pool.pushErr(job, "OOM");
-                return;
-            },
-            .compress => {
-                freeHeaderListItems(alloc, &hdr_list);
-                pool.pushErr(job, "unsupported_content_encoding");
-                return;
-            },
+            .zstd => try alloc.alloc(u8, std.compress.zstd.default_window_len),
+            .deflate, .gzip => try alloc.alloc(u8, std.compress.flate.max_window_len),
+            .compress => return error.UnsupportedContentEncoding,
         };
         defer if (decompress_buffer.len > 0) alloc.free(decompress_buffer);
 
-        var al_writer = std.Io.Writer.Allocating.initCapacity(alloc, 4096) catch {
-            freeHeaderListItems(alloc, &hdr_list);
-            pool.pushErr(job, "OOM");
-            return;
-        };
+        var al_writer = try std.Io.Writer.Allocating.initCapacity(alloc, 4096);
         defer al_writer.deinit();
 
         var transfer_buffer: [64]u8 = undefined;
         var decompress: std.http.Decompress = undefined;
         const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-
-        _ = reader.streamRemaining(&al_writer.writer) catch |err| {
-            const msg = if (wd_timed_out.load(.acquire)) "timeout" else switch (err) {
-                error.ReadFailed => if (response.bodyErr()) |be| @errorName(be) else "ReadFailed",
-                else => @errorName(err),
-            };
-            freeHeaderListItems(alloc, &hdr_list);
-            pool.pushErr(job, msg);
-            return;
+        _ = reader.streamRemaining(&al_writer.writer) catch |err| return switch (err) {
+            error.ReadFailed => response.bodyErr() orelse error.ReadFailed,
+            else => err,
         };
 
-        const body = al_writer.toOwnedSlice() catch {
-            freeHeaderListItems(alloc, &hdr_list);
-            pool.pushErr(job, "OOM");
-            return;
-        };
-
-        const resp_headers = hdr_list.toOwnedSlice(alloc) catch {
-            alloc.free(body);
-            freeHeaderListItems(alloc, &hdr_list);
-            pool.pushErr(job, "OOM");
-            return;
-        };
-
-        pool.pushResult(job, .{ .http = .{
-            .status  = status,
-            .body    = body,
-            .headers = resp_headers,
-        }});
+        const body = try al_writer.toOwnedSlice();
+        errdefer alloc.free(body);
+        const headers = try hdr_list.toOwnedSlice(alloc);
+        return .{ .http = .{ .status = status, .body = body, .headers = headers } };
     }
 
     fn executeProc(pool: *IoPool, thread_idx: u8, job: IoJob, argv: []const []const u8) void {
@@ -614,49 +567,6 @@ pub const IoPool = struct {
 
 const testing = std.testing;
 
-test "IoJob instantiates all payload variants" {
-    const j_http = IoJob{
-        .worker_id = 0, .coro_id = 1,
-        .payload = .{ .http_request = .{
-            .method = "GET", .url = "http://x", .headers = &.{}, .body = "",
-        }},
-    };
-    try testing.expectEqual(@as(u32, 1), j_http.coro_id);
-
-    const j_exec = IoJob{
-        .worker_id = 0, .coro_id = 2,
-        .payload = .{ .exec = .{ .argv = &.{"/bin/true"} } },
-    };
-    try testing.expectEqual(@as(u32, 2), j_exec.coro_id);
-
-    const j_shell = IoJob{
-        .worker_id = 0, .coro_id = 3,
-        .payload = .{ .shell = .{ .command = "true" } },
-    };
-    try testing.expectEqual(@as(u32, 3), j_shell.coro_id);
-}
-
-test "freeIoResult releases all outcome variants — no leaks" {
-    freeIoResult(.{ .coro_id = 0, .outcome = .{ .http = .{
-        .status  = 200,
-        .body    = try testing.allocator.dupe(u8, "hello"),
-        .headers = try testing.allocator.alloc(std.http.Header, 0),
-    }}}, testing.allocator);
-
-    freeIoResult(.{ .coro_id = 0, .outcome = .{ .proc = .{
-        .exit_code = 0,
-        .stdout    = try testing.allocator.dupe(u8, "world"),
-    }}}, testing.allocator);
-
-    freeIoResult(.{ .coro_id = 0, .outcome = .{
-        .send = .{ .message_id = 42 },
-    }}, testing.allocator);
-
-    freeIoResult(.{ .coro_id = 0, .outcome = .{
-        .err = try testing.allocator.dupe(u8, "oops"),
-    }}, testing.allocator);
-}
-
 // ---------------------------------------------------------------------------
 // HTTP stub helpers
 // ---------------------------------------------------------------------------
@@ -665,14 +575,7 @@ test "freeIoResult releases all outcome variants — no leaks" {
 /// writes `response`, then closes. Returns the bound port and thread handle.
 const StubServer = struct { port: u16, thread: std.Thread };
 
-// 0.16's net.Server no longer exposes the bound address, so query the socket
-// directly for the port assigned to a port-0 listen.
-fn boundPort(srv: *std.Io.net.Server) u16 {
-    var sa: std.posix.sockaddr.in = undefined;
-    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-    _ = std.posix.system.getsockname(srv.socket.handle, @ptrCast(&sa), &len);
-    return std.mem.bigToNative(u16, sa.port);
-}
+const boundPort = @import("test_util.zig").boundPort;
 
 fn spawnStub(response: []const u8) !StubServer {
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
@@ -749,46 +652,11 @@ fn stubOnce(srv_ptr: *std.Io.net.Server, response: []const u8) void {
     sw.interface.flush() catch {};
 }
 
-/// Like spawnStub but records the bytes the client sent into `req_out`.
-const CaptureStub = struct { port: u16, thread: std.Thread };
-
-fn spawnCaptureStub(req_out: *std.ArrayListUnmanaged(u8), response: []const u8) !CaptureStub {
-    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
-    const srv_ptr = try testing.allocator.create(std.Io.net.Server);
-    srv_ptr.* = try addr.listen(testing.io, .{ .reuse_address = true });
-    const port = boundPort(srv_ptr);
-    const thread = try std.Thread.spawn(.{}, captureOnce, .{ srv_ptr, req_out, response });
-    return .{ .port = port, .thread = thread };
-}
-
-fn captureOnce(srv_ptr: *std.Io.net.Server, req_out: *std.ArrayListUnmanaged(u8), response: []const u8) void {
-    const io = testing.io;
-    defer {
-        srv_ptr.deinit(io);
-        testing.allocator.destroy(srv_ptr);
-    }
-    var stream = srv_ptr.accept(io) catch return;
-    defer stream.close(io);
-    var rbuf: [8192]u8 = undefined;
-    var sr = stream.reader(io, &rbuf);
-    // Capture the request head line-by-line, stopping at the blank line that
-    // ends the headers. A single readSliceShort would deadlock against the
-    // keep-alive client (see stubOnce).
-    while (sr.interface.takeDelimiterInclusive('\n')) |line| {
-        req_out.appendSlice(testing.allocator, line) catch {};
-        if (line.len <= 2) break; // "\r\n" terminates the header block
-    } else |_| {}
-    var wbuf: [4096]u8 = undefined;
-    var sw = stream.writer(io, &wbuf);
-    sw.interface.writeAll(response) catch {};
-    sw.interface.flush() catch {};
-}
-
-/// Like spawnCaptureStub but also drains the request body after the header
-/// block, so a POST/PUT payload lands in `req_out`. Reads the body length from
-/// the Content-Length header captured in the head; if absent, reads nothing
-/// (the body capture tests always send a fixed-length body).
-fn spawnBodyCaptureStub(req_out: *std.ArrayListUnmanaged(u8), response: []const u8) !CaptureStub {
+/// Like spawnStub but records the request head and body into `req_out`, so a
+/// POST/PUT payload lands there too. Reads the body length from the
+/// Content-Length header; if absent, reads nothing (the capture test always
+/// sends a fixed-length body).
+fn spawnBodyCaptureStub(req_out: *std.ArrayListUnmanaged(u8), response: []const u8) !StubServer {
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0);
     const srv_ptr = try testing.allocator.create(std.Io.net.Server);
     srv_ptr.* = try addr.listen(testing.io, .{ .reuse_address = true });
@@ -834,9 +702,7 @@ fn bodyCaptureOnce(srv_ptr: *std.Io.net.Server, req_out: *std.ArrayListUnmanaged
     sw.interface.flush() catch {};
 }
 
-test "IoJob payload variants each drive a real pool to their IoResult" {
-    // Promotes the former struct-construction compile test (P3-21): each payload
-    // variant is now submitted to a live pool and asserted to yield its outcome.
+test "each IoJob payload variant drives a real pool to its IoResult" {
     var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
     defer rq.deinit(testing.allocator);
 
@@ -861,6 +727,7 @@ test "IoJob payload variants each drive a real pool to their IoResult" {
     try testing.expectEqual(@as(u32, 1), r_http.coro_id);
     try testing.expect(r_http.outcome == .http);
     try testing.expectEqual(@as(u16, 200), r_http.outcome.http.status);
+    try testing.expectEqualStrings("hi", r_http.outcome.http.body);
 
     // exec -> IoResult.proc
     try pool.submit(.{ .worker_id = 0, .coro_id = 2,
@@ -869,6 +736,7 @@ test "IoJob payload variants each drive a real pool to their IoResult" {
     defer freeIoResult(r_exec, testing.allocator);
     try testing.expectEqual(@as(u32, 2), r_exec.coro_id);
     try testing.expect(r_exec.outcome == .proc);
+    try testing.expectEqual(@as(i32, 0), r_exec.outcome.proc.exit_code);
     try testing.expectEqualStrings("exec-ok\n", r_exec.outcome.proc.stdout);
 
     // shell -> IoResult.proc (shell evaluates the arithmetic expansion)
@@ -878,10 +746,11 @@ test "IoJob payload variants each drive a real pool to their IoResult" {
     defer freeIoResult(r_shell, testing.allocator);
     try testing.expectEqual(@as(u32, 3), r_shell.coro_id);
     try testing.expect(r_shell.outcome == .proc);
+    try testing.expectEqual(@as(i32, 0), r_shell.outcome.proc.exit_code);
     try testing.expectEqualStrings("5\n", r_shell.outcome.proc.stdout);
 }
 
-test "http_request POST sends the body to the server and reports status" {
+test "http_request POST sends extra headers and the body, and reports status" {
     var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
     defer rq.deinit(testing.allocator);
 
@@ -902,8 +771,12 @@ test "http_request POST sends the body to the server and reports status" {
     defer pool.deinit();
 
     const body = "{\"hello\":\"world\"}";
+    const hdrs = [_]std.http.Header{
+        .{ .name = "X-Custom", .value = "hello-world" },
+        .{ .name = "Authorization", .value = "Bearer tok123" },
+    };
     try pool.submit(.{ .worker_id = 0, .coro_id = 12,
-        .payload = .{ .http_request = .{ .method = "POST", .url = url, .headers = &.{}, .body = body } } });
+        .payload = .{ .http_request = .{ .method = "POST", .url = url, .headers = &hdrs, .body = body } } });
 
     const result = rq.popTimeout(3 * std.time.ns_per_s) orelse return error.TestTimeout;
     defer freeIoResult(result, testing.allocator);
@@ -911,8 +784,10 @@ test "http_request POST sends the body to the server and reports status" {
     try testing.expect(result.outcome == .http);
     try testing.expectEqual(@as(u16, 201), result.outcome.http.status);
 
-    // The request line carries POST, and the captured body holds the payload.
+    // The request carries POST, both extra headers, and the payload.
     try testing.expect(std.mem.find(u8, req_bytes.items, "POST ") != null);
+    try testing.expect(std.mem.find(u8, req_bytes.items, "X-Custom: hello-world") != null);
+    try testing.expect(std.mem.find(u8, req_bytes.items, "Authorization: Bearer tok123") != null);
     try testing.expect(std.mem.find(u8, req_bytes.items, body) != null);
 }
 
@@ -966,7 +841,7 @@ test "http_request to a stalled peer times out instead of pinning the pool threa
     // result arrives; with it, an err lands shortly after timeout_ms.
     const result = rq.popTimeout(3 * std.time.ns_per_s);
     if (result == null) {
-        // Regression: close the stub's end first to unblock the pool thread, so
+        // No result: close the stub's end first to unblock the pool thread, so
         // pool.deinit() can join it, then fail loudly.
         hang.deinit();
         pool.deinit();
@@ -980,43 +855,6 @@ test "http_request to a stalled peer times out instead of pinning the pool threa
     try testing.expect(r.outcome == .err);
     try testing.expectEqualStrings("timeout", r.outcome.err);
     try testing.expectEqual(@as(u64, 1), m.io_timeouts_total.load(.monotonic));
-}
-
-test "http_request forwards extra headers to the server" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
-    defer rq.deinit(testing.allocator);
-
-    var req_bytes: std.ArrayListUnmanaged(u8) = .empty;
-    defer req_bytes.deinit(testing.allocator);
-
-    const stub = try spawnCaptureStub(&req_bytes,
-        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
-    defer stub.thread.join();
-
-    const url = try testing.allocator.print("http://127.0.0.2:{d}/", .{stub.port});
-    defer testing.allocator.free(url);
-
-    var pool: IoPool = undefined;
-    try pool.init(testing.allocator, testing.io,
-        .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 5_000, .proc_max_output = 65_536 },
-        &.{&rq});
-    defer pool.deinit();
-
-    const hdrs = [_]std.http.Header{
-        .{ .name = "X-Custom", .value = "hello-world" },
-        .{ .name = "Authorization", .value = "Bearer tok123" },
-    };
-    try pool.submit(.{
-        .worker_id = 0, .coro_id = 7,
-        .payload = .{ .http_request = .{ .method = "GET", .url = url, .headers = &hdrs, .body = "" } },
-    });
-
-    const result = rq.popTimeout(3 * std.time.ns_per_s) orelse return error.TestTimeout;
-    defer freeIoResult(result, testing.allocator);
-    try testing.expectEqual(@as(u16, 200), result.outcome.http.status);
-
-    try testing.expect(std.mem.find(u8, req_bytes.items, "X-Custom: hello-world") != null);
-    try testing.expect(std.mem.find(u8, req_bytes.items, "Authorization: Bearer tok123") != null);
 }
 
 test "http_request captures response headers, original casing, last-wins dup" {
@@ -1126,146 +964,6 @@ test "http_request decompresses gzip response body" {
     try testing.expectEqualStrings("hello gzip world", result.outcome.http.body);
 }
 
-test "http_request GET to local stub → status 200, body matches" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
-    defer rq.deinit(testing.allocator);
-
-    const stub = try spawnStub(
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Length: 5\r\n" ++
-        "Connection: close\r\n" ++
-        "\r\nhello");
-    defer stub.thread.join();
-
-    const url = try testing.allocator.print(
-        "http://127.0.0.2:{d}/", .{stub.port});
-    defer testing.allocator.free(url);
-
-    var pool: IoPool = undefined;
-    try pool.init(testing.allocator, testing.io,
-        .{ .thread_count = 1, .queue_capacity = 8,
-           .timeout_ms = 5_000, .proc_max_output = 65_536 },
-        &.{&rq});
-    defer pool.deinit();
-
-    try pool.submit(.{
-        .worker_id = 0, .coro_id = 42,
-        .payload = .{ .http_request = .{
-            .method = "GET", .url = url, .headers = &.{}, .body = "",
-        }},
-    });
-
-    const result = rq.popTimeout(3 * std.time.ns_per_s) orelse return error.TestTimeout;
-    defer freeIoResult(result, testing.allocator);
-
-    try testing.expectEqual(@as(u32, 42), result.coro_id);
-    try testing.expect(result.outcome == .http);
-    try testing.expectEqual(@as(u16, 200), result.outcome.http.status);
-    try testing.expectEqualStrings("hello", result.outcome.http.body);
-}
-
-test "http_request to unreachable address → IoResult.err, thread survives" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
-    defer rq.deinit(testing.allocator);
-
-    var pool: IoPool = undefined;
-    try pool.init(testing.allocator, testing.io,
-        .{ .thread_count = 1, .queue_capacity = 8,
-           .timeout_ms = 5_000, .proc_max_output = 65_536 },
-        &.{&rq});
-    defer pool.deinit();
-
-    // Port 1 is almost certainly not listening — ECONNREFUSED expected.
-    try pool.submit(.{
-        .worker_id = 0, .coro_id = 1,
-        .payload = .{ .http_request = .{
-            .method = "GET", .url = "http://127.0.0.1:1/",
-            .headers = &.{}, .body = "",
-        }},
-    });
-
-    const r1 = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
-    defer freeIoResult(r1, testing.allocator);
-    try testing.expect(r1.outcome == .err);
-
-    // Confirm the thread survived by processing a second job.
-    try pool.submit(.{
-        .worker_id = 0, .coro_id = 2,
-        .payload = .{ .http_request = .{
-            .method = "GET", .url = "http://127.0.0.1:1/",
-            .headers = &.{}, .body = "",
-        }},
-    });
-    const r2 = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
-    defer freeIoResult(r2, testing.allocator);
-    try testing.expect(r2.outcome == .err);
-}
-
-test "exec and shell run a command and capture output" {
-    // exec: the argv form runs /bin/echo and returns its stdout.
-    {
-        var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
-        defer rq.deinit(testing.allocator);
-        var pool: IoPool = undefined;
-        try pool.init(testing.allocator, testing.io,
-            .{ .thread_count = 1, .queue_capacity = 8,
-               .timeout_ms = 5_000, .proc_max_output = 65_536 },
-            &.{&rq});
-        defer pool.deinit();
-
-        try pool.submit(.{ .worker_id = 0, .coro_id = 10,
-            .payload = .{ .exec = .{ .argv = &.{ "/bin/echo", "hello" } } } });
-
-        const result = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
-        defer freeIoResult(result, testing.allocator);
-        try testing.expectEqual(@as(u32, 10), result.coro_id);
-        try testing.expect(result.outcome == .proc);
-        try testing.expectEqual(@as(i32, 0), result.outcome.proc.exit_code);
-        try testing.expectEqualStrings("hello\n", result.outcome.proc.stdout);
-    }
-    // shell: the command runs under a shell, so $((...)) is evaluated.
-    {
-        var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
-        defer rq.deinit(testing.allocator);
-        var pool: IoPool = undefined;
-        try pool.init(testing.allocator, testing.io,
-            .{ .thread_count = 1, .queue_capacity = 8,
-               .timeout_ms = 5_000, .proc_max_output = 65_536 },
-            &.{&rq});
-        defer pool.deinit();
-
-        try pool.submit(.{ .worker_id = 0, .coro_id = 30,
-            .payload = .{ .shell = .{ .command = "echo $((1+1))" } } });
-
-        const result = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
-        defer freeIoResult(result, testing.allocator);
-        try testing.expectEqual(@as(u32, 30), result.coro_id);
-        try testing.expect(result.outcome == .proc);
-        try testing.expectEqual(@as(i32, 0), result.outcome.proc.exit_code);
-        try testing.expectEqualStrings("2\n", result.outcome.proc.stdout);
-    }
-}
-
-test "command exceeding IO_JOB_TIMEOUT_MS → IoResult.err, child killed" {
-    var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
-    defer rq.deinit(testing.allocator);
-    // Short timeout so the test completes in ~200 ms.
-    var pool: IoPool = undefined;
-    try pool.init(testing.allocator, testing.io,
-        .{ .thread_count = 1, .queue_capacity = 8,
-           .timeout_ms = 150, .proc_max_output = 65_536 },
-        &.{&rq});
-    defer pool.deinit();
-
-    try pool.submit(.{ .worker_id = 0, .coro_id = 20,
-        .payload = .{ .exec = .{ .argv = &.{ "/bin/sleep", "60" } } } });
-
-    const result = rq.popTimeout(1 * std.time.ns_per_s) orelse return error.TestTimeout;
-    defer freeIoResult(result, testing.allocator);
-    // Returning without hanging confirms the child was reaped (no zombie).
-    try testing.expect(result.outcome == .err);
-}
-
 test "stdout exceeding PROC_MAX_OUTPUT_BYTES → truncated and marked" {
     var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 8);
     defer rq.deinit(testing.allocator);
@@ -1289,16 +987,17 @@ test "stdout exceeding PROC_MAX_OUTPUT_BYTES → truncated and marked" {
     try testing.expect(std.mem.endsWith(u8, out, "[output truncated]"));
 }
 
-test "io_pool metrics — jobs_total, inflight, errors, timeouts" {
+test "success, error and timeout outcomes: one thread survives all three; metrics count them" {
     var m = metrics_mod.Metrics{};
 
     var rq = try queue_mod.Queue(IoResult).init(testing.allocator, testing.io, 16);
     defer rq.deinit(testing.allocator);
 
+    // One thread, so each job after a failure proves the thread survived it.
     // Short timeout (150 ms) so the timeout job completes quickly.
     var pool: IoPool = undefined;
     try pool.init(testing.allocator, testing.io,
-        .{ .thread_count = 2, .queue_capacity = 8, .timeout_ms = 150,
+        .{ .thread_count = 1, .queue_capacity = 8, .timeout_ms = 150,
            .proc_max_output = 65_536, .metrics = &m },
         &.{&rq});
     defer pool.deinit();
@@ -1319,7 +1018,8 @@ test "io_pool metrics — jobs_total, inflight, errors, timeouts" {
     defer freeIoResult(re, testing.allocator);
     try testing.expect(re.outcome == .err);
 
-    // Job 3: timeout (exec /bin/sleep 60 with pool timeout_ms = 150)
+    // Job 3: timeout (exec /bin/sleep 60 with pool timeout_ms = 150). The
+    // result arriving within 1 s shows the child was killed and reaped.
     try pool.submit(.{ .worker_id = 0, .coro_id = 3,
         .payload = .{ .exec = .{ .argv = &.{ "/bin/sleep", "60" } } } });
     const res = rq.popTimeout(1 * std.time.ns_per_s) orelse return error.TestTimeout;
@@ -1388,13 +1088,12 @@ test "graceful stop — joins threads and kills in-flight children" {
     while (rq.popTimeout(0)) |r| freeIoResult(r, testing.allocator);
 }
 
-test "io_pool carries a configured child_env" {
+test "a child runs with the configured child_env" {
     const alloc = testing.allocator;
     var env = std.process.Environ.Map.init(alloc);
     defer env.deinit();
-    try env.put("PATH", "/usr/bin");
+    try env.put("ZORA_PROBE", "seen");
 
-    // Build the minimal result-queue plumbing the pool requires (one worker).
     var rq = try queue_mod.Queue(IoResult).init(alloc, rt.io(), 8);
     defer rq.deinit(alloc);
     const rqs = [_]*queue_mod.Queue(IoResult){&rq};
@@ -1403,12 +1102,16 @@ test "io_pool carries a configured child_env" {
     try pool.init(alloc, rt.io(), .{
         .thread_count    = 1,
         .queue_capacity  = 8,
-        .timeout_ms      = 1_000,
+        .timeout_ms      = 5_000,
         .proc_max_output = 1024,
         .child_env       = &env,
     }, &rqs);
     defer pool.deinit();
 
-    try testing.expect(pool.child_env != null);
-    try testing.expectEqualStrings("/usr/bin", pool.child_env.?.get("PATH").?);
+    try pool.submit(.{ .worker_id = 0, .coro_id = 1,
+        .payload = .{ .shell = .{ .command = "echo \"$ZORA_PROBE\"" } } });
+    const r = rq.popTimeout(5 * std.time.ns_per_s) orelse return error.TestTimeout;
+    defer freeIoResult(r, alloc);
+    try testing.expect(r.outcome == .proc);
+    try testing.expectEqualStrings("seen\n", r.outcome.proc.stdout);
 }
