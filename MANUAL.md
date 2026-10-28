@@ -231,7 +231,28 @@ BOT_TOKEN="..." WEBHOOK_SECRET="..." nohup ./zora-run.sh &
 kill -TERM $PID
 ```
 
-On `SIGTERM` or `SIGINT`, zora drains in-flight work and exits cleanly.
+On `SIGTERM` or `SIGINT`, zora drains in-flight work and exits with status 0.
+The steps run in this order:
+
+1. The webhook server stops accepting connections.
+2. Each worker stops taking new updates and finishes its parked handlers. A
+   handler waiting on `bot.http_request`, `bot.exec` or `bot.shell` resumes
+   when its I/O completes or reaches `IO_JOB_TIMEOUT_MS`.
+   `WORKFLOW_DEADLINE_MS` still reaps a handler that runs too long.
+3. The dispatchers send every call left in their queue, including the calls
+   the handlers emitted in step 2, and then exit.
+
+Shutdown does not deliver everything:
+
+- An update that the server accepted but no worker started is dropped. The
+  server has already answered `200`, so Telegram does not send it again.
+- A call held after a `429` is sent only if its `Retry-After` window ends
+  before the dispatchers exit. Otherwise zora drops it.
+- zora sets no overall time limit on shutdown. Each send attempt times out
+  after 30 s and is retried once, so with many queued calls and an
+  unreachable API the drain can outlast the service manager's stop timeout
+  (systemd `TimeoutStopSec`, 90 s by default). The service manager then
+  kills the process, and the calls still queued are lost.
 
 ### Startup log
 

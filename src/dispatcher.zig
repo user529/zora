@@ -51,7 +51,6 @@ pub const DispatcherArgs = struct {
     allocator: std.mem.Allocator,
     /// Runtime for the per-thread HTTP client, sleeps, and wall-clock reads.
     io: std.Io,
-    stop: *std.atomic.Value(bool),
     /// Per-worker result queues indexed by worker_id.
     /// Non-null only when tracked sends are expected; tests without them pass null.
     io_result_queues: ?[]*queue_mod.Queue(io_pool.IoResult) = null,
@@ -112,8 +111,10 @@ fn parkAt(dq: *delay.DelayQueue, ready: i64, call: types.ApiCall, args: Dispatch
 /// Dispatcher thread main loop.
 /// Creates one `std.http.Client` (and therefore one connection pool) per
 /// thread, giving each thread its own persistent connection to the API.
-/// Exits when `args.stop` is set (checked between calls) or when the queue is
-/// closed and empty.
+/// Exits once the queue is closed and empty, so close() at shutdown does not
+/// cut off calls still queued. A call diverted to the delay queue goes out
+/// only if its Retry-After window ends before the dispatchers exit; otherwise
+/// shutdown frees it unsent.
 pub fn dispatcherThread(args: DispatcherArgs) void {
     var client = std.http.Client{ .allocator = args.allocator, .io = args.io };
     defer client.deinit();
@@ -145,11 +146,9 @@ pub fn dispatcherThread(args: DispatcherArgs) void {
         .resp_buf = &resp_buf,
     };
 
-    while (!args.stop.load(.acquire)) {
-        // Park indefinitely until a call arrives or the queue is closed at
-        // shutdown, with no timeout, so an idle dispatcher consumes no CPU.
-        const call = args.queue.popBlocking() orelse break;
-
+    // popBlocking() waits with no timeout until a call arrives or the queue is
+    // closed and empty, so an idle dispatcher uses no CPU.
+    while (args.queue.popBlocking()) |call| {
         // If this chat is still inside a 429 window, hold the call instead of
         // sending it.
         if (divertIfBlocked(call, args)) continue;
@@ -751,13 +750,12 @@ fn parseHttpRequest(r: *std.Io.Reader, allocator: std.mem.Allocator) !?MockServe
     };
 }
 
-// Helper: build a stop flag + spawn one dispatcher thread pointing at a mock.
+// Helper: spawn one dispatcher thread pointing at a mock.
 //
-// Heap-allocated so that &self.queue and &self.stop remain valid after init()
-// returns.  A by-value return would copy the struct to the caller's stack and
-// invalidate the pointers passed to the spawned thread.
+// Heap-allocated so that `&self.queue` remains valid after init() returns. A
+// by-value return would copy the struct to the caller's stack and invalidate
+// the queue pointer passed to the spawned thread.
 const TestDispatcher = struct {
-    stop: std.atomic.Value(bool),
     queue: queue_mod.Queue(types.ApiCall),
     thread: std.Thread,
     allocator: std.mem.Allocator,
@@ -784,7 +782,6 @@ const TestDispatcher = struct {
         const self = try allocator.create(TestDispatcher);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
-        self.stop = std.atomic.Value(bool).init(false);
         self.queue = try queue_mod.Queue(types.ApiCall).init(allocator, testing.io, 256);
         errdefer self.queue.deinit(allocator);
         const args = DispatcherArgs{
@@ -794,7 +791,6 @@ const TestDispatcher = struct {
             .api_base = api_base,
             .allocator = allocator,
             .io = testing.io,
-            .stop = &self.stop,
             .send_deadline_ms = opts.send_deadline_ms,
             .metrics = opts.metrics,
         };
@@ -803,8 +799,7 @@ const TestDispatcher = struct {
     }
 
     fn deinit(self: *TestDispatcher) void {
-        self.stop.store(true, .release);
-        self.queue.close(); // wake the parked dispatcher so it can observe stop
+        self.queue.close(); // the dispatcher drains the queue, then exits
         self.thread.join();
         self.queue.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -1112,7 +1107,6 @@ test "tracked_send_failures_total increments when message_id absent in response"
     defer rq.deinit(alloc);
     var rq_slice = [1]*queue_mod.Queue(io_pool.IoResult){&rq};
 
-    var stop = std.atomic.Value(bool).init(false);
     var dq = try queue_mod.Queue(types.ApiCall).init(alloc, testing.io, 16);
     defer dq.deinit(alloc);
 
@@ -1123,7 +1117,6 @@ test "tracked_send_failures_total increments when message_id absent in response"
         .api_base = api_base,
         .allocator = alloc,
         .io = testing.io,
-        .stop = &stop,
         .io_result_queues = &rq_slice,
         .metrics = &m,
     }});
@@ -1143,7 +1136,6 @@ test "tracked_send_failures_total increments when message_id absent in response"
     // failure counter must be exactly 1.
     try testing.expectEqual(@as(u64, 1), m.tracked_send_failures_total.load(.monotonic));
 
-    stop.store(true, .release);
     dq.close();
     disp_thread.join();
     srv_thread.join();
@@ -1159,7 +1151,6 @@ test "an oversize response is rejected and counted" {
     mock.force_big.store(1, .release); // first 200 carries an oversized body
 
     var m = metrics_mod.Metrics{};
-    var stop = std.atomic.Value(bool).init(false);
     var dq = try queue_mod.Queue(types.ApiCall).init(testing.allocator, testing.io, 16);
     defer dq.deinit(testing.allocator);
 
@@ -1171,7 +1162,6 @@ test "an oversize response is rejected and counted" {
         .api_base = mock.baseUrl(&url_buf),
         .allocator = testing.allocator,
         .io = testing.io,
-        .stop = &stop,
         .metrics = &m,
     }});
 
@@ -1188,10 +1178,8 @@ test "an oversize response is rejected and counted" {
         rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
         waited += 20;
     }
-    stop.store(true, .release);
     dq.close();
     disp.join();
-    while (dq.popTimeout(0)) |c| types.freeApiCall(c, testing.allocator);
 
     try testing.expect(m.response_oversize_total.load(.monotonic) >= 1);
 }
@@ -1200,7 +1188,6 @@ test "an oversize response is rejected and counted" {
 // requeue thread feeding the dispatcher's own queue. Heap-allocated so pointers
 // passed to threads stay valid.
 const ThrottleHarness = struct {
-    stop: std.atomic.Value(bool),
     queue: queue_mod.Queue(types.ApiCall),
     delay_q: delay.DelayQueue,
     blocked: delay.BlockedMap,
@@ -1212,7 +1199,6 @@ const ThrottleHarness = struct {
         const self = try allocator.create(ThrottleHarness);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
-        self.stop = std.atomic.Value(bool).init(false);
         self.queue = try queue_mod.Queue(types.ApiCall).init(allocator, testing.io, 64);
         self.delay_q = delay.DelayQueue.init(allocator, testing.io, 64);
         self.blocked = delay.BlockedMap.init(allocator, testing.io);
@@ -1223,7 +1209,6 @@ const ThrottleHarness = struct {
             .api_base = api_base,
             .allocator = allocator,
             .io = testing.io,
-            .stop = &self.stop,
             .delay_q = &self.delay_q,
             .blocked_until = &self.blocked,
             .retry_after_default_ms = 1000,
@@ -1238,8 +1223,7 @@ const ThrottleHarness = struct {
     }
 
     fn deinit(self: *ThrottleHarness) void {
-        self.stop.store(true, .release);
-        self.queue.close(); // wake the parked dispatcher so it can observe stop
+        self.queue.close(); // the dispatcher drains the queue, then exits
         self.disp_t.join();
         self.delay_q.close();
         self.requeue_t.join();
@@ -1336,12 +1320,11 @@ test "one retry on a fresh connection after a pause; api_calls and retries are c
         }.run, .{ &server, &accept_ms });
 
         var m = metrics_mod.Metrics{};
-        var stop = std.atomic.Value(bool).init(false);
         var dq = try queue_mod.Queue(types.ApiCall).init(testing.allocator, testing.io, 16);
         defer dq.deinit(testing.allocator);
         const disp = try std.Thread.spawn(.{}, dispatcherThread, .{DispatcherArgs{
             .id = 0, .queue = &dq, .bot_token = "TOK", .api_base = api_base,
-            .allocator = testing.allocator, .io = testing.io, .stop = &stop,
+            .allocator = testing.allocator, .io = testing.io,
             .metrics = &m,
         }});
 
@@ -1351,7 +1334,6 @@ test "one retry on a fresh connection after a pause; api_calls and retries are c
             rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
             waited += 20;
         }
-        stop.store(true, .release);
         dq.close();
         disp.join();
         srv_thread.join();
@@ -1382,12 +1364,11 @@ test "one retry on a fresh connection after a pause; api_calls and retries are c
         }.run, .{&server});
 
         var m = metrics_mod.Metrics{};
-        var stop = std.atomic.Value(bool).init(false);
         var dq = try queue_mod.Queue(types.ApiCall).init(testing.allocator, testing.io, 16);
         defer dq.deinit(testing.allocator);
         const disp = try std.Thread.spawn(.{}, dispatcherThread, .{DispatcherArgs{
             .id = 0, .queue = &dq, .bot_token = "TOK", .api_base = api_base,
-            .allocator = testing.allocator, .io = testing.io, .stop = &stop,
+            .allocator = testing.allocator, .io = testing.io,
             .metrics = &m,
         }});
 
@@ -1397,7 +1378,6 @@ test "one retry on a fresh connection after a pause; api_calls and retries are c
             rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
             waited += 20;
         }
-        stop.store(true, .release);
         dq.close();
         disp.join();
         srv_thread.join();

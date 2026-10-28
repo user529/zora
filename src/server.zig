@@ -69,7 +69,9 @@ pub const Server = struct {
     listener: std.Io.net.Server,
     /// deinit() sets it to wake the accept thread out of poll().
     stop: Latch,
-    accept_thread: std.Thread,
+    /// Null until start() spawns it, after the whole handler pool, so a set
+    /// handle means every thread is running; deinit() stops them only then.
+    accept_thread: ?std.Thread,
     active: std.atomic.Value(u32),
     /// Fixed handler-thread pool (std.Thread.Pool was removed in 0.16). The
     /// accept thread pushes accepted streams to conn_queue; these threads pop
@@ -80,8 +82,10 @@ pub const Server = struct {
     read_idle_timeout_ms: u32,
     metrics: ?*metrics_mod.Metrics,
 
-    /// Start the server.  Returns a heap-allocated Server.  Call deinit() to
-    /// stop the accept loop, close the socket, and free the allocation.
+    /// Bind the listener and allocate the hand-off queue and handler slots.
+    /// Returns a heap-allocated Server that spawns no thread: the kernel
+    /// queues incoming connections, but nothing answers them until start().
+    /// deinit() releases it, started or not.
     pub fn init(args: ServerArgs) !*Server {
         const self = try args.allocator.create(Server);
         errdefer args.allocator.destroy(self);
@@ -91,6 +95,7 @@ pub const Server = struct {
         self.queues = args.queues;
         self.read_idle_timeout_ms = args.read_idle_timeout_ms;
         self.metrics = args.metrics;
+        self.accept_thread = null;
         // kernel_backlog 4096 matches somaxconn; default 128 caused SYN-queue
         // exhaustion warnings under burst load.
         self.listener = try args.listen_addr.listen(args.io, .{ .reuse_address = true, .kernel_backlog = 4096 });
@@ -103,10 +108,15 @@ pub const Server = struct {
         self.conn_queue = try q_mod.Queue(std.Io.net.Stream).init(args.allocator, args.io, MAX_CONNECTIONS);
         errdefer self.conn_queue.deinit(args.allocator);
 
-        // Handler pool must be running before the accept loop (which feeds it).
         const n_handlers = @max(@as(usize, args.pool_threads), 1);
         self.handler_threads = try args.allocator.alloc(std.Thread, n_handlers);
-        errdefer args.allocator.free(self.handler_threads);
+        return self;
+    }
+
+    /// Spawn the handler pool, then the accept thread that feeds it. On error
+    /// no thread is left running and the server stays unstarted, so deinit()
+    /// remains valid. A server is started at most once.
+    pub fn start(self: *Server) !void {
         var spawned: usize = 0;
         errdefer {
             self.conn_queue.close();
@@ -118,19 +128,21 @@ pub const Server = struct {
         }
 
         self.accept_thread = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, acceptLoop, .{self});
-        return self;
     }
 
-    /// Signal the accept loop to exit, wait for it, drain the handler pool,
-    /// then release resources.  Order matters: stop accepting before draining
-    /// (no new tasks), drain before freeing (handlers hold *Server).
+    /// Release the server. When started, signal the accept loop to exit, wait
+    /// for it, and drain the handler pool first; an unstarted server has no
+    /// thread to stop. Order matters: stop accepting before draining (no new
+    /// tasks), drain before freeing (handlers hold `*Server`).
     /// The handlers serve every stream already queued before they exit, so
     /// `conn_queue` is empty when they have joined.
     pub fn deinit(self: *Server) void {
-        self.stop.set();
-        self.accept_thread.join();
-        self.conn_queue.close();
-        for (self.handler_threads) |t| t.join();
+        if (self.accept_thread) |accept| {
+            self.stop.set();
+            accept.join();
+            self.conn_queue.close();
+            for (self.handler_threads) |t| t.join();
+        }
         self.allocator.free(self.handler_threads);
         self.conn_queue.deinit(self.allocator);
         self.stop.deinit();
@@ -546,6 +558,8 @@ const TestSetup = struct {
             .read_idle_timeout_ms = read_idle_timeout_ms,
             .metrics = metrics,
         });
+        errdefer self.srv.deinit();
+        try self.srv.start();
         return self;
     }
 
@@ -917,4 +931,39 @@ test "idle server: handler pool and accept loop sleep without periodic wakeups" 
     rt.sleepNs(testing.io, 300 * std.time.ns_per_ms);
     const woke = std.posix.getrusage(std.posix.rusage.SELF).nvcsw - before;
     try testing.expect(woke < 15);
+}
+
+test "init binds but serves nothing until start; deinit releases an unstarted server" {
+    var q = try Queue(types.WorkItem).init(testing.allocator, testing.io, 4);
+    defer q.deinit(testing.allocator);
+    var q_ptrs = [_]*Queue(types.WorkItem){&q};
+    const args: ServerArgs = .{
+        .listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0),
+        .webhook_secret = "s",
+        .queues = &q_ptrs,
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .pool_threads = 1,
+    };
+
+    const srv = try Server.init(args);
+    const port = test_util.boundPort(&srv.listener);
+    // The kernel completes the handshake from the backlog, but with no accept
+    // thread nothing answers: a reply within 200 ms means init started threads.
+    var stream = try test_util.boundAddress(&srv.listener).connect(testing.io, .{ .mode = .stream });
+    var wbuf: [128]u8 = undefined;
+    var sw = stream.writer(testing.io, &wbuf);
+    try sw.interface.writeAll("GET /webhook HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    try sw.interface.flush();
+    var pfd = std.posix.pollfd{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 };
+    const ready = try std.posix.poll(@as(*[1]std.posix.pollfd, &pfd)[0..1], 200);
+    try testing.expectEqual(@as(usize, 0), ready);
+    stream.close(testing.io);
+    srv.deinit();
+
+    // deinit() closed the listener, so the same port binds again in this process.
+    var again = args;
+    again.listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", port);
+    const srv2 = try Server.init(again);
+    srv2.deinit();
 }

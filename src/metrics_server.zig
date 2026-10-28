@@ -38,10 +38,12 @@ pub const MetricsServer = struct {
     listener: std.Io.net.Server,
     /// deinit() sets it to wake the serve thread out of poll().
     stop: Latch,
-    thread: std.Thread,
+    /// Null until start() spawns the serve thread; deinit() stops it only then.
+    thread: ?std.Thread,
 
-    /// Bind and start the serve thread. Returns a heap-allocated server;
-    /// deinit() stops the loop, closes the socket, and frees it.
+    /// Bind the listener. Returns a heap-allocated server that spawns no
+    /// thread: the kernel queues scrapes, but nothing answers them until
+    /// start(). deinit() releases it, started or not.
     pub fn init(args: MetricsServerArgs) !*MetricsServer {
         const self = try args.allocator.create(MetricsServer);
         errdefer args.allocator.destroy(self);
@@ -49,17 +51,27 @@ pub const MetricsServer = struct {
         self.io = args.io;
         self.metrics = args.metrics;
         self.sources = args.sources;
+        self.thread = null;
         self.listener = try args.listen_addr.listen(args.io, .{ .reuse_address = true });
         errdefer self.listener.deinit(args.io);
         self.stop = try Latch.init();
         errdefer self.stop.deinit();
-        self.thread = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, serveLoop, .{self});
         return self;
     }
 
+    /// Spawn the serve thread. On error the server stays unstarted, so
+    /// deinit() remains valid. A server is started at most once.
+    pub fn start(self: *MetricsServer) !void {
+        self.thread = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, serveLoop, .{self});
+    }
+
+    /// Release the server. When started, signal the serve loop to exit and
+    /// join it first; an unstarted server has no thread to stop.
     pub fn deinit(self: *MetricsServer) void {
-        self.stop.set();
-        self.thread.join();
+        if (self.thread) |t| {
+            self.stop.set();
+            t.join();
+        }
         self.stop.deinit();
         self.listener.deinit(self.io);
         self.allocator.destroy(self);
@@ -171,6 +183,7 @@ test "GET /metrics serves the exposition; other requests get 404" {
         .allocator = testing.allocator,
     });
     defer srv.deinit();
+    try srv.start();
     const bound = test_util.boundAddress(&srv.listener);
 
     var buf: [65536]u8 = undefined;
@@ -186,4 +199,24 @@ test "GET /metrics serves the exposition; other requests get 404" {
 
     const wrong_method = try rawRequest(bound, "POST /metrics HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.startsWith(u8, wrong_method, "HTTP/1.1 404 Not Found"));
+}
+
+test "deinit releases an unstarted scrape endpoint" {
+    var m = metrics_mod.Metrics{};
+    const args: MetricsServerArgs = .{
+        .listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", 0),
+        .metrics = &m,
+        .sources = .{ .release = 1, .branch = "test" },
+        .io = testing.io,
+        .allocator = testing.allocator,
+    };
+    const srv = try MetricsServer.init(args);
+    const port = test_util.boundPort(&srv.listener);
+    srv.deinit();
+
+    // deinit() closed the listener, so the same port binds again in this process.
+    var again = args;
+    again.listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.2", port);
+    const srv2 = try MetricsServer.init(again);
+    srv2.deinit();
 }

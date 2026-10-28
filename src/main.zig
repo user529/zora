@@ -4,12 +4,13 @@
 //!   1. Load Config and the API schema
 //!   2. Open + verify the SQLite schema and encryption key (exit on mismatch)
 //!   3. Install the SIGTERM/SIGINT handlers; print the banner and the config
-//!   4. Allocate queues; spawn the dispatcher and requeue threads
-//!   5. Start the io_pool and the scheduler; spawn the worker threads (each
-//!      opens its own DB connection)
-//!   6. Spawn the rules and schema watchers (detached; never joined)
-//!   7. Bind the HTTP server and, when METRICS_ADDR is set, the scrape endpoint
-//!   8. Block until SIGTERM/SIGINT, then shut down in order (see run())
+//!   4. Acquire: allocate the queues, open the worker DB connections, and bind
+//!      the HTTP server and, when METRICS_ADDR is set, the scrape endpoint; an
+//!      error here returns to main() before any thread exists
+//!   5. Spawn: the metrics-log, requeue and dispatcher threads, the io_pool,
+//!      the scheduler, the workers, the rules and schema watchers, then the
+//!      scrape endpoint and the webhook server last
+//!   6. Block until SIGTERM/SIGINT, then shut down in order (see run())
 const std = @import("std");
 const build_opts = @import("build_options");
 
@@ -192,8 +193,8 @@ pub fn main(init: std.process.Init) u8 {
     // The process Io comes from rt (one shared OS-backed runtime — see
     // rt.zig); `std.process.Init` supplies the environment map.
     //
-    // run() returns an error only from startup (a bind, spawn, allocation, or
-    // fd failure); main() names it for the operator before exiting with 1.
+    // main() logs an error that run() returns, then exits with 1. Which
+    // failures return and which exit inside run() is described above run().
     run(std.heap.c_allocator, rt.io(), init.environ_map.*) catch |err| {
         log.err("startup failed: {s}", .{@errorName(err)});
         return 1;
@@ -202,9 +203,21 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Core startup — separated from main() so every startup error returns to
-// the one place that logs it
+// Core startup, separated from main(). run() ends a failed start in one of
+// three ways. A configuration or database check logs its own message and
+// exits with 1. Any other failure before the first thread spawn (an
+// allocation, a DB open, a bind) returns the error to main(). A failure after
+// the first thread spawn exits through startFailed().
 // ---------------------------------------------------------------------------
+
+/// Reports a failure after run() has spawned threads, then exits with status 1.
+/// It exits instead of returning because those threads hold pointers into
+/// run()'s frame: returning an error would unwind its defers and free queues
+/// under them.
+fn startFailed(err: anyerror) noreturn {
+    log.err("startup failed: {s}", .{@errorName(err)});
+    std.process.exit(1);
+}
 
 fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !void {
     // ── Config ───────────────────────────────────────────────────────────────
@@ -266,7 +279,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
 
-    // ── Startup banner — before server.init ───────────────────────────────────
+    // ── Startup banner — before the acquire phase ─────────────────────────────
     var banner_buf: [256]u8 = undefined;
     var banner_fw = std.Io.Writer.fixed(&banner_buf);
     writeBanner(&banner_fw, cfg.api_validation, cfg.state_encryption_key != null) catch {}; // 256 B covers all fields
@@ -277,14 +290,10 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
 
     var stop = std.atomic.Value(bool).init(false);
 
-    // ── Metrics log thread (detached; runs until process exit) ────────────────
-    // g_metrics is module-level, so its lifetime outlives run() and the
-    // detached thread safely reads it after run() returns.
-    if (cfg.metrics_log) {
-        log.warn("METRICS_LOG snapshot line is deprecated and frozen; scrape GET /metrics (METRICS_ADDR) instead", .{});
-        const metrics_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, metricsLogThread, .{&g_metrics});
-        metrics_t.detach();
-    }
+    // ══ Acquire phase ═════════════════════════════════════════════════════════
+    // This phase creates the queues and slices, opens the worker DB
+    // connections, and binds both listeners. No thread runs yet, so an error
+    // here unwinds safely and run() returns it to main().
 
     // ── Per-worker result queues ──────────────────────────────────────────────
     // The io_pool pushes I/O results here, and the dispatchers push the outcome
@@ -306,47 +315,18 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
     errdefer allocator.free(result_q_ptrs);
     for (0..cfg.worker_threads) |i| result_q_ptrs[i] = &result_qs[i];
 
-    // ── Dispatcher queue + threads ────────────────────────────────────────────
+    // ── Dispatcher queue, throttle state, dispatcher thread slice ─────────────
     var disp_q = try queue_mod.Queue(types.ApiCall).init(allocator, io, 4096);
     defer disp_q.deinit(allocator);
     disp_q.kind = .dispatcher;
 
-    // ── Throttle: delay queue + per-chat block map + requeue thread ───────────
     var delay_q = delay_mod.DelayQueue.init(allocator, io, cfg.delay_queue_capacity);
     var blocked_until = delay_mod.BlockedMap.init(allocator, io);
-
-    const requeue_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, delay_mod.requeueThread, .{
-        delay_mod.RequeueArgs{
-            .delay_q = &delay_q,
-            .disp_q = &disp_q,
-            .metrics = &g_metrics,
-        },
-    });
 
     const disp_threads = try allocator.alloc(std.Thread, cfg.dispatcher_threads);
     defer allocator.free(disp_threads);
 
-    for (0..cfg.dispatcher_threads) |i| {
-        disp_threads[i] = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, disp_mod.dispatcherThread, .{
-            disp_mod.DispatcherArgs{
-                .id = @intCast(i),
-                .queue = &disp_q,
-                .bot_token = cfg.bot_token,
-                .api_base = cfg.bot_api_base,
-                .allocator = allocator,
-                .io = io,
-                .stop = &stop,
-                .io_result_queues = result_q_ptrs,
-                .metrics = &g_metrics,
-                .delay_q = &delay_q,
-                .blocked_until = &blocked_until,
-                .retry_after_default_ms = cfg.retry_after_default_ms,
-                .retry_after_max_ms = cfg.retry_after_max_ms,
-            },
-        });
-    }
-
-    // ── Worker queues + threads ───────────────────────────────────────────────
+    // ── Worker queues ─────────────────────────────────────────────────────────
     const wqs = try allocator.alloc(queue_mod.Queue(types.WorkItem), cfg.worker_threads);
     defer {
         for (wqs) |*q| q.deinit(allocator);
@@ -363,39 +343,12 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
         wq_ptrs[i] = &wqs[i];
     }
 
-    // ── Single shared io_pool that executes blocking I/O for parked coroutines ─
-    var pool: io_pool.IoPool = undefined;
-    try pool.init(allocator, io, io_pool.IoPoolConfig{
-        .thread_count = cfg.io_pool_threads,
-        .queue_capacity = cfg.io_queue_capacity,
-        .timeout_ms = cfg.io_job_timeout_ms,
-        .proc_max_output = cfg.proc_max_output_bytes,
-        .metrics = &g_metrics,
-        .child_env = &child_env,
-    }, result_q_ptrs);
-    errdefer pool.deinit();
-
-    // ── Scheduler: own DB connection + timer thread ───────────────────────────
-    // lease_ms must exceed workflow_deadline_ms so a legitimately-slow async job
-    // is never reclaimed and double-fired.
-    std.debug.assert(scheduler_mod.DEFAULT_LEASE_MS > @as(i64, @intCast(cfg.workflow_deadline_ms)));
-    var g_scheduler = scheduler_mod.Scheduler{ .io = io };
-    const scheduler_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, scheduler_mod.schedulerThread, .{
-        scheduler_mod.SchedulerArgs{
-            .db = &sched_db,
-            .worker_qs = wq_ptrs,
-            .sched = &g_scheduler,
-            .stop = &stop,
-            .io = io,
-            .allocator = allocator,
-            .metrics = &g_metrics,
-        },
-    });
-
+    // ── Worker thread slice and per-worker DB connections ─────────────────────
     const worker_threads = try allocator.alloc(std.Thread, cfg.worker_threads);
     defer allocator.free(worker_threads);
 
-    // Track per-worker DB pointers so they can be freed after workers join.
+    // One DB connection per worker; the shutdown path closes them after the
+    // workers have joined.
     const dbs = try allocator.alloc(state_store.StateStore, cfg.worker_threads);
     defer allocator.free(dbs); // only frees the slice backing array
 
@@ -405,7 +358,120 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
     for (0..cfg.worker_threads) |i| {
         dbs[i] = try state_store.StateStore.openWithOptions(allocator, cfg.db_path, open_opts);
         opened_dbs += 1;
-        worker_threads[i] = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, worker_mod.workerThread, .{
+    }
+
+    // ── Scheduler state (the timer thread starts later) ───────────────────────
+    // `DEFAULT_LEASE_MS` must exceed `workflow_deadline_ms`, so the scheduler
+    // never reclaims and fires again a job that is slow but still running.
+    std.debug.assert(scheduler_mod.DEFAULT_LEASE_MS > @as(i64, @intCast(cfg.workflow_deadline_ms)));
+    var g_scheduler = scheduler_mod.Scheduler{ .io = io };
+
+    // ── HTTP server and scrape endpoint: bind now, serve later ────────────────
+    // A bind failure here returns before any thread exists.
+    const srv = try server_mod.Server.init(.{
+        .listen_addr = cfg.listen_addr,
+        .webhook_secret = cfg.webhook_secret,
+        .queues = wq_ptrs,
+        .allocator = allocator,
+        .io = io,
+        .pool_threads = cfg.webhook_pool_threads,
+        .metrics = &g_metrics,
+    });
+    errdefer srv.deinit();
+
+    // No errdefer: nothing fallible follows before the point of no return.
+    const metrics_srv: ?*metrics_server_mod.MetricsServer = if (cfg.metrics_addr) |maddr|
+        try metrics_server_mod.MetricsServer.init(.{
+            .listen_addr = maddr,
+            .metrics = &g_metrics,
+            .sources = .{
+                .worker_queues = wq_ptrs,
+                .dispatcher_queue = &disp_q,
+                .release = RELEASE,
+                .branch = GIT_BRANCH,
+            },
+            .io = io,
+            .allocator = allocator,
+        })
+    else
+        null;
+
+    // ══ Point of no return ════════════════════════════════════════════════════
+    // Past this line threads hold pointers into this frame, so an error must
+    // not run the defers above: they would free queues under running threads.
+    // Every fallible call below goes through startFailed(), never `try`.
+
+    // ══ Start phase ═══════════════════════════════════════════════════════════
+    // Spawn the threads, with the webhook server last. Until it starts, no
+    // update is answered: nothing reaches the workers before they exist, and
+    // when a start-phase failure exits the process, Telegram still holds every
+    // update and sends it again.
+
+    // ── Metrics log thread (detached; runs until process exit) ────────────────
+    // `g_metrics` is module-level, so it outlives run(), and the detached
+    // thread can read it after run() returns.
+    if (cfg.metrics_log) {
+        log.warn("METRICS_LOG snapshot line is deprecated and frozen; scrape GET /metrics (METRICS_ADDR) instead", .{});
+        const metrics_t = std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, metricsLogThread, .{&g_metrics}) catch |err| startFailed(err);
+        metrics_t.detach();
+    }
+
+    // ── Throttle requeue thread ───────────────────────────────────────────────
+    const requeue_t = std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, delay_mod.requeueThread, .{
+        delay_mod.RequeueArgs{
+            .delay_q = &delay_q,
+            .disp_q = &disp_q,
+            .metrics = &g_metrics,
+        },
+    }) catch |err| startFailed(err);
+
+    // ── Dispatcher threads ────────────────────────────────────────────────────
+    for (0..cfg.dispatcher_threads) |i| {
+        disp_threads[i] = std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, disp_mod.dispatcherThread, .{
+            disp_mod.DispatcherArgs{
+                .id = @intCast(i),
+                .queue = &disp_q,
+                .bot_token = cfg.bot_token,
+                .api_base = cfg.bot_api_base,
+                .allocator = allocator,
+                .io = io,
+                .io_result_queues = result_q_ptrs,
+                .metrics = &g_metrics,
+                .delay_q = &delay_q,
+                .blocked_until = &blocked_until,
+                .retry_after_default_ms = cfg.retry_after_default_ms,
+                .retry_after_max_ms = cfg.retry_after_max_ms,
+            },
+        }) catch |err| startFailed(err);
+    }
+
+    // ── Single shared io_pool that executes blocking I/O for parked coroutines ─
+    var pool: io_pool.IoPool = undefined;
+    pool.init(allocator, io, io_pool.IoPoolConfig{
+        .thread_count = cfg.io_pool_threads,
+        .queue_capacity = cfg.io_queue_capacity,
+        .timeout_ms = cfg.io_job_timeout_ms,
+        .proc_max_output = cfg.proc_max_output_bytes,
+        .metrics = &g_metrics,
+        .child_env = &child_env,
+    }, result_q_ptrs) catch |err| startFailed(err);
+
+    // ── Scheduler timer thread ────────────────────────────────────────────────
+    const scheduler_t = std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, scheduler_mod.schedulerThread, .{
+        scheduler_mod.SchedulerArgs{
+            .db = &sched_db,
+            .worker_qs = wq_ptrs,
+            .sched = &g_scheduler,
+            .stop = &stop,
+            .io = io,
+            .allocator = allocator,
+            .metrics = &g_metrics,
+        },
+    }) catch |err| startFailed(err);
+
+    // ── Worker threads ────────────────────────────────────────────────────────
+    for (0..cfg.worker_threads) |i| {
+        worker_threads[i] = std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, worker_mod.workerThread, .{
             worker_mod.WorkerArgs{
                 .id = @intCast(i),
                 .rules_path = cfg.rules_file,
@@ -426,7 +492,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
                 .workflow_deadline_ms = cfg.workflow_deadline_ms,
                 .scheduler = &g_scheduler,
             },
-        });
+        }) catch |err| startFailed(err);
     }
 
     // ── Hot-reload watcher (detached; never joined) ───────────────────────────
@@ -434,59 +500,33 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
     // it gets its own copy of its path, made here before the spawn: no
     // watcher thread ever reads `cfg`.
     {
-        const rules_path = try allocator.dupe(u8, cfg.rules_file);
-        errdefer allocator.free(rules_path);
-        const watcher_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, watcher.watcherThread, .{
+        const rules_path = allocator.dupe(u8, cfg.rules_file) catch |err| startFailed(err);
+        const watcher_t = std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, watcher.watcherThread, .{
             watcher.WatcherArgs{
                 .rules_path = rules_path,
                 .allocator = allocator,
                 .io = io,
             },
-        });
+        }) catch |err| startFailed(err);
         watcher_t.detach();
     }
 
     // ── Schema-file watcher (detached; mirrors the rules watcher) ─────────────
     {
-        const schema_file = try allocator.dupe(u8, cfg.schema_file);
-        errdefer allocator.free(schema_file);
-        const schema_watcher_t = try std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, tg_schema.schemaWatcherThread, .{
+        const schema_file = allocator.dupe(u8, cfg.schema_file) catch |err| startFailed(err);
+        const schema_watcher_t = std.Thread.spawn(.{ .stack_size = types.THREAD_STACK_SIZE }, tg_schema.schemaWatcherThread, .{
             tg_schema.SchemaWatcherArgs{
                 .schema_file = schema_file,
                 .slot = &g_schema_slot,
                 .allocator = allocator,
             },
-        });
+        }) catch |err| startFailed(err);
         schema_watcher_t.detach();
     }
 
-    // ── HTTP server (accept loop runs in its own thread) ──────────────────────
-    const srv = try server_mod.Server.init(.{
-        .listen_addr = cfg.listen_addr,
-        .webhook_secret = cfg.webhook_secret,
-        .queues = wq_ptrs,
-        .allocator = allocator,
-        .io = io,
-        .pool_threads = cfg.webhook_pool_threads,
-        .metrics = &g_metrics,
-    });
-
-    // ── Prometheus scrape endpoint (only when METRICS_ADDR is set) ────────────
-    const metrics_srv: ?*metrics_server_mod.MetricsServer = if (cfg.metrics_addr) |maddr|
-        try metrics_server_mod.MetricsServer.init(.{
-            .listen_addr = maddr,
-            .metrics = &g_metrics,
-            .sources = .{
-                .worker_queues = wq_ptrs,
-                .dispatcher_queue = &disp_q,
-                .release = RELEASE,
-                .branch = GIT_BRANCH,
-            },
-            .io = io,
-            .allocator = allocator,
-        })
-    else
-        null;
+    // ── Serve: scrape endpoint, then the webhook last ─────────────────────────
+    if (metrics_srv) |ms| ms.start() catch |err| startFailed(err);
+    srv.start() catch |err| startFailed(err);
 
     // ── Block until SIGTERM / SIGINT ──────────────────────────────────────────
     g_stop.wait() catch |err| log.err("waiting for a stop signal: {s} — shutting down", .{@errorName(err)});
@@ -517,8 +557,10 @@ fn run(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ.Map) !
     // Drain WorkItem entries workers didn't pop before stop (free their bodies).
     for (wqs) |*q| while (q.popTimeout(0)) |item| allocator.free(item.body);
     for (dbs) |*db| db.close();
-    // Wake the parked dispatchers so they drain and exit. close() is the
-    // shutdown signal for the queue consumers.
+    // close() is the dispatchers' only exit signal. They exit once the queue is
+    // empty, so replies emitted while the workers drained go out. A call parked
+    // in the delay queue goes out only if its Retry-After window ends before
+    // the dispatchers exit; otherwise the teardown below frees it unsent.
     disp_q.close();
     for (disp_threads) |t| t.join();
     // Stop the requeue thread before draining either queue so nothing moves
@@ -636,7 +678,6 @@ const IntegrationStack = struct {
                 .api_base = api_base,
                 .allocator = std.heap.page_allocator,
                 .io = testing.io,
-                .stop = &self.stop,
                 .metrics = &self.metrics,
             },
         });
@@ -651,6 +692,7 @@ const IntegrationStack = struct {
             .pool_threads = 2,
             .metrics = &self.metrics,
         });
+        try self.srv.start();
 
         return self;
     }
@@ -659,7 +701,7 @@ const IntegrationStack = struct {
         self.stop.store(true, .release);
         self.worker_q.close(); // wake the parked worker so it can observe stop
         self.worker_t.join();
-        self.disp_q.close(); // wake the parked dispatcher so it can observe stop
+        self.disp_q.close(); // the dispatcher drains the queue, then exits
         self.disp_t.join();
         self.srv.deinit();
         self.db.close();
