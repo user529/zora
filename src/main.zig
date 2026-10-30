@@ -808,6 +808,6 @@ test "POST webhook → worker processes → dispatcher calls mock Telegram API" 
     try testing.expectEqual(@as(u16, 200), status);
 
     // Dispatcher should POST to mock within 2 s.
-    try testing.expect(mock.waitForN(1, 2000));
+    try testing.expect(test_util.waitAtLeast(&mock.received, @TypeOf(mock.received).len, 1, 2000));
     try testing.expectEqual(@as(u32, 1), mock.call_cnt.load(.acquire));
 }

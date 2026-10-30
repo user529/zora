@@ -183,6 +183,7 @@ pub fn requeueThread(args: RequeueArgs) void {
 }
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 
 fn dummyCall(allocator: std.mem.Allocator, chat_id: i64) !types.ApiCall {
     return .{
@@ -290,10 +291,7 @@ test "requeueThread sheds a due call when disp_q is full" {
     }});
 
     // Poll the shed counter with a bounded timeout instead of a fixed sleep.
-    const deadline = rt.nowMs(rt.io()) + 2000;
-    while (metrics.throttle_shed_total.load(.monotonic) == 0 and rt.nowMs(rt.io()) < deadline) {
-        rt.sleepNs(rt.io(), std.time.ns_per_ms);
-    }
+    _ = test_util.waitAtLeast(&metrics.throttle_shed_total, test_util.atomicCount, 1, 2000);
 
     dq.close();
     t.join();

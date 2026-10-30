@@ -508,6 +508,8 @@ fn pushTrackedErr(
 const testing = std.testing;
 
 const boundPort = @import("test_util.zig").boundPort;
+const waitAtLeast = @import("test_util.zig").waitAtLeast;
+const atomicCount = @import("test_util.zig").atomicCount;
 
 // The dispatcher does not build bodies or map method names — body
 // construction lives in lua_api.  Wire-level coverage is the MockServer
@@ -587,16 +589,6 @@ pub const MockServer = struct {
 
     pub fn baseUrl(self: *const MockServer, buf: []u8) []u8 {
         return std.fmt.bufPrint(buf, "http://127.0.0.2:{d}", .{boundPort(&self.server)}) catch unreachable;
-    }
-
-    pub fn waitForN(self: *MockServer, n: usize, timeout_ms: u64) bool {
-        const t0 = rt.nowMs(testing.io);
-        while (self.received.len() < n) {
-            if (@as(u64, @intCast(rt.nowMs(testing.io) - t0)) >= timeout_ms)
-                return false;
-            rt.sleepNs(testing.io, 5 * std.time.ns_per_ms);
-        }
-        return true;
     }
 };
 
@@ -973,7 +965,7 @@ test "json and multipart calls POST to /bot{token}/{method} with correct bodies"
             .payload = .{ .multipart = parts },
         });
 
-        try testing.expect(mock.waitForN(1, 2000));
+        try testing.expect(waitAtLeast(&mock.received, @TypeOf(mock.received).len, 1, 2000));
         var req = mock.received.pop();
         defer req.deinit();
 
@@ -1007,7 +999,7 @@ test "json and multipart calls POST to /bot{token}/{method} with correct bodies"
             .payload = .{ .json = try alloc.dupe(u8, "{\"chat_id\":1,\"text\":\"hi\"}") },
         });
 
-        try testing.expect(mock.waitForN(1, 2000));
+        try testing.expect(waitAtLeast(&mock.received, @TypeOf(mock.received).len, 1, 2000));
         var req = mock.received.pop();
         defer req.deinit();
         try testing.expectEqualStrings("/bottest-tok/editMessageText", req.path);
@@ -1030,7 +1022,7 @@ test "json and multipart calls POST to /bot{token}/{method} with correct bodies"
             .payload = .{ .multipart = parts },
         });
 
-        try testing.expect(mock.waitForN(1, 2000));
+        try testing.expect(waitAtLeast(&mock.received, @TypeOf(mock.received).len, 1, 2000));
         var req = mock.received.pop();
         defer req.deinit();
 
@@ -1171,13 +1163,9 @@ test "an oversize response is rejected and counted" {
     });
 
     // The request reaches the mock twice (reject → retry).
-    try testing.expect(mock.waitForN(2, 4000));
+    try testing.expect(waitAtLeast(&mock.received, @TypeOf(mock.received).len, 2, 4000));
     // And the oversize counter is incremented.
-    var waited: u64 = 0;
-    while (m.response_oversize_total.load(.monotonic) == 0 and waited < 4000) {
-        rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
-        waited += 20;
-    }
+    _ = waitAtLeast(&m.response_oversize_total, atomicCount, 1, 4000);
     dq.close();
     disp.join();
 
@@ -1259,7 +1247,7 @@ test "429 parks the call and a blocked chat waits for the window" {
         defer h.deinit();
 
         try h.pushMsg(1);
-        try testing.expect(mock.waitForN(2, 4000));
+        try testing.expect(waitAtLeast(&mock.received, @TypeOf(mock.received).len, 2, 4000));
     }
     // While a chat is blocked, further messages to it are held back until the
     // window elapses, then all are delivered.
@@ -1284,7 +1272,7 @@ test "429 parks the call and a blocked chat waits for the window" {
         try testing.expectEqual(@as(usize, 1), mock.received.len());
 
         // After the window all three are delivered: 1 (429) + 3 (success) = 4 total.
-        try testing.expect(mock.waitForN(4, 4000));
+        try testing.expect(waitAtLeast(&mock.received, @TypeOf(mock.received).len, 4, 4000));
     }
 }
 
@@ -1329,11 +1317,7 @@ test "one retry on a fresh connection after a pause; api_calls and retries are c
         }});
 
         try pushCall(&dq, "sendMessage", "{\"chat_id\":1,\"text\":\"x\"}");
-        var waited: u64 = 0;
-        while (waited < 4_000 and m.api_calls[@backingInt(metrics_mod.CallOutcome.ok)].load(.monotonic) == 0) {
-            rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
-            waited += 20;
-        }
+        _ = waitAtLeast(&m.api_calls[@backingInt(metrics_mod.CallOutcome.ok)], atomicCount, 1, 4_000);
         dq.close();
         disp.join();
         srv_thread.join();
@@ -1373,11 +1357,7 @@ test "one retry on a fresh connection after a pause; api_calls and retries are c
         }});
 
         try pushCall(&dq, "sendMessage", "{\"chat_id\":1,\"text\":\"x\"}");
-        var waited: u64 = 0;
-        while (waited < 4_000 and m.api_calls[@backingInt(metrics_mod.CallOutcome.failed)].load(.monotonic) == 0) {
-            rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
-            waited += 20;
-        }
+        _ = waitAtLeast(&m.api_calls[@backingInt(metrics_mod.CallOutcome.failed)], atomicCount, 1, 4_000);
         dq.close();
         disp.join();
         srv_thread.join();

@@ -343,6 +343,7 @@ pub fn main(init: std.process.Init) u8 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 
 test "parseArgs reads --in and --out; rejects a missing --out and an unknown flag" {
     const argv = [_][:0]const u8{ "zora-migrate", "--in", "a.db", "--out", "b.db" };
@@ -386,22 +387,13 @@ fn writeV1Fixture(path: [:0]const u8) !void {
     try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(raw.?, ddl, null, null, null));
 }
 
-/// Resolve a tmpDir to an absolute path and join `name` onto it, NUL-terminated.
-fn joinZ(buf: []u8, dir_path: []const u8, name: []const u8) [:0]const u8 {
-    return std.mem.printSentinel(buf, "{s}/{s}", .{ dir_path, name }, 0) catch unreachable;
-}
-
 test "migrate v1 plaintext -> v2 plaintext preserves every row" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &dbuf);
-    const dir = dbuf[0..dlen];
-
     var ibuf: [std.fs.max_path_bytes + 16]u8 = undefined;
     var obuf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const in_path = joinZ(&ibuf, dir, "v1.db");
-    const out_path = joinZ(&obuf, dir, "v2.db");
+    const in_path = try test_util.tmpDbPath(&tmp, "v1.db", &ibuf);
+    const out_path = try test_util.tmpDbPath(&tmp, "v2.db", &obuf);
 
     try writeV1Fixture(in_path);
     const counts = try migrate(testing.allocator, testing.io, in_path, out_path, null);
@@ -443,14 +435,10 @@ test "migrate v1 plaintext -> v2 plaintext preserves every row" {
 test "migrate v1 plaintext -> v2 encrypted; new binary reads it back" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &dbuf);
-    const dir = dbuf[0..dlen];
-
     var ibuf: [std.fs.max_path_bytes + 16]u8 = undefined;
     var obuf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const in_path = joinZ(&ibuf, dir, "v1.db");
-    const out_path = joinZ(&obuf, dir, "v2enc.db");
+    const in_path = try test_util.tmpDbPath(&tmp, "v1.db", &ibuf);
+    const out_path = try test_util.tmpDbPath(&tmp, "v2enc.db", &obuf);
 
     try writeV1Fixture(in_path);
     _ = try migrate(testing.allocator, testing.io, in_path, out_path, "correct horse");
@@ -478,14 +466,10 @@ test "migrate v1 plaintext -> v2 encrypted; new binary reads it back" {
 test "migrate refuses an existing output and a source that is not v1" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &dbuf);
-    const dir = dbuf[0..dlen];
-
     var ibuf: [std.fs.max_path_bytes + 16]u8 = undefined;
     var obuf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const in_path = joinZ(&ibuf, dir, "v1.db");
-    const out_path = joinZ(&obuf, dir, "exists.db");
+    const in_path = try test_util.tmpDbPath(&tmp, "v1.db", &ibuf);
+    const out_path = try test_util.tmpDbPath(&tmp, "exists.db", &obuf);
 
     try writeV1Fixture(in_path);
     try writeV1Fixture(out_path); // out already exists
@@ -494,8 +478,8 @@ test "migrate refuses an existing output and a source that is not v1" {
     // A v2 database (StateStore seeds schema_version='2') is not a v1 source.
     var v2buf: [std.fs.max_path_bytes + 16]u8 = undefined;
     var o2buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const v2_path = joinZ(&v2buf, dir, "v2src.db");
-    const out2_path = joinZ(&o2buf, dir, "out.db");
+    const v2_path = try test_util.tmpDbPath(&tmp, "v2src.db", &v2buf);
+    const out2_path = try test_util.tmpDbPath(&tmp, "out.db", &o2buf);
     var s = try state_store.StateStore.open(testing.allocator, v2_path);
     s.close();
     try testing.expectError(MigrateError.SourceNotV1, migrate(testing.allocator, testing.io, v2_path, out2_path, null));
@@ -504,14 +488,10 @@ test "migrate refuses an existing output and a source that is not v1" {
 test "migrate handles an empty v1 database" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &dbuf);
-    const dir = dbuf[0..dlen];
-
     var ibuf: [std.fs.max_path_bytes + 16]u8 = undefined;
     var obuf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const in_path = joinZ(&ibuf, dir, "empty.db");
-    const out_path = joinZ(&obuf, dir, "emptyout.db");
+    const in_path = try test_util.tmpDbPath(&tmp, "empty.db", &ibuf);
+    const out_path = try test_util.tmpDbPath(&tmp, "emptyout.db", &obuf);
 
     // v1 schema, schema_version='1', but no data rows.
     var raw: ?*c.sqlite3 = null;

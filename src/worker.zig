@@ -530,19 +530,30 @@ pub fn hashUserId(user_id: i64, worker_count: u32) u32 {
 const testing = std.testing;
 const Queue = queue_mod.Queue;
 
-/// Test helper: spin-wait until `queue.len() >= n` or `timeout_ms` elapses.
-fn waitQueue(q: anytype, n: usize, timeout_ms: u64) bool {
-    const start = rt.nowMs(testing.io);
-    while (q.len() < n) {
-        if (@as(u64, @intCast(rt.nowMs(testing.io) - start)) >= timeout_ms) return false;
-        rt.sleepNs(testing.io, 2 * std.time.ns_per_ms);
-    }
-    return true;
-}
-
 /// Test helper: pop the next ApiCall for inspection. The caller frees it.
 fn popAction(q: *Queue(types.ApiCall)) types.ApiCall {
     return q.pop();
+}
+
+/// Current `coroutines_inflight` gauge, for `waitAtLeast`. The gauge is
+/// signed; the clamp at 0 keeps a negative value from panicking in `@intCast`.
+fn inflightCount(m: *metrics_mod.Metrics) usize {
+    return @intCast(@max(0, m.coroutines_inflight.load(.monotonic)));
+}
+
+/// 1 once the worker has called commit(), which clears the seam
+/// `fail_next_commit`, else 0, for `waitAtLeast`.
+fn commitFired(db: *state_store.StateStore) usize {
+    return @intFromBool(!db.fail_next_commit);
+}
+
+/// 1 once user 11's state holds the write made before the yield, else 0, for
+/// `waitAtLeast`. A read error also gives 0: the wait then times out and the
+/// test fails without the error name.
+fn preKept(db: *state_store.StateStore) usize {
+    const data = db.getUserState(11) catch return 0;
+    defer testing.allocator.free(data);
+    return @intFromBool(std.mem.find(u8, data, "\"pre\":\"kept\"") != null);
 }
 
 // ── Shared test setup ────────────────────────────────────────────────────────
@@ -560,6 +571,9 @@ fn testWorkItem(allocator: std.mem.Allocator, body: []const u8) !types.WorkItem 
 const StubServer = struct { port: u16, thread: std.Thread };
 
 const boundPort = @import("test_util.zig").boundPort;
+const tmpDbPath = @import("test_util.zig").tmpDbPath;
+const waitAtLeast = @import("test_util.zig").waitAtLeast;
+const atomicCount = @import("test_util.zig").atomicCount;
 
 /// Drain an HTTP request head line-by-line (keep-alive clients never EOF, so a
 /// single readSliceShort would block forever trying to fill its buffer).
@@ -912,7 +926,7 @@ test "Lua error rolls back the update's state; the next update commits and is de
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"boom\":true}"));
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"boom\":false}"));
 
-    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 2_000));
     const action = ctx.output_q.pop();
     defer types.freeApiCall(action, testing.allocator);
     try testing.expectEqualStrings("sendMessage", action.method);
@@ -977,7 +991,7 @@ test "strict schema validation drops a failing call before the dispatcher" {
     }
 
     try ctx.input_q.push(try testWorkItem(testing.allocator, "{\"update_id\":1}"));
-    try testing.expect(waitQueue(&ctx.output_q, 1, 1000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 1000));
     const action = popAction(&ctx.output_q);
     defer types.freeApiCall(action, testing.allocator);
     try testing.expect(bodyHas(action.payload.json, "\"chat_id\":2"));
@@ -1058,7 +1072,7 @@ test "bot.http_request yields, resumes with status and case-insensitive headers"
     rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":1}"));
 
-    try testing.expect(waitQueue(&ctx.output_q, 1, 5_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 5_000));
     const action = ctx.output_q.pop();
     defer types.freeApiCall(action, testing.allocator);
 
@@ -1131,7 +1145,7 @@ test "slow coroutine parked; same worker processes fast update first" {
     defer types.freeApiCall(fast_action, testing.allocator);
     try testing.expectEqualStrings("fast_done", fast_action.method);
 
-    try testing.expect(waitQueue(&ctx.output_q, 1, 1_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 1_000));
     const slow_action = ctx.output_q.pop();
     defer types.freeApiCall(slow_action, testing.allocator);
     try testing.expectEqualStrings("slow_done", slow_action.method);
@@ -1170,7 +1184,7 @@ test "state written in a resumed (post-I/O) segment commits and is read by a lat
 
     // Update 1: yields on http_request, writes user_state in the resumed segment.
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"write\":true}"));
-    try testing.expect(waitQueue(&ctx.output_q, 1, 5_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 5_000));
     {
         const a = ctx.output_q.pop();
         defer types.freeApiCall(a, testing.allocator);
@@ -1179,7 +1193,7 @@ test "state written in a resumed (post-I/O) segment commits and is read by a lat
 
     // Update 2 (sync): reads the state the resumed segment committed.
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"write\":false}"));
-    try testing.expect(waitQueue(&ctx.output_q, 1, 5_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 5_000));
     {
         const a = ctx.output_q.pop();
         defer types.freeApiCall(a, testing.allocator);
@@ -1224,25 +1238,14 @@ test "write before a yield survives a later-segment failure; the worker continue
     // The resumed segment errors, so no action is dispatched. Poll the state
     // store until the pre-yield write lands (it commits when the coroutine
     // parks), bounded so a regression that drops it fails rather than hangs.
-    var found = false;
-    var waited: u64 = 0;
-    while (waited < 5_000) : (waited += 10) {
-        const data = try ctx.db.getUserState(11);
-        defer testing.allocator.free(data);
-        if (std.mem.find(u8, data, "\"pre\":\"kept\"") != null) {
-            found = true;
-            break;
-        }
-        rt.sleepNs(testing.io, 10 * std.time.ns_per_ms);
-    }
-    try testing.expect(found);
+    try testing.expect(waitAtLeast(&ctx.db, preKept, 1, 5_000));
 
     // No action was dispatched by the failed workflow.
     try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
 
     // The aborted workflow freed its slot: the next update is answered.
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"next\":true}"));
-    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 2_000));
     const action = ctx.output_q.pop();
     defer types.freeApiCall(action, testing.allocator);
     try testing.expectEqualStrings("survived", action.method);
@@ -1321,16 +1324,7 @@ test "resume-path COMMIT failure drops the segment's actions and its state write
     // The resume commit fails → actions dropped, state rolled back. There is no
     // dispatched action to wait on, so poll the seam reset as the completion
     // marker (it clears when the resume commit fires).
-    var fired = false;
-    var waited: u64 = 0;
-    while (waited < 5_000) : (waited += 10) {
-        if (!ctx.db.fail_next_commit) {
-            fired = true;
-            break;
-        }
-        rt.sleepNs(testing.io, 10 * std.time.ns_per_ms);
-    }
-    try testing.expect(fired);
+    try testing.expect(waitAtLeast(&ctx.db, commitFired, 1, 5_000));
 
     // (a) the resumed segment's action was NOT dispatched.
     try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
@@ -1386,7 +1380,7 @@ test "no transaction is held across a yield — a second writer is not blocked" 
     // transaction would impose — so a regression (transaction held across the
     // yield) fails this assertion instead of passing slowly.
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"park\":false}"));
-    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 2_000));
     {
         const a = ctx.output_q.pop();
         defer types.freeApiCall(a, testing.allocator);
@@ -1437,7 +1431,7 @@ test "re-yield against a populated inflight map — 8 coroutines, two yields eac
         try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":1}"));
     }
 
-    try testing.expect(waitQueue(&ctx.output_q, N, 10_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, N, 10_000));
     for (0..N) |_| {
         const action = ctx.output_q.pop();
         defer types.freeApiCall(action, testing.allocator);
@@ -1500,28 +1494,20 @@ test "coroutine past WORKFLOW_DEADLINE_MS is reaped; worker continues" {
 
     // Wait for the coroutine to park (the reaper only acts on parked entries).
     {
-        var waited: u64 = 0;
-        while (m.coroutines_inflight.load(.monotonic) == 0 and waited < 2_000) : (waited += 5) {
-            rt.sleepNs(testing.io, 5 * std.time.ns_per_ms);
-        }
+        _ = waitAtLeast(&m, inflightCount, 1, 2_000);
         try testing.expectEqual(@as(i64, 1), m.coroutines_inflight.load(.monotonic));
     }
 
     // Advance the clock past the deadline (1_000 + 200). The next reaper pass
     // fires; poll the reaped count rather than sleeping a wall-clock margin.
     ctx.clock.store(1_500, .release);
-    {
-        var waited: u64 = 0;
-        while (m.coroutines_reaped_total.load(.monotonic) == 0 and waited < 2_000) : (waited += 5) {
-            rt.sleepNs(testing.io, 5 * std.time.ns_per_ms);
-        }
-    }
+    _ = waitAtLeast(&m.coroutines_reaped_total, atomicCount, 1, 2_000);
     try testing.expectEqual(@as(u64, 1), m.coroutines_reaped_total.load(.monotonic));
     try testing.expectEqual(@as(i64, 0), m.coroutines_inflight.load(.monotonic));
 
     // The worker keeps running after the reap: a fresh update is answered.
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"hang\":false}"));
-    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 2_000));
     const action = ctx.output_q.pop();
     defer types.freeApiCall(action, testing.allocator);
     try testing.expectEqualStrings("ok", action.method);
@@ -1587,7 +1573,7 @@ test "at inflight ceiling new updates are not dequeued until a slot frees" {
     rt.sleepNs(testing.io, 100 * std.time.ns_per_ms);
     try testing.expectEqual(@as(usize, 0), ctx.output_q.len());
 
-    try testing.expect(waitQueue(&ctx.output_q, 2, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 2, 2_000));
     try testing.expectEqual(@as(usize, 2), ctx.output_q.len());
 }
 
@@ -1610,7 +1596,7 @@ test "bot.exec and bot.shell deliver results to coroutine" {
     rt.sleepNs(testing.io, 30 * std.time.ns_per_ms);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"kind\":\"exec\"}"));
-    try testing.expect(waitQueue(&ctx.output_q, 1, 3_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 3_000));
     const exec_action = ctx.output_q.pop();
     defer types.freeApiCall(exec_action, testing.allocator);
     try testing.expectEqualStrings("exec_result", exec_action.method);
@@ -1618,7 +1604,7 @@ test "bot.exec and bot.shell deliver results to coroutine" {
     try testing.expect(std.mem.find(u8, exec_action.payload.json, "execok") != null);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"kind\":\"shell\"}"));
-    try testing.expect(waitQueue(&ctx.output_q, 1, 3_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 3_000));
     const shell_action = ctx.output_q.pop();
     defer types.freeApiCall(shell_action, testing.allocator);
     try testing.expectEqualStrings("shell_result", shell_action.method);
@@ -1665,13 +1651,13 @@ test "hot-reload while coroutine is parked; parked completes on old rules; next 
     }
     _ = ctx.reload_ver.fetchAdd(1, .release);
 
-    try testing.expect(waitQueue(&ctx.output_q, 1, 5_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 5_000));
     const old_action = ctx.output_q.pop();
     defer types.freeApiCall(old_action, testing.allocator);
     try testing.expectEqualStrings("old_rules", old_action.method);
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":99}"));
-    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 2_000));
     const new_action = ctx.output_q.pop();
     defer types.freeApiCall(new_action, testing.allocator);
     try testing.expectEqualStrings("new_rules", new_action.method);
@@ -1692,7 +1678,7 @@ test "bot.send_message parks until the dispatcher reports the message_id" {
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":2}"));
 
-    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 2_000));
     const send_call = ctx.output_q.pop();
     defer types.freeApiCall(send_call, testing.allocator);
     try testing.expectEqualStrings("sendMessage", send_call.method);
@@ -1708,7 +1694,7 @@ test "bot.send_message parks until the dispatcher reports the message_id" {
         .outcome = .{ .send = .{ .message_id = 99 } },
     });
 
-    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 2_000));
     const edit_call = ctx.output_q.pop();
     defer types.freeApiCall(edit_call, testing.allocator);
     try testing.expectEqualStrings("editMessageText", edit_call.method);
@@ -1733,7 +1719,7 @@ test "tracked send failure → Lua error raised; pcall catches; worker continues
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":3}"));
 
-    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 2_000));
     const send_call = ctx.output_q.pop();
     const tracking = send_call.tracking.?;
     types.freeApiCall(send_call, testing.allocator);
@@ -1745,7 +1731,7 @@ test "tracked send failure → Lua error raised; pcall catches; worker continues
         .outcome = .{ .err = err_msg },
     });
 
-    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 2_000));
     const handled = ctx.output_q.pop();
     defer types.freeApiCall(handled, testing.allocator);
     try testing.expectEqualStrings("error_handled", handled.method);
@@ -1753,7 +1739,7 @@ test "tracked send failure → Lua error raised; pcall catches; worker continues
 
     // The worker continues: the next update parks on a fresh tracked send.
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":4}"));
-    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 2_000));
     const next = ctx.output_q.pop();
     defer types.freeApiCall(next, testing.allocator);
     try testing.expect(next.tracking != null);
@@ -1773,7 +1759,7 @@ test "bot.emit send_message (fire-and-forget) does not park coroutine" {
 
     try ctx.input_q.push(try asyncWorkItem(testing.allocator, "{\"update_id\":5}"));
 
-    try testing.expect(waitQueue(&ctx.output_q, 1, 2_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 2_000));
     const action = ctx.output_q.pop();
     defer types.freeApiCall(action, testing.allocator);
 
@@ -1910,10 +1896,8 @@ test "worker exits within WORKFLOW_DEADLINE_MS + 200ms with non-responding stub"
 test "scheduled job fires on_schedule and deletes its row (at-least-once happy path)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const plen = try tmp.dir.realPathFile(testing.io, ".", pbuf[0..std.fs.max_path_bytes]);
-    var dbbuf: [std.fs.max_path_bytes + 8]u8 = undefined;
-    const db_path = try std.mem.printSentinel(&dbbuf, "{s}/s.db", .{pbuf[0..plen]}, 0);
+    var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const db_path = try tmpDbPath(&tmp, "s.db", &db_buf);
 
     // Seed a due job through one connection.
     {
@@ -1949,7 +1933,7 @@ test "scheduled job fires on_schedule and deletes its row (at-least-once happy p
     }
 
     // The worker emits the sendMessage from on_schedule.
-    try testing.expect(waitQueue(&ctx.output_q, 1, 3000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 3000));
     const action = popAction(&ctx.output_q);
     defer types.freeApiCall(action, testing.allocator);
     try testing.expect(bodyHas(action.payload.json, "\"text\":\"fired\""));
@@ -1973,10 +1957,8 @@ test "scheduled job whose handler COMMIT fails keeps its row (delete atomic with
     // that fails.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const plen = try tmp.dir.realPathFile(testing.io, ".", pbuf[0..std.fs.max_path_bytes]);
-    var dbbuf: [std.fs.max_path_bytes + 8]u8 = undefined;
-    const db_path = try std.mem.printSentinel(&dbbuf, "{s}/s.db", .{pbuf[0..plen]}, 0);
+    var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const db_path = try tmpDbPath(&tmp, "s.db", &db_buf);
 
     // Seed one due job through a throwaway connection so the row is durable in
     // the file DB before the worker fires it.
@@ -2010,16 +1992,7 @@ test "scheduled job whose handler COMMIT fails keeps its row (delete atomic with
     // action is dispatched (commit failed → actions dropped), so there is no
     // output-queue signal to wait on; poll the seam's reset as the completion
     // marker, then assert the row survived.
-    var fired = false;
-    var waited: u64 = 0;
-    while (waited < 3_000) : (waited += 10) {
-        if (!ctx.db.fail_next_commit) {
-            fired = true;
-            break;
-        }
-        rt.sleepNs(testing.io, 10 * std.time.ns_per_ms);
-    }
-    try testing.expect(fired);
+    try testing.expect(waitAtLeast(&ctx.db, commitFired, 1, 3_000));
 
     // The row must still be present and re-claimable through a fresh connection:
     // the delete was rolled back with the failed commit, not orphaned.
@@ -2056,7 +2029,7 @@ test "hot-reload: the next update runs the new rules; rules_reloads counts succe
     });
     _ = ctx.reload_ver.fetchAdd(1, .release);
     try ctx.input_q.push(.{ .body = try testing.allocator.dupe(u8, UPDATE), .user_id = 1 });
-    try testing.expect(waitQueue(&ctx.output_q, 1, 4_000));
+    try testing.expect(waitAtLeast(&ctx.output_q, Queue(types.ApiCall).len, 1, 4_000));
     {
         const action = ctx.output_q.pop();
         defer types.freeApiCall(action, testing.allocator);
@@ -2067,11 +2040,7 @@ test "hot-reload: the next update runs the new rules; rules_reloads counts succe
     try ctx.tmp.dir.writeFile(testing.io, .{ .sub_path = "rules.lua", .data = "function on_message(" });
     _ = ctx.reload_ver.fetchAdd(1, .release);
     try ctx.input_q.push(.{ .body = try testing.allocator.dupe(u8, UPDATE), .user_id = 1 });
-    var waited: u64 = 0;
-    while (waited < 4_000 and m.rules_reloads[@backingInt(metrics_mod.ReloadOutcome.failed)].load(.monotonic) == 0) {
-        rt.sleepNs(testing.io, 20 * std.time.ns_per_ms);
-        waited += 20;
-    }
+    _ = waitAtLeast(&m.rules_reloads[@backingInt(metrics_mod.ReloadOutcome.failed)], atomicCount, 1, 4_000);
     ctx.deinit(t);
 
     try testing.expectEqual(@as(u64, 1), m.rules_reloads[@backingInt(metrics_mod.ReloadOutcome.ok)].load(.monotonic));

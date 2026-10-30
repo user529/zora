@@ -323,25 +323,11 @@ fn watcherPoll(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers shared by tests
-// ---------------------------------------------------------------------------
-
-/// Spin-wait until `counter >= expected` or `timeout_ms` elapses.
-/// Returns true if the condition was satisfied in time.
-fn waitForCount(counter: *const std.atomic.Value(u64), expected: u64, timeout_ms: u64) bool {
-    const start = rt.nowMs(rt.io());
-    while (counter.load(.acquire) < expected) {
-        if (@as(u64, @intCast(rt.nowMs(rt.io()) - start)) >= timeout_ms) return false;
-        rt.sleepNs(rt.io(), 5 * std.time.ns_per_ms);
-    }
-    return true;
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 
 // Valid Lua snippets used across watcher tests.
 // Each "version" is syntactically distinct so writing v1 after v0 always
@@ -388,7 +374,7 @@ test "watcherPoll detects file write within 1500ms" {
     }
 
     // Watcher should detect within 1500ms total budget.
-    try testing.expect(waitForCount(&counter, 1, 1400));
+    try testing.expect(test_util.waitAtLeast(&counter, test_util.atomicCount, 1, 1400));
 }
 
 test "(Linux) inotify: 3 writes 200ms apart (CLOSE_WRITE) → counter >= 3 within 2s" {
@@ -425,7 +411,7 @@ test "(Linux) inotify: 3 writes 200ms apart (CLOSE_WRITE) → counter >= 3 withi
         if (n < 2) rt.sleepNs(rt.io(), 200 * std.time.ns_per_ms);
     }
 
-    try testing.expect(waitForCount(&counter, 3, 2000));
+    try testing.expect(test_util.waitAtLeast(&counter, test_util.atomicCount, 3, 2000));
 }
 
 test "(Linux) atomic rename (tmp → rules.lua) → counter incremented within 2000ms" {
@@ -466,7 +452,7 @@ test "(Linux) atomic rename (tmp → rules.lua) → counter incremented within 2
     }
     try tmp.dir.rename("rules.lua.tmp", tmp.dir, "rules.lua", testing.io);
 
-    try testing.expect(waitForCount(&counter, 1, 2000));
+    try testing.expect(test_util.waitAtLeast(&counter, test_util.atomicCount, 1, 2000));
 }
 
 test "(Linux) file deletion fires the on_delete callback exactly once" {
@@ -525,7 +511,7 @@ test "(Linux) file deletion fires the on_delete callback exactly once" {
     // Delete the file → on_delete must fire once.
     try tmp.dir.deleteFile(testing.io, "rules.lua");
 
-    try testing.expect(waitForCount(&counters.deletes, 1, 2000));
+    try testing.expect(test_util.waitAtLeast(&counters.deletes, test_util.atomicCount, 1, 2000));
 
     // No further deletes should arrive from the single removal. Give the
     // watcher a settle window, then confirm the count is still exactly one

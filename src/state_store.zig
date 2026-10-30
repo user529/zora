@@ -582,6 +582,7 @@ pub const StateStore = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 
 /// Open an in-memory StateStore for a single test.
 fn openMem() !StateStore {
@@ -651,11 +652,8 @@ test "schema_version is seeded, matched on open, and mismatch is rejected" {
     {
         var tmp = testing.tmpDir(.{});
         defer tmp.cleanup();
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const dir_path_len = try tmp.dir.realPath(testing.io, &path_buf);
-        const dir_path = path_buf[0..dir_path_len];
-        var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-        const db_path = try std.mem.printSentinel(&db_path_buf, "{s}/v.db", .{dir_path}, 0);
+        var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+        const db_path = try test_util.tmpDbPath(&tmp, "v.db", &db_buf);
 
         // First open creates and seeds schema_version = '2'.
         var store = try StateStore.open(testing.allocator, db_path);
@@ -717,11 +715,8 @@ test "two connections on one file: WAL, pragmas, interleaved writes, cross reads
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPath(testing.io, &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-    var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.mem.printSentinel(&db_path_buf, "{s}/wal.db", .{dir_path}, 0);
+    var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const db_path = try test_util.tmpDbPath(&tmp, "wal.db", &db_buf);
 
     var s1 = try StateStore.open(testing.allocator, db_path);
     defer s1.close();
@@ -907,12 +902,10 @@ test "scheduleClaimDue substitutes {} for a NULL payload" {
 test "encryption marker is seeded on create; reopen checks passphrase and mode" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_len = try tmp.dir.realPath(testing.io, &path_buf);
     var db_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
     var db_buf2: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const enc_path = try std.mem.printSentinel(&db_buf, "{s}/enc.db", .{path_buf[0..dir_len]}, 0);
-    const plain_path = try std.mem.printSentinel(&db_buf2, "{s}/plain.db", .{path_buf[0..dir_len]}, 0);
+    const enc_path = try test_util.tmpDbPath(&tmp, "enc.db", &db_buf);
+    const plain_path = try test_util.tmpDbPath(&tmp, "plain.db", &db_buf2);
     const pw: OpenOptions = .{ .encryption = .{ .passphrase = "pw", .io = testing.io } };
 
     // A fresh encrypted DB seeds the marker, salt, params and verifier.
