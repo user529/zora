@@ -169,6 +169,7 @@ fn acceptLoop(srv: *Server) void {
             continue;
         };
         if (srv.active.load(.acquire) >= MAX_CONNECTIONS) {
+            if (srv.metrics) |m| _ = m.route_drop_total.fetchAdd(1, .monotonic);
             log.warn("connection limit ({d}) reached — dropping", .{MAX_CONNECTIONS});
             stream.close(srv.io);
             continue;
@@ -183,6 +184,7 @@ fn acceptLoop(srv: *Server) void {
             break :blk true;
         };
         if (all_saturated) {
+            if (srv.metrics) |m| _ = m.route_drop_total.fetchAdd(1, .monotonic);
             log.warn("all worker queues saturated — dropping connection", .{});
             sendStatus(srv.io, stream, "503 Service Unavailable") catch {};
             stream.close(srv.io);
@@ -193,6 +195,7 @@ fn acceptLoop(srv: *Server) void {
         _ = srv.active.fetchAdd(1, .acquire);
         srv.conn_queue.push(stream) catch |err| {
             _ = srv.active.fetchSub(1, .release);
+            if (srv.metrics) |m| _ = m.route_drop_total.fetchAdd(1, .monotonic);
             log.warn("connection enqueue: {s}", .{@errorName(err)});
             stream.close(srv.io);
             continue;
@@ -346,6 +349,7 @@ fn handleRequest(srv: *Server, stream: std.Io.net.Stream) !void {
     // ── Forward the raw body verbatim to a worker ────────────────────────────
     // The WorkItem owns its body; the worker frees it once the handler has started.
     const owned_body = srv.allocator.dupe(u8, body) catch {
+        if (srv.metrics) |m| _ = m.route_drop_total.fetchAdd(1, .monotonic);
         log.warn("rejected request: out of memory copying body", .{});
         try sendStatus(srv.io, stream, "500 Internal Server Error");
         return;
@@ -823,11 +827,13 @@ test "extractUserId — message / callback_query / edge cases" {
 }
 
 // ---------------------------------------------------------------------------
-// Routing under backpressure: affinity-overflow placement and all-full drop
+// Routing under backpressure: affinity-overflow placement and capacity drops
 //
-// Both paths relax the hash(user_id)%N affinity and record it on Metrics:
+// Each path increments its own counter on `Metrics`:
 //   - overflow: primary queue full, update placed on a later queue → still 200.
-//   - drop:     every queue full, update shed → 503.
+//   - drop:     every queue full → 503 from the accept loop (or from the push
+//               loop when the queues fill after the accept check); connection
+//               limit reached → closed without a response.
 // Pre-filling the primary queue of user_id 2 (hashUserId(2, N)) forces the
 // chosen path deterministically.
 // ---------------------------------------------------------------------------
@@ -866,7 +872,7 @@ test "primary queue full → affinity-overflow places update on next queue, 200,
     try testing.expectEqual(@as(u64, 0), metrics.route_drop_total.load(.monotonic));
 }
 
-test "all queues full → update dropped with 503, queue length unchanged" {
+test "all queues full → update shed with 503, route_drop_total++" {
     var metrics = metrics_mod.Metrics{};
     // Single queue, capacity 1: once filled, every queue is saturated, so the
     // next update is shed (503) rather than placed.
@@ -881,15 +887,29 @@ test "all queues full → update dropped with 503, queue length unchanged" {
     // The dropped update was not enqueued: the queue still holds only the filler.
     try testing.expectEqual(@as(usize, 1), ts.queueLen(0));
 
-    // route_drop_total stays 0 here. A server with every worker queue full
-    // sheds the connection in the accept loop ("all worker queues saturated —
-    // dropping connection"), which sends 503 without touching the counter.
-    // Only the push loop in handleRequest increments it, in the narrow race
-    // where a queue fills between the accept check and the push. The
-    // assertion pins this behavior, so a change that wires the counter into
-    // the accept loop shows up here.
-    try testing.expectEqual(@as(u64, 0), metrics.route_drop_total.load(.monotonic));
+    // The accept loop sheds the connection before a handler reads it, and
+    // counts the drop.
+    try testing.expectEqual(@as(u64, 1), metrics.route_drop_total.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), metrics.route_overflow_total.load(.monotonic));
+}
+
+test "connection limit reached → connection closed without a response, route_drop_total++" {
+    var metrics = metrics_mod.Metrics{};
+    const ts = try TestSetup.initFull(1, TEST_SECRET, DEFAULT_READ_IDLE_TIMEOUT_MS, 1, &metrics);
+    defer ts.deinit();
+
+    ts.srv.active.store(MAX_CONNECTIONS, .release);
+    defer ts.srv.active.store(0, .release); // runs before ts.deinit(); no handler took a slot
+
+    // The server closes without writing a status line, so httpReq() fails on
+    // its write or its read and never returns a status code.
+    if (httpReq("POST", ts.serverAddr(), "/webhook", TEST_SECRET, UPDATE_USER_2)) |status| {
+        std.debug.print("unexpected status {d}\n", .{status});
+        return error.TestUnexpectedResult;
+    } else |_| {}
+
+    try testing.expectEqual(@as(u64, 1), metrics.route_drop_total.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), ts.queueLen(0));
 }
 
 test "stalled client (sends nothing) is reclaimed by the read timeout" {

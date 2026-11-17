@@ -32,12 +32,13 @@ pub const Metrics = struct {
     response_oversize_total: std.atomic.Value(u64) = .init(0), // replies over the response ceiling, dropped
     dispatch_timeouts_total: std.atomic.Value(u64) = .init(0), // sends abandoned at the poll-gate deadline
 
-    // Server routing (webhook → worker-queue placement). Both counters record a
-    // relaxation of the hash(user_id)%N affinity: overflow places a user's update
-    // on a non-primary worker, drop sheds it when every queue is full. The
-    // affinity is best-effort, not a hard single-writer invariant.
+    // Server routing (webhook → worker-queue placement). An overflow relaxes the
+    // `hash(user_id) % N` affinity, which is best-effort, not a hard
+    // single-writer invariant. A drop is counted per connection: the accept loop
+    // drops a connection before it reads the request, so it cannot tell whether
+    // the connection carried an update.
     route_overflow_total: std.atomic.Value(u64) = .init(0), // placed on a non-primary worker (primary queue full)
-    route_drop_total: std.atomic.Value(u64) = .init(0), // dropped — all worker queues full
+    route_drop_total: std.atomic.Value(u64) = .init(0), // dropped for lack of capacity: queues full, connection limit, out of memory
 
     // Throttle / reactive rate limiting
     throttle_429_total: std.atomic.Value(u64) = .init(0), // 429s observed
@@ -125,7 +126,7 @@ pub fn renderPrometheus(m: *const Metrics, src: RenderSources, w: *std.Io.Writer
 
     // routing
     try counterLine(w, "zora_route_overflow_total", "Updates placed on a non-primary worker (primary queue full).", m.route_overflow_total.load(.monotonic));
-    try counterLine(w, "zora_route_drop_total", "Updates dropped with every worker queue full.", m.route_drop_total.load(.monotonic));
+    try counterLine(w, "zora_route_drop_total", "Webhook connections dropped for lack of capacity: every worker queue full, the connection limit reached, or out of memory.", m.route_drop_total.load(.monotonic));
 
     // throttle
     try counterLine(w, "zora_throttle_429_total", "HTTP 429 responses observed from the Telegram API.", m.throttle_429_total.load(.monotonic));
